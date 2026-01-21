@@ -21,6 +21,8 @@ struct Renderer::Impl {
     HWND hwnd{nullptr};
     HDC hdc{nullptr};
     HFONT font{nullptr};
+    HICON hicon_small{nullptr};
+    HICON hicon_big{nullptr};
     int fb_w{0};
     int fb_h{0};
 #endif
@@ -79,11 +81,35 @@ Renderer::Renderer() {
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
-    impl->window = glfwCreateWindow(WIDTH, HEIGHT, "Intersection", nullptr, nullptr);
+    impl->window = glfwCreateWindow(WIDTH*1.5, HEIGHT*1.5, "Intersection", nullptr, nullptr);
     if(!impl->window){
         glfwTerminate();
         return;
     }
+
+#ifdef _WIN32
+    // Set window icon from assets/icon.ico (place your ICO there; PNG not supported here)
+    impl->hwnd = glfwGetWin32Window(impl->window);
+    if(impl->hwnd){
+        HICON icon_big = static_cast<HICON>(
+            LoadImageW(nullptr, L"assets\\icon.ico", IMAGE_ICON, 0, 0,
+                       LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        );
+        HICON icon_small = static_cast<HICON>(
+            LoadImageW(nullptr, L"assets\\icon.ico", IMAGE_ICON, 16, 16,
+                       LR_LOADFROMFILE)
+        );
+        if(icon_big){
+            SendMessageW(impl->hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon_big);
+            impl->hicon_big = icon_big;
+        }
+        if(icon_small){
+            SendMessageW(impl->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon_small);
+            impl->hicon_small = icon_small;
+        }
+    }
+#endif
+
     glfwMakeContextCurrent(impl->window);
     glfwSwapInterval(1);
     // No GLAD in this build: using immediate-mode OpenGL functions provided via system GL headers.
@@ -119,6 +145,14 @@ Renderer::~Renderer(){
         if(impl->font){
             DeleteObject(impl->font);
             impl->font = nullptr;
+        }
+        if(impl->hicon_big){
+            DestroyIcon(impl->hicon_big);
+            impl->hicon_big = nullptr;
+        }
+        if(impl->hicon_small){
+            DestroyIcon(impl->hicon_small);
+            impl->hicon_small = nullptr;
         }
     }
 #endif
