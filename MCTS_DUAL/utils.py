@@ -1,7 +1,7 @@
 # This file is a local copy of necessary components from the 'Intersection' package
 # to make C_MCTS a self-contained module.
 # === From Intersection/config.py ===
-WIDTH, HEIGHT = 750, 750
+WIDTH, HEIGHT = 900, 900
 FPS = 60
 SCALE = 12
 LANE_WIDTH_M = 3.5
