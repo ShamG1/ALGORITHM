@@ -1,0 +1,214 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeDetermineSystem.cmake:205 (message)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      The system is: Windows - 10.0.22631 - AMD64
+  -
+    kind: "message-v1"
+    backtrace:
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeDetermineCXXCompiler.cmake:126 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" succeeded.
+      Compiler:  
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      0
+      用于 .NET Framework 的 Microsoft (R) 生成引擎版本 16.11.2+f32259642
+      版权所有(C) Microsoft Corporation。保留所有权利。
+      
+      生成启动时间为 2026-01-21 22:26:34。
+      节点 1 上的项目“E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\3.29.2\\CompilerIdCXX\\CompilerIdCXX.vcxproj”(默认目标)。
+      PrepareForBuild:
+        正在创建目录“Debug\\”。
+        正在创建目录“Debug\\CompilerIdCXX.tlog\\”。
+      InitializeBuildStatus:
+        正在创建“Debug\\CompilerIdCXX.tlog\\unsuccessfulbuild”，因为已指定“AlwaysCreate”。
+      ClCompile:
+        E:\\Visual Studio\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64\\CL.exe /c /nologo /W0 /WX- /diagnostics:column /Od /D _MBCS /Gm- /EHsc /RTC1 /MDd /GS /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /Fo"Debug\\\\" /Fd"Debug\\vc142.pdb" /external:W0 /Gd /TP /FC /errorReport:queue CMakeCXXCompilerId.cpp
+        CMakeCXXCompilerId.cpp
+      Link:
+        E:\\Visual Studio\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64\\link.exe /ERRORREPORT:QUEUE /OUT:".\\CompilerIdCXX.exe" /INCREMENTAL:NO /NOLOGO kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib /MANIFEST /MANIFESTUAC:"level='asInvoker' uiAccess='false'" /manifest:embed /PDB:".\\CompilerIdCXX.pdb" /SUBSYSTEM:CONSOLE /TLBID:1 /DYNAMICBASE /NXCOMPAT /IMPLIB:".\\CompilerIdCXX.lib" /MACHINE:X64 Debug\\CMakeCXXCompilerId.obj
+        CompilerIdCXX.vcxproj -> E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\3.29.2\\CompilerIdCXX\\CompilerIdCXX.exe
+      PostBuildEvent:
+        for %%i in (cl.exe) do @echo CMAKE_CXX_COMPILER=%%~$PATH:i
+        :VCEnd
+        CMAKE_CXX_COMPILER=E:\\Visual Studio\\VC\\Tools\\MSVC\\14.29.30133\\bin\\Hostx64\\x64\\cl.exe
+      FinalizeBuildStatus:
+        正在删除文件“Debug\\CompilerIdCXX.tlog\\unsuccessfulbuild”。
+        正在对“Debug\\CompilerIdCXX.tlog\\CompilerIdCXX.lastbuildstate”执行 Touch 任务。
+      已完成生成项目“E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\3.29.2\\CompilerIdCXX\\CompilerIdCXX.vcxproj”(默认目标)的操作。
+      
+      已成功生成。
+          0 个警告
+          0 个错误
+      
+      已用时间 00:00:02.54
+      
+      
+      Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "CompilerIdCXX.exe"
+      
+      Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "CompilerIdCXX.vcxproj"
+      
+      The CXX compiler identification is MSVC, found in:
+        E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/3.29.2/CompilerIdCXX/CompilerIdCXX.exe
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeDetermineCompilerABI.cmake:64 (try_compile)"
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    checks:
+      - "Detecting CXX compiler ABI info"
+    directories:
+      source: "E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-m09hd5"
+      binary: "E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-m09hd5"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: "/DWIN32 /D_WINDOWS /GR /EHsc"
+      CMAKE_CXX_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
+      CMAKE_EXE_LINKER_FLAGS: "/machine:x64"
+    buildResult:
+      variable: "CMAKE_CXX_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: 'E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-m09hd5'
+        
+        Run Build Command(s): "E:/Visual Studio/MSBuild/Current/Bin/MSBuild.exe" cmTC_6c4b3.vcxproj /p:Configuration=Debug /p:Platform=x64 /p:VisualStudioVersion=16.0 /v:n
+        用于 .NET Framework 的 Microsoft (R) 生成引擎版本 16.11.2+f32259642
+        版权所有(C) Microsoft Corporation。保留所有权利。
+        
+        生成启动时间为 2026-01-21 22:26:37。
+        节点 1 上的项目“E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-m09hd5\\cmTC_6c4b3.vcxproj”(默认目标)。
+        PrepareForBuild:
+          正在创建目录“cmTC_6c4b3.dir\\Debug\\”。
+          正在创建目录“E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-m09hd5\\Debug\\”。
+          正在创建目录“cmTC_6c4b3.dir\\Debug\\cmTC_6c4b3.tlog\\”。
+        InitializeBuildStatus:
+          正在创建“cmTC_6c4b3.dir\\Debug\\cmTC_6c4b3.tlog\\unsuccessfulbuild”，因为已指定“AlwaysCreate”。
+        ClCompile:
+          E:\\Visual Studio\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64\\CL.exe /c /Zi /W1 /WX- /diagnostics:column /Od /Ob0 /D _MBCS /D WIN32 /D _WINDOWS /D "CMAKE_INTDIR=\\"Debug\\"" /Gm- /EHsc /RTC1 /MDd /GS /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /GR /Fo"cmTC_6c4b3.dir\\Debug\\\\" /Fd"cmTC_6c4b3.dir\\Debug\\vc142.pdb" /external:W1 /Gd /TP /errorReport:queue "E:\\cmake\\share\\cmake-3.29\\Modules\\CMakeCXXCompilerABI.cpp"
+          用于 x64 的 Microsoft (R) C/C++ 优化编译器 19.29.30154 版
+          版权所有(C) Microsoft Corporation。保留所有权利。
+          CMakeCXXCompilerABI.cpp
+          cl /c /Zi /W1 /WX- /diagnostics:column /Od /Ob0 /D _MBCS /D WIN32 /D _WINDOWS /D "CMAKE_INTDIR=\\"Debug\\"" /Gm- /EHsc /RTC1 /MDd /GS /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /GR /Fo"cmTC_6c4b3.dir\\Debug\\\\" /Fd"cmTC_6c4b3.dir\\Debug\\vc142.pdb" /external:W1 /Gd /TP /errorReport:queue "E:\\cmake\\share\\cmake-3.29\\Modules\\CMakeCXXCompilerABI.cpp"
+        Link:
+          E:\\Visual Studio\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64\\link.exe /ERRORREPORT:QUEUE /OUT:"E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-m09hd5\\Debug\\cmTC_6c4b3.exe" /INCREMENTAL /ILK:"cmTC_6c4b3.dir\\Debug\\cmTC_6c4b3.ilk" /NOLOGO kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib /MANIFEST /MANIFESTUAC:"level='asInvoker' uiAccess='false'" /manifest:embed /DEBUG /PDB:"E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-m09hd5/Debug/cmTC_6c4b3.pdb" /SUBSYSTEM:CONSOLE /TLBID:1 /DYNAMICBASE /NXCOMPAT /IMPLIB:"E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-m09hd5/Debug/cmTC_6c4b3.lib" /MACHINE:X64  /machine:x64 cmTC_6c4b3.dir\\Debug\\CMakeCXXCompilerABI.obj
+          cmTC_6c4b3.vcxproj -> E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-m09hd5\\Debug\\cmTC_6c4b3.exe
+        FinalizeBuildStatus:
+          正在删除文件“cmTC_6c4b3.dir\\Debug\\cmTC_6c4b3.tlog\\unsuccessfulbuild”。
+          正在对“cmTC_6c4b3.dir\\Debug\\cmTC_6c4b3.tlog\\cmTC_6c4b3.lastbuildstate”执行 Touch 任务。
+        已完成生成项目“E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-m09hd5\\cmTC_6c4b3.vcxproj”(默认目标)的操作。
+        
+        已成功生成。
+            0 个警告
+            0 个错误
+        
+        已用时间 00:00:00.75
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeDetermineCompilerABI.cmake:170 (message)"
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Parsed CXX implicit link information:
+        link line regex: [^( *|.*[/\\])(ld[0-9]*(\\.[a-z]+)?|link\\.exe|lld-link(\\.exe)?|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        linker tool regex: [^[ 	]*(->|")?[ 	]*(([^"]*[/\\])?(ld[0-9]*(\\.[a-z]+)?|link\\.exe|lld-link(\\.exe)?))("|,| |$)]
+        linker tool for 'CXX': E:/Visual Studio/VC/Tools/MSVC/14.29.30133/bin/HostX64/x64/link.exe
+        implicit libs: []
+        implicit objs: []
+        implicit dirs: []
+        implicit fwks: []
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "E:/cmake/share/cmake-3.29/Modules/Internal/CMakeDetermineLinkerId.cmake:40 (message)"
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeDetermineCompilerABI.cmake:207 (cmake_determine_linker_id)"
+      - "E:/cmake/share/cmake-3.29/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Running the CXX compiler's linker: "E:/Visual Studio/VC/Tools/MSVC/14.29.30133/bin/HostX64/x64/link.exe" "-v"
+      Microsoft (R) Incremental Linker Version 14.29.30154.0
+      Copyright (C) Microsoft Corporation.  All rights reserved.
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "E:/cmake/share/cmake-3.29/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "E:/cmake/share/cmake-3.29/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "E:/cmake/share/cmake-3.29/Modules/CheckCXXCompilerFlag.cmake:34 (cmake_check_compiler_flag)"
+      - "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/share/cmake/pybind11/pybind11Common.cmake:321 (check_cxx_compiler_flag)"
+      - "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/share/cmake/pybind11/pybind11Common.cmake:393 (_pybind11_return_if_cxx_and_linker_flags_work)"
+      - "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/share/cmake/pybind11/pybind11Common.cmake:427 (_pybind11_generate_lto)"
+      - "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/share/cmake/pybind11/pybind11Config.cmake:257 (include)"
+      - "CMakeLists.txt:22 (find_package)"
+    checks:
+      - "Performing Test HAS_MSVC_GL_LTCG"
+    directories:
+      source: "E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-hgw5wo"
+      binary: "E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-hgw5wo"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: "/DWIN32 /D_WINDOWS /GR /EHsc"
+      CMAKE_CXX_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
+      CMAKE_EXE_LINKER_FLAGS: "/machine:x64"
+    buildResult:
+      variable: "HAS_MSVC_GL_LTCG"
+      cached: true
+      stdout: |
+        Change Dir: 'E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-hgw5wo'
+        
+        Run Build Command(s): "E:/Visual Studio/MSBuild/Current/Bin/MSBuild.exe" cmTC_89722.vcxproj /p:Configuration=Debug /p:Platform=x64 /p:VisualStudioVersion=16.0 /v:n
+        用于 .NET Framework 的 Microsoft (R) 生成引擎版本 16.11.2+f32259642
+        版权所有(C) Microsoft Corporation。保留所有权利。
+        
+        生成启动时间为 2026-01-21 22:26:39。
+        节点 1 上的项目“E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\cmTC_89722.vcxproj”(默认目标)。
+        PrepareForBuild:
+          正在创建目录“cmTC_89722.dir\\Debug\\”。
+          正在创建目录“E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\Debug\\”。
+          正在创建目录“cmTC_89722.dir\\Debug\\cmTC_89722.tlog\\”。
+        InitializeBuildStatus:
+          正在创建“cmTC_89722.dir\\Debug\\cmTC_89722.tlog\\unsuccessfulbuild”，因为已指定“AlwaysCreate”。
+        ClCompile:
+          E:\\Visual Studio\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64\\CL.exe /c /Zi /W1 /WX- /diagnostics:column /Od /Ob0 /GL /D _MBCS /D WIN32 /D _WINDOWS /D HAS_MSVC_GL_LTCG /D "CMAKE_INTDIR=\\"Debug\\"" /Gm- /EHsc /RTC1 /MDd /GS /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /GR /std:c++17 /Fo"cmTC_89722.dir\\Debug\\\\" /Fd"cmTC_89722.dir\\Debug\\vc142.pdb" /external:W1 /Gd /TP /errorReport:queue "E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\src.cxx"
+          用于 x64 的 Microsoft (R) C/C++ 优化编译器 19.29.30154 版
+          版权所有(C) Microsoft Corporation。保留所有权利。
+          src.cxx
+          cl /c /Zi /W1 /WX- /diagnostics:column /Od /Ob0 /GL /D _MBCS /D WIN32 /D _WINDOWS /D HAS_MSVC_GL_LTCG /D "CMAKE_INTDIR=\\"Debug\\"" /Gm- /EHsc /RTC1 /MDd /GS /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /GR /std:c++17 /Fo"cmTC_89722.dir\\Debug\\\\" /Fd"cmTC_89722.dir\\Debug\\vc142.pdb" /external:W1 /Gd /TP /errorReport:queue "E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\src.cxx"
+        Link:
+          E:\\Visual Studio\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64\\link.exe /ERRORREPORT:QUEUE /OUT:"E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\Debug\\cmTC_89722.exe" /INCREMENTAL /ILK:"cmTC_89722.dir\\Debug\\cmTC_89722.ilk" /NOLOGO "-LTCG" kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib /MANIFEST /MANIFESTUAC:"level='asInvoker' uiAccess='false'" /manifest:embed /DEBUG /PDB:"E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-hgw5wo/Debug/cmTC_89722.pdb" /SUBSYSTEM:CONSOLE /TLBID:1 /DYNAMICBASE /NXCOMPAT /IMPLIB:"E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/CMakeScratch/TryCompile-hgw5wo/Debug/cmTC_89722.lib" /MACHINE:X64  /machine:x64 cmTC_89722.dir\\Debug\\src.obj
+        LINK : warning LNK4075: 忽略“/INCREMENTAL”(由于“/LTCG”规范) [E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\cmTC_89722.vcxproj]
+          正在生成代码
+          已完成代码的生成
+          cmTC_89722.vcxproj -> E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\Debug\\cmTC_89722.exe
+        FinalizeBuildStatus:
+          正在删除文件“cmTC_89722.dir\\Debug\\cmTC_89722.tlog\\unsuccessfulbuild”。
+          正在对“cmTC_89722.dir\\Debug\\cmTC_89722.tlog\\cmTC_89722.lastbuildstate”执行 Touch 任务。
+        已完成生成项目“E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\cmTC_89722.vcxproj”(默认目标)的操作。
+        
+        已成功生成。
+        
+        “E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\cmTC_89722.vcxproj”(默认目标) (1) ->
+        (Link 目标) -> 
+          LINK : warning LNK4075: 忽略“/INCREMENTAL”(由于“/LTCG”规范) [E:\\IMPORTANT_\\SCI\\algorithm\\MCTS_DUAL\\cpp\\build\\CMakeFiles\\CMakeScratch\\TryCompile-hgw5wo\\cmTC_89722.vcxproj]
+        
+            1 个警告
+            0 个错误
+        
+        已用时间 00:00:00.62
+        
+      exitCode: 0
+...

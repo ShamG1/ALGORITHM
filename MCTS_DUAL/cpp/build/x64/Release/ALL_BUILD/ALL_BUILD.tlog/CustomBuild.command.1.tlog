@@ -1,0 +1,10 @@
+^E:\IMPORTANT_\SCI\ALGORITHM\MCTS_DUAL\CPP\CMAKELISTS.TXT
+setlocal
+E:\cmake\bin\cmake.exe -SE:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp -BE:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build --check-stamp-file E:/IMPORTANT_/SCI/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
