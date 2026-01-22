@@ -23,11 +23,19 @@ try:
 except ImportError:
     import cpp_backend  # type: ignore
 
-from utils import (
-    DEFAULT_ROUTE_MAPPING_2LANES,
-    DEFAULT_ROUTE_MAPPING_3LANES,
-    build_lane_layout,
-)
+# Handle both relative and absolute imports
+try:
+    from .utils import (
+        DEFAULT_ROUTE_MAPPING_2LANES,
+        DEFAULT_ROUTE_MAPPING_3LANES,
+        build_lane_layout,
+    )
+except ImportError:
+    from utils import (
+        DEFAULT_ROUTE_MAPPING_2LANES,
+        DEFAULT_ROUTE_MAPPING_3LANES,
+        build_lane_layout,
+    )
 
 # Local default reward config (mirrors Intersection/config.py)
 DEFAULT_REWARD_CONFIG = {

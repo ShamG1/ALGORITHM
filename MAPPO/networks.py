@@ -5,8 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from Intersection.config import OBS_DIM
-
+from MCTS_DUAL.utils import OBS_DIM
 
 class Actor(nn.Module):
     """Actor network (policy network) for MAPPO with LSTM."""
@@ -23,6 +22,8 @@ class Actor(nn.Module):
         if self.use_lstm:
             # LSTM layer
             self.lstm = nn.LSTM(hidden_dim, lstm_hidden_dim, batch_first=True)
+            # Layer normalization after LSTM for stability
+            self.ln = nn.LayerNorm(lstm_hidden_dim)
             # Post-LSTM layers
             self.fc2 = nn.Linear(lstm_hidden_dim, hidden_dim)
             self.fc3 = nn.Linear(hidden_dim, hidden_dim)
@@ -37,6 +38,11 @@ class Actor(nn.Module):
         
         # Initialize weights
         self._initialize_weights()
+        
+        # Initialize std_head bias to ensure reasonable initial exploration
+        # softplus(0.5) ≈ 0.97, so initial std ≈ 0.97 + 1e-5 ≈ 0.97
+        # This ensures sufficient exploration at the start of training
+        nn.init.constant_(self.std_head.bias, 0.5)
     
     def _initialize_weights(self):
         """Initialize network weights."""
@@ -92,6 +98,7 @@ class Actor(nn.Module):
             
             # Use last timestep output
             x = lstm_out[:, -1, :]  # (batch_size, lstm_hidden_dim)
+            x = self.ln(x)  # Layer normalization for stability
             x = F.relu(self.fc2(x))
             x = F.relu(self.fc3(x))
         else:
@@ -168,6 +175,8 @@ class Critic(nn.Module):
         if self.use_lstm:
             # LSTM layer
             self.lstm = nn.LSTM(hidden_dim, lstm_hidden_dim, batch_first=True)
+            # Layer normalization after LSTM for stability
+            self.ln = nn.LayerNorm(lstm_hidden_dim)
             # Post-LSTM layers
             self.fc2 = nn.Linear(lstm_hidden_dim, hidden_dim)
             self.fc3 = nn.Linear(hidden_dim, hidden_dim)
@@ -234,6 +243,7 @@ class Critic(nn.Module):
             
             # Use last timestep output
             x = lstm_out[:, -1, :]  # (batch_size, lstm_hidden_dim)
+            x = self.ln(x)  # Layer normalization for stability
             x = F.relu(self.fc2(x))
             x = F.relu(self.fc3(x))
         else:

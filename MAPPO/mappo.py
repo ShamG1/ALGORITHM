@@ -21,7 +21,7 @@ class MAPPO:
     def __init__(
         self,
         num_agents: int = 6,
-        obs_dim: int = 118,
+        obs_dim: int = 127,  # Updated to match MCTS_DUAL OBS_DIM
         action_dim: int = 2,
         hidden_dim: int = 256,
         lr_actor: float = 3e-4,

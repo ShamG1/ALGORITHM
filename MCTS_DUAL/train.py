@@ -25,8 +25,13 @@ except ImportError:
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from env import IntersectionEnv # Use IntersectionEnv as the main env
-from utils import DEFAULT_REWARD_CONFIG, OBS_DIM
+# Handle both relative and absolute imports
+try:
+    from .env import IntersectionEnv
+    from .utils import DEFAULT_REWARD_CONFIG, OBS_DIM
+except ImportError:
+    from env import IntersectionEnv
+    from utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
 
 def set_global_seeds(seed: int, deterministic: bool = False) -> None:
@@ -88,8 +93,23 @@ def _search_agent_wrapper(args):
         # 1. lazy load network (only initialize objects when called for the first time)
         if _WORKER_CACHE["network"] is None:
             # Import strictly inside function/worker to avoid circular imports or pickling issues
-            from networks import DualNetwork
-            from utils import OBS_DIM
+            # Handle both relative and absolute imports for worker process
+            try:
+                from .dual_net import DualNetwork
+                from .utils import OBS_DIM
+            except ImportError:
+                try:
+                    from dual_net import DualNetwork
+                    from utils import OBS_DIM
+                except ImportError:
+                    # Fallback: import from MCTS_DUAL package
+                    import sys
+                    import os
+                    mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    if mcts_dual_path not in sys.path:
+                        sys.path.insert(0, mcts_dual_path)
+                    from MCTS_DUAL.dual_net import DualNetwork
+                    from MCTS_DUAL.utils import OBS_DIM
             
             network = DualNetwork(
                 obs_dim=OBS_DIM,
@@ -107,8 +127,24 @@ def _search_agent_wrapper(args):
         
         # 2. lazy load environment (for MCTS rollouts)
         if _WORKER_CACHE["env"] is None:
-            from train import generate_ego_routes
-            from env import IntersectionEnv
+            # Handle both relative and absolute imports for worker process
+            try:
+                from .train import generate_ego_routes
+                from .env import IntersectionEnv
+            except ImportError:
+                try:
+                    from train import generate_ego_routes
+                    from env import IntersectionEnv
+                except ImportError:
+                    # Fallback: import from MCTS_DUAL package
+                    import sys
+                    import os
+                    mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    if mcts_dual_path not in sys.path:
+                        sys.path.insert(0, mcts_dual_path)
+                    from MCTS_DUAL.train import generate_ego_routes
+                    from MCTS_DUAL.env import IntersectionEnv
+                    from MCTS_DUAL.utils import DEFAULT_REWARD_CONFIG
             env_cfg = config.get('env_config', {})
             num_agents_cfg = env_cfg.get('num_agents', 1)
             num_lanes_cfg = env_cfg.get('num_lanes', 3)
@@ -118,6 +154,22 @@ def _search_agent_wrapper(args):
             else:
                 # ensure worker copy is independent
                 ego_routes_copy = list(ego_routes_copy)
+            # Import DEFAULT_REWARD_CONFIG if not already imported
+            try:
+                DEFAULT_REWARD_CONFIG
+            except NameError:
+                try:
+                    from .utils import DEFAULT_REWARD_CONFIG
+                except ImportError:
+                    try:
+                        from utils import DEFAULT_REWARD_CONFIG
+                    except ImportError:
+                        import sys
+                        import os
+                        mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                        if mcts_dual_path not in sys.path:
+                            sys.path.insert(0, mcts_dual_path)
+                        from MCTS_DUAL.utils import DEFAULT_REWARD_CONFIG
             reward_cfg = env_cfg.get('reward_config', DEFAULT_REWARD_CONFIG.get('reward_config', {}))
             # create FastIntersectionEnv (C++ backend) for C++ MCTS
             _WORKER_CACHE["env"] = IntersectionEnv({
@@ -198,10 +250,10 @@ def _search_agent_wrapper(args):
         return agent_id, np.zeros(2)
 
 try:
-    from .networks import DualNetwork
+    from .dual_net import DualNetwork
     from .mcts import MCTS
 except ImportError:
-    from networks import DualNetwork
+    from dual_net import DualNetwork
     from mcts import MCTS
 
 def generate_ego_routes(num_agents: int, num_lanes: int):

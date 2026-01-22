@@ -1,11 +1,11 @@
 # MCTS Multi-Agent Training Package
 
 try:
-    from .networks import DualNetwork
+    from .dual_net import DualNetwork
     from .mcts import MCTS
     from .train import MCTSTrainer
 except ImportError:
-    from networks import DualNetwork
+    from dual_net import DualNetwork
     from mcts import MCTS
     from train import MCTSTrainer
 

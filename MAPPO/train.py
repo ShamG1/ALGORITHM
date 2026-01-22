@@ -14,8 +14,9 @@ from tqdm import tqdm
 # Add parent directory to path to import env
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Intersection.env import IntersectionEnv, DEFAULT_ROUTE_MAPPING_2LANES, DEFAULT_ROUTE_MAPPING_3LANES
-from Intersection.config import DEFAULT_REWARD_CONFIG, OBS_DIM
+# Import from MCTS_DUAL instead of Intersection
+from MCTS_DUAL.env import IntersectionEnv, DEFAULT_ROUTE_MAPPING_2LANES, DEFAULT_ROUTE_MAPPING_3LANES
+from MCTS_DUAL.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
 # Import MAPPO - handle both absolute and relative imports
 try:
@@ -105,7 +106,7 @@ class Trainer:
         num_agents: int = 6,
         num_lanes: int = 2,
         max_episodes: int = 10000,
-        max_steps_per_episode: int = 2000,
+        max_steps_per_episode: int = 500,
         update_frequency: int = 2048,  # Steps before update
         save_frequency: int = 100,  # Episodes before saving
         log_frequency: int = 10,  # Episodes before logging
@@ -114,8 +115,9 @@ class Trainer:
         render: bool = False,
         show_lane_ids: bool = False,
         show_lidar: bool = False,
-        respawn_enabled: bool = False,
-        save_dir: str = 'policy/checkpoints'
+        respawn_enabled: bool = True,
+        save_dir: str = 'policy/checkpoints',
+        use_tqdm: bool = False
     ):
         """
         Initialize trainer.
@@ -132,6 +134,7 @@ class Trainer:
             use_team_reward: Whether to use team reward mixing
             render: Whether to render environment
             save_dir: Directory to save checkpoints
+            use_tqdm: Whether to use tqdm progress bar (default: False)
         """
         self.num_agents = num_agents
         self.num_lanes = num_lanes
@@ -147,6 +150,7 @@ class Trainer:
         self.show_lidar = show_lidar
         self.respawn_enabled = respawn_enabled
         self.save_dir = save_dir
+        self.use_tqdm = use_tqdm
         
         # Create save directory
         os.makedirs(save_dir, exist_ok=True)
@@ -238,24 +242,26 @@ class Trainer:
         episode = 0
         step_count = 0
         
-        # Create a single progress bar for episode step progress (reused across episodes)
-        try:
-            is_terminal = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
-        except:
-            is_terminal = True
-        
-        # Single progress bar showing current episode's step progress
-        step_pbar = tqdm(
-            total=self.max_steps_per_episode,
-            desc="Episode 1",
-            leave=True,
-            ncols=120,
-            miniters=1,
-            mininterval=0.1,
-            file=sys.stdout,
-            disable=False,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
-        )
+        # Create progress bar only if use_tqdm is enabled
+        step_pbar = None
+        if self.use_tqdm:
+            try:
+                is_terminal = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+            except:
+                is_terminal = True
+            
+            # Single progress bar showing current episode's step progress
+            step_pbar = tqdm(
+                total=self.max_steps_per_episode,
+                desc="Episode 1",
+                leave=True,
+                ncols=120,
+                miniters=1,
+                mininterval=0.1,
+                file=sys.stdout,
+                disable=False,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            )
         
         step_times = []  # Track step times across all episodes
         
@@ -263,9 +269,13 @@ class Trainer:
             episode += 1
             self.stats['episode'] = episode
             
+            # Record episode start time
+            episode_start_time = time.time()
+            
             # Reset progress bar for new episode
-            step_pbar.reset(total=self.max_steps_per_episode)
-            step_pbar.set_description(f"Episode {episode}/{self.max_episodes}")
+            if step_pbar is not None:
+                step_pbar.reset(total=self.max_steps_per_episode)
+                step_pbar.set_description(f"Episode {episode}/{self.max_episodes}")
             
             # Reset environment
             obs, info = self.env.reset()
@@ -297,8 +307,37 @@ class Trainer:
                 else:
                     rewards = np.array([rewards] * self.num_agents)
                 
-                done = terminated or truncated
-                dones = np.array([done] * self.num_agents)
+                # In respawn mode, episode only ends when all agents are done or max steps reached
+                # Check individual agent done status from info
+                if self.respawn_enabled:
+                    # Get per-agent done status from info
+                    agent_dones = info.get('done', [False] * self.num_agents)
+                    if isinstance(agent_dones, list):
+                        agent_dones = np.array(agent_dones)
+                    elif not isinstance(agent_dones, np.ndarray):
+                        agent_dones = np.array([agent_dones] * self.num_agents)
+                    
+                    # Ensure we have the right number of done flags
+                    if len(agent_dones) != self.num_agents:
+                        agent_dones = np.array([False] * self.num_agents)
+                    
+                    # Check agents_alive if available (more reliable than done flags)
+                    agents_alive = info.get('agents_alive', None)
+                    if agents_alive is not None:
+                        # If there are still alive agents, don't end episode
+                        # Episode only ends when all agents are done or max steps reached
+                        done = (agents_alive == 0) or truncated
+                    else:
+                        # Fallback: check if all agents are done
+                        all_agents_done = np.all(agent_dones) if len(agent_dones) == self.num_agents else False
+                        done = all_agents_done or truncated
+                    
+                    # Use per-agent done status for storing transitions
+                    dones = agent_dones.copy() if len(agent_dones) == self.num_agents else np.array([done] * self.num_agents)
+                else:
+                    # Without respawn, use global done status
+                    done = terminated or truncated
+                    dones = np.array([done] * self.num_agents)
                 
                 # Store transition
                 self.mappo.store_transition(
@@ -317,17 +356,18 @@ class Trainer:
                 episode_avg_step_time = np.mean(episode_step_times) if episode_step_times else 0.0
                 
                 # Update step progress bar with current episode info
-                current_total_reward = episode_reward.sum()
-                current_mean_reward = episode_reward.mean()
-                step_pbar.set_postfix({
-                    'Total Reward': f'{current_total_reward:.2f}',
-                    'Mean Reward': f'{current_mean_reward:.2f}',
-                    'Step Time': f'{step_time*1000:.1f}ms',
-                    'Avg Step': f'{episode_avg_step_time*1000:.1f}ms'
-                })
-                # Update progress bar
-                step_pbar.update(1)
-                step_pbar.refresh()  # Force refresh to ensure display
+                if step_pbar is not None:
+                    current_total_reward = episode_reward.sum()
+                    current_mean_reward = episode_reward.mean()
+                    step_pbar.set_postfix({
+                        'Total Reward': f'{current_total_reward:.2f}',
+                        'Mean Reward': f'{current_mean_reward:.2f}',
+                        'Step Time': f'{step_time*1000:.1f}ms',
+                        'Avg Step': f'{episode_avg_step_time*1000:.1f}ms'
+                    })
+                    # Update progress bar
+                    step_pbar.update(1)
+                    step_pbar.refresh()  # Force refresh to ensure display
                 
                 # Update policy if buffer reaches update_frequency
                 # This ensures updates happen even if episode is very long (e.g., with respawn)
@@ -357,6 +397,9 @@ class Trainer:
             self.stats['episode_rewards'].append(episode_reward.mean())
             self.stats['episode_lengths'].append(episode_length)
             
+            # Calculate episode duration
+            episode_duration = time.time() - episode_start_time
+            
             # Write episode rewards to CSV
             total_reward = episode_reward.sum()  # Sum of all agents' rewards
             mean_reward = episode_reward.mean()
@@ -364,12 +407,13 @@ class Trainer:
                 writer = csv.writer(f)
                 writer.writerow([episode, total_reward, mean_reward, episode_length])
             
-            # Print episode reward information (below progress bar)
+            # Print episode reward information with duration
             print(
-                f"\nEpisode {episode:5d} | "
+                f"Episode {episode:5d} | "
                 f"Total Reward: {total_reward:8.2f} | "
                 f"Mean Reward: {mean_reward:7.2f} | "
-                f"Length: {episode_length:4d} steps"
+                f"Length: {episode_length:4d} steps | "
+                f"Time: {episode_duration:.2f}s"
             )
             
             # Check for success/crash
@@ -421,7 +465,8 @@ class Trainer:
                     json.dump(self.stats, f, indent=2)
         
         # Close step progress bar
-        step_pbar.close()
+        if step_pbar is not None:
+            step_pbar.close()
         
         # Final save
         final_path = os.path.join(self.save_dir, 'mappo_final.pth')
@@ -443,15 +488,16 @@ def main():
     parser = argparse.ArgumentParser(description='Train MAPPO for intersection navigation')
     parser.add_argument('--num-agents', type=int, default=6, help='Number of agents')
     parser.add_argument('--num-lanes', type=int, default=2, help='Number of lanes per direction')
-    parser.add_argument('--max-episodes', type=int, default=10000, help='Max training episodes')
+    parser.add_argument('--max-episodes', type=int, default=100000, help='Max training episodes')
     parser.add_argument('--update-frequency', type=int, default=2048, help='Steps before update')
     parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'], help='Device')
     parser.add_argument('--use-team-reward', action='store_true', help='Use team reward mixing')
     parser.add_argument('--render', action='store_true', help='Render environment')
     parser.add_argument('--show-lane-ids', action='store_true', help='Show lane IDs in render')
     parser.add_argument('--show-lidar', action='store_true', help='Show lidar rays in render')
-    parser.add_argument('--respawn', action='store_true', help='Enable respawn for agents (agents will respawn at start when they crash)')
-    parser.add_argument('--save-dir', type=str, default='policy/checkpoints', help='Save directory')
+    parser.add_argument('--no-respawn', action='store_false', dest='respawn', default=True, help='Disable respawn for agents (respawn is enabled by default)')
+    parser.add_argument('--save-dir', type=str, default='MAPPO/checkpoints', help='Save directory')
+    parser.add_argument('--tqdm', action='store_true', help='Enable tqdm progress bar (default: disabled)')
     
     args = parser.parse_args()
     
@@ -473,8 +519,9 @@ def main():
         render=args.render,
         show_lane_ids=args.show_lane_ids,
         show_lidar=args.show_lidar,
-        respawn_enabled=args.respawn,
-        save_dir=args.save_dir
+        respawn_enabled=getattr(args, 'respawn', True),  # Default to True if not set
+        save_dir=args.save_dir,
+        use_tqdm=args.tqdm
     )
     
     # Start training
