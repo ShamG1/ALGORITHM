@@ -2,7 +2,7 @@
 
 ## 概述
 
-本项目实现了一种结合**双网络（Dual Network）**和**蒙特卡洛树搜索（MCTS）**的强化学习算法，用于多智能体交叉路口导航任务。该算法通过共享 LSTM 骨干网络同时学习策略和价值函数，并利用 MCTS 进行在线规划以提升决策质量。
+本项目实现了一种结合"双网络（Dual Network）"和"蒙特卡洛树搜索（MCTS）"的强化学习算法，用于多智能体交叉路口导航任务。该算法通过共享 LSTM 骨干网络同时学习策略和价值函数，并利用 MCTS 进行在线规划以提升决策质量。
 
 ## 核心算法
 
@@ -51,7 +51,7 @@ MCTS 利用双网络进行在线规划，通过模拟搜索找到最优动作。
 
 #### MCTS 搜索流程
 
-MCTS 搜索包含四个阶段，重复执行 $N$ 次（$N$ 为模拟次数）：
+MCTS 搜索包含四个阶段，重复执行 $N$ 次（$$N$$ 为模拟次数）：
 
 ![MCTS 搜索流程图](images/mcts_search_flow.png)
 
@@ -94,7 +94,7 @@ $$P(a|s) = \frac{N(s, a)^{1/\tau}}{\sum_{a'} N(s, a')^{1/\tau}}$$
 
 #### 经验回放与 TBPTT
 
-使用**截断反向传播（Truncated Backpropagation Through Time, TBPTT）**训练 LSTM 网络：
+使用截断反向传播（Truncated Backpropagation Through Time, TBPTT）训练 LSTM 网络：
 
 1. **经验收集**：在环境中执行 MCTS 选择的动作，收集轨迹
 2. **批量更新**：当缓冲区达到阈值（64 步）时进行批量更新
