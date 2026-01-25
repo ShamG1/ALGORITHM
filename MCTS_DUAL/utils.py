@@ -2,25 +2,10 @@
 # to make C_MCTS a self-contained module.
 # === From Intersection/config.py ===
 WIDTH, HEIGHT = 900, 900
-FPS = 60
 SCALE = 12
 LANE_WIDTH_M = 3.5
 LANE_WIDTH_PX = int(LANE_WIDTH_M * SCALE)
-CORNER_RADIUS = int(7 * SCALE)
-CAR_LENGTH = int(4.5 * SCALE)
-CAR_WIDTH = int(2.0 * SCALE)
 
-COLOR_GRASS = (34, 139, 34)
-COLOR_ROAD = (60, 60, 60)
-COLOR_YELLOW = (255, 204, 0)
-COLOR_WHITE = (240, 240, 240)
-COLOR_LIDAR_LINE = (0, 255, 0, 40)
-COLOR_LIDAR_HIT = (255, 0, 0)
-
-COLOR_CAR_LIST = [
-    (231, 76, 60), (52, 152, 219), (46, 204, 113),
-    (155, 89, 182), (241, 196, 15), (230, 126, 34)
-]
 
 
 OBS_DIM = 127

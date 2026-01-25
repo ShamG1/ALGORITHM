@@ -5,13 +5,11 @@
 #include <vector>
 #include <utility>
 
-// Forward declarations to keep header light
 class IntersectionEnv;
 struct EnvState;
 
 namespace py = pybind11;
 
-// The main MCTS search function to be exposed to Python
 std::pair<std::vector<float>, py::dict> mcts_search(
     IntersectionEnv& env,
     const EnvState& root_state,

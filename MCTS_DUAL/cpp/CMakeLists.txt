@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.15)
+
+if(NOT WIN32)
+    message(FATAL_ERROR "cpp_mcts Renderer is Windows-only. Configure/build on Windows.")
+endif()
+
 project(cpp_mcts LANGUAGES CXX)
+
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -88,4 +94,7 @@ target_link_libraries(cpp_mcts PRIVATE ${GLFW_LIB_NAME} opengl32)
 
 if(WIN32)
     target_link_libraries(cpp_mcts PRIVATE gdi32)
+
+    # Avoid MSVC warning C4819 (source file contains characters not representable in current code page)
+    target_compile_options(cpp_mcts PRIVATE /utf-8)
 endif()

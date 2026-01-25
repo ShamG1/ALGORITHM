@@ -6,7 +6,7 @@
 #include "constants.h"
 
 #ifndef _WIN32
-#include "BitmapFont.h"
+#error "Renderer is Windows-only. Build on Windows (_WIN32) only."
 #endif
 
 // Forward declaration

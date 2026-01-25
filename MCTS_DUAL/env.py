@@ -91,6 +91,8 @@ class IntersectionEnv:
 
         self.num_lanes = int(config.get("num_lanes", 3))
         self.render_mode = config.get("render_mode", None)
+        self.show_lane_ids = bool(config.get("show_lane_ids", False))
+        self.show_lidar = bool(config.get("show_lidar", False))
 
         use_team = bool(config.get("use_team_reward", DEFAULT_REWARD_CONFIG.get("use_team_reward", False)))
         if self.traffic_flow:
@@ -205,10 +207,14 @@ class IntersectionEnv:
             return obs[0], float(rewards[0]) if len(rewards) else 0.0, terminated, truncated, info
         return obs, rewards, terminated, truncated, info
 
-    def render(self, show_lane_ids: bool = False, show_lidar: bool = False):
+    def render(self, show_lane_ids: bool | None = None, show_lidar: bool | None = None):
         if self.render_mode != "human":
             return
-        self.env.render(show_lane_ids, show_lidar)
+        if show_lane_ids is None:
+            show_lane_ids = self.show_lane_ids
+        if show_lidar is None:
+            show_lidar = self.show_lidar
+        self.env.render(bool(show_lane_ids), bool(show_lidar))
 
     def close(self):
         # C++ side owns the GLFW window; nothing to close here.

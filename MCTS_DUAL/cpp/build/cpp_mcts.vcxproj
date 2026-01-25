@@ -87,7 +87,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <AdditionalIncludeDirectories>E:\IMPORTANT_\SCI\algorithm\MCTS_DUAL\cpp;E:\IMPORTANT_\SCI\algorithm\MCTS_DUAL\cpp\..\..\TOOLS\glfw-3.4.bin.WIN64\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <AdditionalOptions>%(AdditionalOptions) /external:I "E:/Anaconda/envs/g308/include" /external:I "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/include" /bigobj</AdditionalOptions>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "E:/Anaconda/envs/g308/include" /external:I "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/include" /utf-8 /bigobj</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
@@ -133,7 +133,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <AdditionalIncludeDirectories>E:\IMPORTANT_\SCI\algorithm\MCTS_DUAL\cpp;E:\IMPORTANT_\SCI\algorithm\MCTS_DUAL\cpp\..\..\TOOLS\glfw-3.4.bin.WIN64\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <AdditionalOptions>%(AdditionalOptions) /external:I "E:/Anaconda/envs/g308/include" /external:I "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/include" /bigobj</AdditionalOptions>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "E:/Anaconda/envs/g308/include" /external:I "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/include" /utf-8 /bigobj</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <ExceptionHandling>Sync</ExceptionHandling>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
@@ -182,7 +182,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
     <ClCompile>
       <AdditionalIncludeDirectories>E:\IMPORTANT_\SCI\algorithm\MCTS_DUAL\cpp;E:\IMPORTANT_\SCI\algorithm\MCTS_DUAL\cpp\..\..\TOOLS\glfw-3.4.bin.WIN64\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <AdditionalOptions>%(AdditionalOptions) /external:I "E:/Anaconda/envs/g308/include" /external:I "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/include" /bigobj</AdditionalOptions>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "E:/Anaconda/envs/g308/include" /external:I "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/include" /utf-8 /bigobj</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <ExceptionHandling>Sync</ExceptionHandling>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
@@ -231,7 +231,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
     <ClCompile>
       <AdditionalIncludeDirectories>E:\IMPORTANT_\SCI\algorithm\MCTS_DUAL\cpp;E:\IMPORTANT_\SCI\algorithm\MCTS_DUAL\cpp\..\..\TOOLS\glfw-3.4.bin.WIN64\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <AdditionalOptions>%(AdditionalOptions) /external:I "E:/Anaconda/envs/g308/include" /external:I "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/include" /bigobj</AdditionalOptions>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "E:/Anaconda/envs/g308/include" /external:I "E:/Anaconda/envs/g308/Lib/site-packages/pybind11/include" /utf-8 /bigobj</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <ExceptionHandling>Sync</ExceptionHandling>

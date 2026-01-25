@@ -329,10 +329,9 @@ void IntersectionEnv::update_traffic_flow(float dt) {
     }
 
     // --- NPC Controller Update ---
-    // Combine ego and NPCs for NPC's own perception
+    // NPC planning ignores ego vehicles: only consider NPC traffic cars
     std::vector<const Car*> all_vehicles;
-    all_vehicles.reserve(cars.size() + traffic_cars.size());
-    for (const auto& c : cars) all_vehicles.push_back(&c);
+    all_vehicles.reserve(traffic_cars.size());
     for (const auto& c : traffic_cars) all_vehicles.push_back(&c);
 
     for (auto& npc : traffic_cars) {

@@ -136,7 +136,7 @@ $$R_t = r_t + \gamma R_{t+1} \cdot (1 - d_t)$$
 
 #### 训练流程
 
-![训练流程图](images/training_flow.png)
+![训练流程图](images/training_flow.jpg)
 
 
 ### 4. 多智能体设置
