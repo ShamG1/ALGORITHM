@@ -198,7 +198,7 @@ $$r_i^{\text{mixed}} = (1 - \alpha) \cdot r_i + \alpha \cdot \bar{r}$$
 
 ### 多智能体配置
 
-- **智能体数量**：可配置（默认 6）
+- **智能体数量**：可配置
 - **车道数**：2 或 3 车道
 - **重生机制**：支持智能体碰撞后重生
 
@@ -210,12 +210,6 @@ $$r_i^{\text{mixed}} = (1 - \alpha) \cdot r_i + \alpha \cdot \bar{r}$$
 - **Episode 长度**：每个 episode 的步数
 - **成功率**：成功到达目标的智能体比例
 - **碰撞率**：发生碰撞的智能体比例
-
-### 性能优化
-
-- **C++ 后端**：MCTS 搜索和环境模拟使用 C++ 实现，提升性能
-- **并行 MCTS**：多进程并行执行，充分利用多核 CPU
-- **TorchScript 导出**：支持导出 TorchScript 模型用于 C++ 推理
 
 ## 代码结构
 
@@ -246,46 +240,6 @@ python MCTS_DUAL/train.py \
     --device cuda \
     --save-dir MCTS_DUAL/checkpoints
 ```
-
-### 主要参数
-
-- `--num-agents`: 智能体数量（默认 6）
-- `--num-lanes`: 车道数（默认 2）
-- `--mcts-simulations`: MCTS 模拟次数（默认 50）
-- `--rollout-depth`: 环境 rollout 深度（默认 3）
-- `--device`: 计算设备（cpu/cuda）
-- `--parallel-mcts`: 启用并行 MCTS（默认开启）
-
-## 算法优势
-
-1. **高效规划**：MCTS 结合神经网络，在有限时间内找到高质量动作
-2. **稳定训练**：共享骨干网络和 LayerNorm 确保训练稳定
-3. **可扩展性**：支持多智能体并行训练
-4. **实时性能**：C++ 后端保证实时性能
-5. **端到端学习**：双网络架构允许策略和价值函数联合优化
-
-## 技术特点
-
-### 1. 共享特征提取
-- 策略和价值网络共享 LSTM 骨干，减少参数量
-- 提高特征表示的一致性
-- 加速训练收敛
-
-### 2. 在线规划
-- MCTS 在每一步进行在线搜索
-- 结合神经网络先验和实际环境反馈
-- 平衡探索和利用
-
-### 3. 序列建模
-- LSTM 处理时序依赖
-- TBPTT 训练长序列
-- 支持部分可观测环境
-
-### 4. 多智能体协作
-- 并行 MCTS 搜索
-- 可选团队奖励混合
-- 支持异构智能体（通过不同网络）
-
 ## 参考文献
 
 - AlphaZero: Mastering Chess and Shogi by Self-Play with a General Reinforcement Learning Algorithm
