@@ -51,7 +51,7 @@ MCTS 利用双网络进行在线规划，通过模拟搜索找到最优动作。
 
 #### MCTS 搜索流程
 
-MCTS 搜索包含四个阶段，重复执行 $N$ 次（$$N$$ 为模拟次数）：
+MCTS 搜索包含四个阶段，重复执行 $N$ 次模拟：
 
 ![MCTS 搜索流程图](images/mcts_search_flow.png)
 
@@ -121,8 +121,8 @@ $$\hat{A}_t = \frac{A_t - \bar{A}}{\sigma_A + \epsilon}$$
 **价值损失（Value Loss）：**
 $$\mathcal{L}_{\mathrm{value}} = \mathbb{E}_t[(V(o_t) - R_t)^2]$$
 
-**总损失：**
-$$\mathcal{L}_{\mathrm{total}} = \mathcal{L}_{\mathrm{value}} + \lambda_p \cdot \mathcal{L}_{\mathrm{policy}}$$
+**总损失：**  
+ℒₜₒₜₐₗ = ℒᵥₐₗᵤₑ + λₚ · ℒₚₒₗᵢ𝒸ᵧ
 
 其中 $\lambda_p = 0.5$ 是策略损失权重。
 
