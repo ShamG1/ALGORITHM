@@ -53,7 +53,7 @@ MCTS 利用双网络进行在线规划，通过模拟搜索找到最优动作。
 
 MCTS 搜索包含四个阶段，重复执行 $N$ 次（$N$ 为模拟次数）：
 
-![MCTS 搜索流程图](images/mcts_search_flow.jpg)
+![MCTS 搜索流程图](images/mcts_search_flow.png)
 
 
 **搜索树结构：**
@@ -249,3 +249,4 @@ python MCTS_DUAL/train.py \
 ## 许可证
 
 [待添加]
+
