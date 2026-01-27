@@ -41,6 +41,9 @@ class DualNetwork(nn.Module):
         if self.use_lstm:
             # Shared LSTM layer
             self.lstm = nn.LSTM(hidden_dim, lstm_hidden_dim, batch_first=True)
+            # Action-conditioned transition (for MCTS branch-specific hidden propagation)
+            self.action_embed = nn.Linear(action_dim, hidden_dim)
+            self.lstm_step = nn.LSTMCell(hidden_dim + hidden_dim, lstm_hidden_dim)
             # Shared post-LSTM layers
             self.fc_shared = nn.Linear(lstm_hidden_dim, hidden_dim)
             self.fc_shared2 = nn.Linear(hidden_dim, hidden_dim)
@@ -216,3 +219,52 @@ class DualNetwork(nn.Module):
             return action, log_prob, new_hidden
         else:
             return action, log_prob
+
+    def next_hidden(self, obs, action, hidden_state=None):
+        """Compute action-conditioned next LSTM hidden state.
+
+        This is used by C++ LSTM-MCTS to propagate per-branch (h,c).
+
+        Args:
+            obs: (B, obs_dim) or (B, 1, obs_dim). Only the last step is used.
+            action: (B, action_dim) in [-1,1]
+            hidden_state: tuple (h, c) in LSTM format (1,B,H) or (B,H)
+
+        Returns:
+            new_hidden: tuple (h_next, c_next) in shape (1,B,H)
+        """
+        if not self.use_lstm:
+            raise RuntimeError("next_hidden() requires use_lstm=True")
+
+        if obs.dim() == 3:
+            obs_step = obs[:, -1, :]
+        else:
+            obs_step = obs
+
+        x_obs = self.fc_input(obs_step)
+        x_obs = self.ln_input(x_obs)
+        x_obs = F.relu(x_obs)
+
+        x_act = self.action_embed(action)
+        x_act = F.relu(x_act)
+
+        x = torch.cat([x_obs, x_act], dim=-1)
+
+        B = x.shape[0]
+        H = self.lstm.hidden_size
+
+        if hidden_state is None:
+            h0 = torch.zeros(B, H, device=x.device, dtype=x.dtype)
+            c0 = torch.zeros(B, H, device=x.device, dtype=x.dtype)
+        else:
+            h, c = hidden_state
+            # Accept (1,B,H) or (B,H)
+            if h.dim() == 3:
+                h0 = h[0]
+                c0 = c[0]
+            else:
+                h0 = h
+                c0 = c
+
+        h1, c1 = self.lstm_step(x, (h0, c0))
+        return (h1.unsqueeze(0), c1.unsqueeze(0))

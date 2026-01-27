@@ -26,15 +26,19 @@ std::pair<std::vector<float>, py::dict> mcts_search(
     unsigned int seed
 );
 
-// (LSTM) MCTS API.
-// infer_fn signature (Python):
-//   (obs_batch: List[List[float]], h_batch: np.ndarray(B,H), c_batch: np.ndarray(B,H))
-//     -> (mean: np.ndarray(B,2), std: np.ndarray(B,2), value: np.ndarray(B) or (B,1), h_next: np.ndarray(B,H) or (B,1,H), c_next: np.ndarray(B,H) or (B,1,H))
+// (LSTM) MCTS API (2-step).
+// infer_policy_value signature (Python):
+//   (obs_batch: List[List[float]], h_batch: np.ndarray(B,H) or (B,1,H), c_batch: np.ndarray(B,H) or (B,1,H))
+//     -> (mean: np.ndarray(B,2), std: np.ndarray(B,2), value: np.ndarray(B) or (B,1))
+// infer_next_hidden signature (Python):
+//   (obs_batch: List[List[float]], h_batch: np.ndarray(B,H) or (B,1,H), c_batch: np.ndarray(B,H) or (B,1,H), action_batch: np.ndarray(B,2))
+//     -> (h_next: np.ndarray(B,H) or (B,1,H), c_next: np.ndarray(B,H) or (B,1,H))
 std::pair<std::vector<float>, py::dict> mcts_search_lstm(
     IntersectionEnv& env,
     const EnvState& root_state,
     const std::vector<float>& root_obs,
-    const py::function& infer_fn,
+    const py::function& infer_policy_value,
+    const py::function& infer_next_hidden,
     const std::vector<float>& root_h,
     const std::vector<float>& root_c,
     int lstm_hidden_dim,

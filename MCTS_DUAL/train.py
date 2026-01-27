@@ -286,12 +286,25 @@ def _search_agent_wrapper(args):
             action = np.array(action)
         action = action.flatten()
         
-        return agent_id, action
+        # Return updated hidden state if provided by C++ LSTM-MCTS
+        hidden_out = None
+        try:
+            if isinstance(search_stats, dict) and ("h_next" in search_stats) and ("c_next" in search_stats):
+                hn = search_stats["h_next"]
+                cn = search_stats["c_next"]
+                # Convert to torch tensors shaped (1,1,H)
+                hn_t = torch.as_tensor(np.asarray(hn, dtype=np.float32), device=device).view(1, 1, -1)
+                cn_t = torch.as_tensor(np.asarray(cn, dtype=np.float32), device=device).view(1, 1, -1)
+                hidden_out = (hn_t, cn_t)
+        except Exception:
+            hidden_out = None
+
+        return agent_id, action, hidden_out
     except Exception as e:
         import sys
         sys.stdout.write(f"[Process {agent_id}] Error: {e}\n")
         sys.stdout.flush()
-        return agent_id, np.zeros(2)
+        return agent_id, np.zeros(2), None
 
 try:
     from .dual_net import DualNetwork
@@ -1089,8 +1102,10 @@ class MCTSTrainer:
                 completed += 1
                 
                 try:
-                    i, action = future.result(timeout=120)  # 2 minute timeout per result
+                    i, action, hidden_out = future.result(timeout=120)  # 2 minute timeout per result
                     actions[i] = action
+                    if hidden_out is not None:
+                        self.hidden_states[i] = hidden_out
                 except Exception as e:
                     agent_id = futures[future]
                     error_msg = f"Error getting result for agent {agent_id}: {e}"

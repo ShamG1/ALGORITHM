@@ -7,6 +7,7 @@
 #include <utility>
 #include <algorithm>
 #include <limits>
+#include <array>
 
 #include "IntersectionEnv.h"
 #include "EnvState.h"
@@ -29,6 +30,25 @@ struct Node {
     std::vector<ChildEdge> edges;
 };
 
+struct LSTMEdge {
+    std::array<float, 2> action; // throttle, steer
+    float prior{0.0f};
+    int N{0};
+    float W{0.0f};
+    int child{-1};
+    std::vector<float> h_next;
+    std::vector<float> c_next;
+};
+
+struct LSTMNode {
+    EnvState state;
+    float V{0.0f};
+    int total_N{0};
+    std::vector<LSTMEdge> edges;
+    std::vector<float> h;
+    std::vector<float> c;
+};
+
 static inline float clampf(float v, float lo, float hi) {
     return std::max(lo, std::min(hi, v));
 }
@@ -38,7 +58,6 @@ static inline float randn(std::mt19937& rng) {
     return nd(rng);
 }
 
-// Helper to compute log prob of a sample from a univariate Gaussian
 static inline float gaussian_log_prob(float x, float mean, float std) {
     if (std <= 1e-6f) return -std::numeric_limits<float>::infinity();
     const float var = std * std;
@@ -47,7 +66,6 @@ static inline float gaussian_log_prob(float x, float mean, float std) {
     return -0.5f * ((x - mean) * (x - mean) / var + log_2pi) - log_std;
 }
 
-// Helper to compute softmax in-place with numerical stability
 static void softmax_inplace(std::vector<float>& logits) {
     if (logits.empty()) return;
     float max_logit = -std::numeric_limits<float>::infinity();
@@ -63,23 +81,10 @@ static void softmax_inplace(std::vector<float>& logits) {
     }
 }
 
-static py::tuple call_infer(const py::function& infer_fn, const std::vector<std::vector<float>>& obs_batch) {
-    py::list lst;
-    lst.attr("reserve")(obs_batch.size());
-    for (const auto& obs : obs_batch) {
-        py::list row;
-        row.attr("reserve")(obs.size());
-        for (float v : obs) row.append(v);
-        lst.append(row);
-    }
-    return infer_fn(lst).cast<py::tuple>();
-}
-
 static void parse_infer_out(const py::tuple& out,
                             std::vector<std::array<float,2>>& means,
                             std::vector<std::array<float,2>>& stds,
                             std::vector<float>& values) {
-    // out = (mean, std, value). Each can be list-like or numpy.
     py::array mean_arr = py::array::ensure(out[0]);
     py::array std_arr  = py::array::ensure(out[1]);
     py::array val_arr  = py::array::ensure(out[2]);
@@ -109,65 +114,46 @@ static void parse_infer_out(const py::tuple& out,
     }
 }
 
-static void expand_node(IntersectionEnv& env,
-                        Node& node,
-                        const std::vector<float>& node_obs,
-                        const py::function& infer_fn,
-                        int num_action_samples,
-                        float dirichlet_alpha,
-                        float dirichlet_eps,
-                        std::mt19937& rng) {
-    py::tuple out = infer_fn(py::cast(std::vector<std::vector<float>>{node_obs})).cast<py::tuple>();
+static void parse_hc_batch(const py::handle& arr_h,
+                           int lstm_hidden_dim,
+                           std::vector<std::vector<float>>& out_batch) {
+    py::array a = py::array::ensure(arr_h);
+    if (!a) throw std::runtime_error("h/c must be array-like");
 
-    std::vector<std::array<float,2>> means, stds;
-    std::vector<float> values;
-    parse_infer_out(out, means, stds, values);
-
-    node.V = values.empty() ? 0.0f : values[0];
-
-    node.edges.clear();
-    node.edges.reserve((size_t)num_action_samples);
-
-    std::vector<float> logps;
-    logps.reserve((size_t)num_action_samples);
-
-    for (int k = 0; k < num_action_samples; ++k) {
-        float a0 = means[0][0] + stds[0][0] * randn(rng);
-        float a1 = means[0][1] + stds[0][1] * randn(rng);
-        a0 = clampf(a0, -1.0f, 1.0f);
-        a1 = clampf(a1, -1.0f, 1.0f);
-
-        ChildEdge e;
-        e.action = {a0, a1};
-        node.edges.push_back(e);
-
-        float lp = gaussian_log_prob(a0, means[0][0], stds[0][0]) + gaussian_log_prob(a1, means[0][1], stds[0][1]);
-        logps.push_back(lp);
-    }
-
-    softmax_inplace(logps);
-
-    if (dirichlet_eps > 0.0f && dirichlet_alpha > 0.0f) {
-        std::gamma_distribution<float> gd(dirichlet_alpha, 1.0f);
-        std::vector<float> noise((size_t)num_action_samples, 0.0f);
-        float sum = 0.0f;
-        for (int i = 0; i < num_action_samples; ++i) { noise[(size_t)i] = gd(rng); sum += noise[(size_t)i]; }
-        if (sum > 0.0f) {
-            for (auto& x : noise) x /= sum;
-            for (int i = 0; i < num_action_samples; ++i) {
-                logps[(size_t)i] = (1.0f - dirichlet_eps) * logps[(size_t)i] + dirichlet_eps * noise[(size_t)i];
-            }
+    if (a.ndim() == 2) {
+        // (B,H)
+        if ((int)a.shape(1) != lstm_hidden_dim) {
+            throw std::runtime_error("h/c shape mismatch: expected second dim H");
         }
+        auto u = a.unchecked<float, 2>();
+        size_t B = (size_t)u.shape(0);
+        out_batch.assign(B, std::vector<float>((size_t)lstm_hidden_dim, 0.0f));
+        for (size_t b = 0; b < B; ++b) {
+            for (int i = 0; i < lstm_hidden_dim; ++i) out_batch[b][(size_t)i] = u(b, i);
+        }
+        return;
     }
 
-    for (int k = 0; k < num_action_samples; ++k) {
-        node.edges[(size_t)k].prior = logps[(size_t)k];
+    if (a.ndim() == 3) {
+        // (B,1,H)
+        if ((int)a.shape(1) != 1 || (int)a.shape(2) != lstm_hidden_dim) {
+            throw std::runtime_error("h/c shape mismatch: expected (B,1,H)");
+        }
+        auto u = a.unchecked<float, 3>();
+        size_t B = (size_t)u.shape(0);
+        out_batch.assign(B, std::vector<float>((size_t)lstm_hidden_dim, 0.0f));
+        for (size_t b = 0; b < B; ++b) {
+            for (int i = 0; i < lstm_hidden_dim; ++i) out_batch[b][(size_t)i] = u(b, 0, i);
+        }
+        return;
     }
+
+    throw std::runtime_error("h/c must be 2D (B,H) or 3D (B,1,H)");
 }
 
-static float puct_score(const Node& node, const ChildEdge& e, float c_puct) {
-    const float Q = (e.N > 0) ? (e.W / float(e.N)) : 0.0f;
-    const float U = c_puct * e.prior * std::sqrt(float(std::max(1, node.total_N))) / (1.0f + float(e.N));
+static float puct_score_basic(int total_N, float prior, int N, float W, float c_puct) {
+    const float Q = (N > 0) ? (W / float(N)) : 0.0f;
+    const float U = c_puct * prior * std::sqrt(float(std::max(1, total_N))) / (1.0f + float(N));
     return Q + U;
 }
 
@@ -201,18 +187,30 @@ static std::vector<float> step_env_with_action(IntersectionEnv& env,
     env.set_state(saved);
 
     done_out = terminated;
-    (void)total_reward; // currently unused
+    (void)total_reward;
     return ego_obs;
 }
 
-static void backup(std::vector<std::pair<int,int>>& path, std::vector<Node>& nodes, float value) {
+static void backup_lstm(std::vector<std::pair<int,int>>& path, std::vector<LSTMNode>& nodes, float value) {
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
         int nidx = it->first;
         int eidx = it->second;
-        nodes[nidx].total_N += 1;
+        nodes[(size_t)nidx].total_N += 1;
         if (eidx >= 0) {
-            nodes[nidx].edges[(size_t)eidx].N += 1;
-            nodes[nidx].edges[(size_t)eidx].W += value;
+            nodes[(size_t)nidx].edges[(size_t)eidx].N += 1;
+            nodes[(size_t)nidx].edges[(size_t)eidx].W += value;
+        }
+    }
+}
+
+static void backup_basic(std::vector<std::pair<int,int>>& path, std::vector<Node>& nodes, float value) {
+    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+        int nidx = it->first;
+        int eidx = it->second;
+        nodes[(size_t)nidx].total_N += 1;
+        if (eidx >= 0) {
+            nodes[(size_t)nidx].edges[(size_t)eidx].N += 1;
+            nodes[(size_t)nidx].edges[(size_t)eidx].W += value;
         }
     }
 }
@@ -241,22 +239,87 @@ std::pair<std::vector<float>, py::dict> mcts_search(
     root.state = root_state;
     nodes.push_back(std::move(root));
 
-    expand_node(env, nodes[0], root_obs, infer_fn, num_action_samples, dirichlet_alpha, dirichlet_eps, rng);
+    auto expand_node = [&](Node& node, const std::vector<float>& node_obs, bool add_dirichlet) {
+        // We reuse the same infer_policy_value signature as LSTM version: (obs_batch, h, c) -> (mean,std,value)
+        // For non-LSTM, we pass dummy h/c.
+        py::list obs_one;
+        {
+            py::list row;
+            for (float v : node_obs) row.append(v);
+            obs_one.append(row);
+        }
 
+        py::array_t<float> h_arr({1, 1});
+        py::array_t<float> c_arr({1, 1});
+        h_arr.mutable_at(0,0) = 0.0f;
+        c_arr.mutable_at(0,0) = 0.0f;
+
+        py::tuple pv = infer_fn(obs_one, h_arr, c_arr).cast<py::tuple>();
+        if (pv.size() < 3) throw std::runtime_error("infer_fn must return (mean,std,value)");
+
+        std::vector<std::array<float,2>> means, stds;
+        std::vector<float> values;
+        parse_infer_out(pv, means, stds, values);
+        node.V = values.empty() ? 0.0f : values[0];
+
+        // Sample actions + priors
+        std::vector<std::array<float,2>> sampled;
+        sampled.reserve((size_t)num_action_samples);
+        std::vector<float> logps;
+        logps.reserve((size_t)num_action_samples);
+
+        for (int k = 0; k < num_action_samples; ++k) {
+            float a0 = means[0][0] + stds[0][0] * randn(rng);
+            float a1 = means[0][1] + stds[0][1] * randn(rng);
+            a0 = clampf(a0, -1.0f, 1.0f);
+            a1 = clampf(a1, -1.0f, 1.0f);
+            sampled.push_back({a0, a1});
+            float lp = gaussian_log_prob(a0, means[0][0], stds[0][0]) + gaussian_log_prob(a1, means[0][1], stds[0][1]);
+            logps.push_back(lp);
+        }
+
+        softmax_inplace(logps);
+
+        if (add_dirichlet && dirichlet_eps > 0.0f && dirichlet_alpha > 0.0f) {
+            std::gamma_distribution<float> gd(dirichlet_alpha, 1.0f);
+            std::vector<float> noise((size_t)num_action_samples, 0.0f);
+            float s = 0.0f;
+            for (int i = 0; i < num_action_samples; ++i) { noise[(size_t)i] = gd(rng); s += noise[(size_t)i]; }
+            if (s > 0.0f) {
+                for (auto& x : noise) x /= s;
+                for (int i = 0; i < num_action_samples; ++i) {
+                    logps[(size_t)i] = (1.0f - dirichlet_eps) * logps[(size_t)i] + dirichlet_eps * noise[(size_t)i];
+                }
+            }
+        }
+
+        node.edges.clear();
+        node.edges.reserve((size_t)num_action_samples);
+        for (int k = 0; k < num_action_samples; ++k) {
+            ChildEdge e;
+            e.action = sampled[(size_t)k];
+            e.prior = logps[(size_t)k];
+            node.edges.push_back(e);
+        }
+    };
+
+    // Expand root
+    expand_node(nodes[0], root_obs, true);
+
+    // MCTS loop
     for (int sim = 0; sim < num_simulations; ++sim) {
         std::vector<std::pair<int,int>> path;
         int cur = 0;
 
         while (true) {
             Node& n = nodes[(size_t)cur];
-            if (n.edges.empty()) {
-                break;
-            }
+            if (n.edges.empty()) break;
 
             float best = -1e9f;
             int best_e = 0;
             for (int ei = 0; ei < (int)n.edges.size(); ++ei) {
-                float s = puct_score(n, n.edges[(size_t)ei], c_puct);
+                const ChildEdge& e = n.edges[(size_t)ei];
+                float s = puct_score_basic(n.total_N, e.prior, e.N, e.W, c_puct);
                 if (s > best) { best = s; best_e = ei; }
             }
 
@@ -270,23 +333,26 @@ std::pair<std::vector<float>, py::dict> mcts_search(
 
                 Node child;
                 child.state = std::move(next_state);
+
                 int child_idx = (int)nodes.size();
                 nodes.push_back(std::move(child));
                 e.child = child_idx;
 
-                expand_node(env, nodes[(size_t)child_idx], next_obs, infer_fn, num_action_samples, 0.0f, 0.0f, rng);
-                float leaf_value = nodes[(size_t)child_idx].V;
+                expand_node(nodes[(size_t)child_idx], next_obs, false);
 
-                backup(path, nodes, leaf_value);
+                float leaf_value = nodes[(size_t)child_idx].V;
+                backup_basic(path, nodes, leaf_value);
                 break;
-            } else {
-                cur = e.child;
             }
+
+            cur = e.child;
         }
     }
 
+    // Choose action from root visits
     const Node& rootn = nodes[0];
     std::vector<float> action_out = {0.0f, 0.0f};
+    int selected_edge = -1;
 
     if (!rootn.edges.empty()) {
         std::vector<float> probs(rootn.edges.size(), 0.0f);
@@ -302,10 +368,8 @@ std::pair<std::vector<float>, py::dict> mcts_search(
             for (auto& p : probs) p /= sum;
             std::discrete_distribution<int> dd(probs.begin(), probs.end());
             best_i = (size_t)dd(rng);
-        } else {
-            best_i = 0;
         }
-
+        selected_edge = (int)best_i;
         action_out[0] = rootn.edges[best_i].action[0];
         action_out[1] = rootn.edges[best_i].action[1];
     }
@@ -324,15 +388,12 @@ std::pair<std::vector<float>, py::dict> mcts_search(
     return {action_out, stats};
 }
 
-// Minimal LSTM variant.
-// For now, this keeps the same tree/search logic as mcts_search, but calls the LSTM infer_fn
-// once at the root to validate the interface and returns h/c passthrough in stats.
-// A full LSTM-MCTS (propagating hidden state per node) can be implemented later.
 std::pair<std::vector<float>, py::dict> mcts_search_lstm(
     IntersectionEnv& env,
     const EnvState& root_state,
     const std::vector<float>& root_obs,
-    const py::function& infer_fn,
+    const py::function& infer_policy_value,
+    const py::function& infer_next_hidden,
     const std::vector<float>& root_h,
     const std::vector<float>& root_c,
     int lstm_hidden_dim,
@@ -346,65 +407,225 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
     float dirichlet_eps,
     unsigned int seed
 ) {
-    // Build (1,H) numpy arrays for h/c
-    py::array_t<float> h_arr({1, lstm_hidden_dim});
-    py::array_t<float> c_arr({1, lstm_hidden_dim});
-    auto h_mut = h_arr.mutable_unchecked<2>();
-    auto c_mut = c_arr.mutable_unchecked<2>();
-    for (int i = 0; i < lstm_hidden_dim; ++i) {
-        h_mut(0, i) = (i < (int)root_h.size()) ? root_h[(size_t)i] : 0.0f;
-        c_mut(0, i) = (i < (int)root_c.size()) ? root_c[(size_t)i] : 0.0f;
+    std::mt19937 rng(seed ? seed : std::random_device{}());
+
+    std::vector<LSTMNode> nodes;
+    nodes.reserve((size_t)num_simulations + 1);
+
+    LSTMNode root;
+    root.state = root_state;
+    root.h = root_h;
+    root.c = root_c;
+    nodes.push_back(std::move(root));
+
+    auto expand_node = [&](LSTMNode& node, const std::vector<float>& node_obs, bool add_dirichlet) {
+        // policy/value call with batch size 1
+        py::list obs_one;
+        {
+            py::list row;
+            for (float v : node_obs) row.append(v);
+            obs_one.append(row);
+        }
+
+        py::array_t<float> h_arr({1, lstm_hidden_dim});
+        py::array_t<float> c_arr({1, lstm_hidden_dim});
+        {
+            auto hm = h_arr.mutable_unchecked<2>();
+            auto cm = c_arr.mutable_unchecked<2>();
+            for (int i = 0; i < lstm_hidden_dim; ++i) {
+                hm(0, i) = (i < (int)node.h.size()) ? node.h[(size_t)i] : 0.0f;
+                cm(0, i) = (i < (int)node.c.size()) ? node.c[(size_t)i] : 0.0f;
+            }
+        }
+
+        py::tuple pv = infer_policy_value(obs_one, h_arr, c_arr).cast<py::tuple>();
+        if (pv.size() < 3) throw std::runtime_error("infer_policy_value must return (mean,std,value)");
+
+        std::vector<std::array<float,2>> means, stds;
+        std::vector<float> values;
+        parse_infer_out(pv, means, stds, values);
+        node.V = values.empty() ? 0.0f : values[0];
+
+        // Sample actions + priors
+        std::vector<std::array<float,2>> sampled;
+        sampled.reserve((size_t)num_action_samples);
+        std::vector<float> logps;
+        logps.reserve((size_t)num_action_samples);
+
+        for (int k = 0; k < num_action_samples; ++k) {
+            float a0 = means[0][0] + stds[0][0] * randn(rng);
+            float a1 = means[0][1] + stds[0][1] * randn(rng);
+            a0 = clampf(a0, -1.0f, 1.0f);
+            a1 = clampf(a1, -1.0f, 1.0f);
+            sampled.push_back({a0, a1});
+            float lp = gaussian_log_prob(a0, means[0][0], stds[0][0]) + gaussian_log_prob(a1, means[0][1], stds[0][1]);
+            logps.push_back(lp);
+        }
+
+        softmax_inplace(logps);
+
+        if (add_dirichlet && dirichlet_eps > 0.0f && dirichlet_alpha > 0.0f) {
+            std::gamma_distribution<float> gd(dirichlet_alpha, 1.0f);
+            std::vector<float> noise((size_t)num_action_samples, 0.0f);
+            float s = 0.0f;
+            for (int i = 0; i < num_action_samples; ++i) { noise[(size_t)i] = gd(rng); s += noise[(size_t)i]; }
+            if (s > 0.0f) {
+                for (auto& x : noise) x /= s;
+                for (int i = 0; i < num_action_samples; ++i) {
+                    logps[(size_t)i] = (1.0f - dirichlet_eps) * logps[(size_t)i] + dirichlet_eps * noise[(size_t)i];
+                }
+            }
+        }
+
+        // Batch next_hidden for each sampled action
+        py::array_t<float> action_arr({num_action_samples, 2});
+        {
+            auto am = action_arr.mutable_unchecked<2>();
+            for (int k = 0; k < num_action_samples; ++k) {
+                am(k, 0) = sampled[(size_t)k][0];
+                am(k, 1) = sampled[(size_t)k][1];
+            }
+        }
+
+        py::list obs_batch;
+        for (int k = 0; k < num_action_samples; ++k) {
+            py::list row;
+            for (float v : node_obs) row.append(v);
+            obs_batch.append(row);
+        }
+
+        py::array_t<float> h_rep({num_action_samples, lstm_hidden_dim});
+        py::array_t<float> c_rep({num_action_samples, lstm_hidden_dim});
+        {
+            auto hm = h_rep.mutable_unchecked<2>();
+            auto cm = c_rep.mutable_unchecked<2>();
+            for (int k = 0; k < num_action_samples; ++k) {
+                for (int i = 0; i < lstm_hidden_dim; ++i) {
+                    hm(k, i) = (i < (int)node.h.size()) ? node.h[(size_t)i] : 0.0f;
+                    cm(k, i) = (i < (int)node.c.size()) ? node.c[(size_t)i] : 0.0f;
+                }
+            }
+        }
+
+        py::tuple hc = infer_next_hidden(obs_batch, h_rep, c_rep, action_arr).cast<py::tuple>();
+        if (hc.size() < 2) throw std::runtime_error("infer_next_hidden must return (h_next,c_next)");
+
+        std::vector<std::vector<float>> h_next_b, c_next_b;
+        parse_hc_batch(hc[0], lstm_hidden_dim, h_next_b);
+        parse_hc_batch(hc[1], lstm_hidden_dim, c_next_b);
+
+        node.edges.clear();
+        node.edges.reserve((size_t)num_action_samples);
+        for (int k = 0; k < num_action_samples; ++k) {
+            LSTMEdge e;
+            e.action = sampled[(size_t)k];
+            e.prior = logps[(size_t)k];
+            e.h_next = h_next_b[(size_t)k];
+            e.c_next = c_next_b[(size_t)k];
+            node.edges.push_back(std::move(e));
+        }
+    };
+
+    // Expand root
+    expand_node(nodes[0], root_obs, true);
+
+    // MCTS loop
+    for (int sim = 0; sim < num_simulations; ++sim) {
+        std::vector<std::pair<int,int>> path;
+        int cur = 0;
+
+        while (true) {
+            LSTMNode& n = nodes[(size_t)cur];
+            if (n.edges.empty()) break;
+
+            float best = -1e9f;
+            int best_e = 0;
+            for (int ei = 0; ei < (int)n.edges.size(); ++ei) {
+                const LSTMEdge& e = n.edges[(size_t)ei];
+                float s = puct_score_basic(n.total_N, e.prior, e.N, e.W, c_puct);
+                if (s > best) { best = s; best_e = ei; }
+            }
+
+            path.push_back({cur, best_e});
+
+            LSTMEdge& e = n.edges[(size_t)best_e];
+            if (e.child < 0) {
+                bool done = false;
+                EnvState next_state;
+                auto next_obs = step_env_with_action(env, n.state, e.action, rollout_depth, gamma, done, next_state);
+
+                LSTMNode child;
+                child.state = std::move(next_state);
+                child.h = e.h_next;
+                child.c = e.c_next;
+
+                int child_idx = (int)nodes.size();
+                nodes.push_back(std::move(child));
+                e.child = child_idx;
+
+                expand_node(nodes[(size_t)child_idx], next_obs, false);
+
+                float leaf_value = nodes[(size_t)child_idx].V;
+                backup_lstm(path, nodes, leaf_value);
+                break;
+            }
+
+            cur = e.child;
+        }
     }
 
-    // Call LSTM infer once to ensure contract is satisfied and to get a value estimate.
-    // Expected: (mean, std, value, h_next, c_next)
-    py::list obs_lst;
-    {
-        py::list row;
-        row.attr("reserve")(root_obs.size());
-        for (float v : root_obs) row.append(v);
-        obs_lst.append(row);
+    // Choose action from root visits
+    const LSTMNode& rootn = nodes[0];
+    std::vector<float> action_out = {0.0f, 0.0f};
+    int selected_edge = -1;
+
+    if (!rootn.edges.empty()) {
+        std::vector<float> probs(rootn.edges.size(), 0.0f);
+        float sum = 0.0f;
+        for (size_t i = 0; i < rootn.edges.size(); ++i) {
+            float p = float(std::max(0, rootn.edges[i].N));
+            if (temperature > 1e-6f) p = std::pow(p, 1.0f / temperature);
+            probs[i] = p;
+            sum += p;
+        }
+        size_t best_i = 0;
+        if (sum > 0.0f) {
+            for (auto& p : probs) p /= sum;
+            std::discrete_distribution<int> dd(probs.begin(), probs.end());
+            best_i = (size_t)dd(rng);
+        }
+        selected_edge = (int)best_i;
+        action_out[0] = rootn.edges[best_i].action[0];
+        action_out[1] = rootn.edges[best_i].action[1];
     }
 
-    py::tuple out = infer_fn(obs_lst, h_arr, c_arr).cast<py::tuple>();
-    if (out.size() < 5) {
-        throw std::runtime_error("infer_fn for mcts_search_lstm must return 5-tuple (mean,std,value,h_next,c_next)");
+    py::dict stats;
+    py::dict visit_counts;
+    for (size_t i = 0; i < rootn.edges.size(); ++i) {
+        py::list a;
+        a.append(rootn.edges[i].action[0]);
+        a.append(rootn.edges[i].action[1]);
+        visit_counts[py::str(py::repr(a))] = rootn.edges[i].N;
+    }
+    stats["visit_counts"] = visit_counts;
+    stats["num_simulations"] = num_simulations;
+
+    if (selected_edge >= 0) {
+        py::array_t<float> h_next({lstm_hidden_dim});
+        py::array_t<float> c_next({lstm_hidden_dim});
+        {
+            auto hm = h_next.mutable_unchecked<1>();
+            auto cm = c_next.mutable_unchecked<1>();
+            for (int i = 0; i < lstm_hidden_dim; ++i) {
+                hm(i) = rootn.edges[(size_t)selected_edge].h_next[(size_t)i];
+                cm(i) = rootn.edges[(size_t)selected_edge].c_next[(size_t)i];
+            }
+        }
+        stats["h_next"] = h_next;
+        stats["c_next"] = c_next;
     }
 
-    // Reuse the existing non-LSTM search by wrapping infer_fn to ignore h/c.
-    // This provides correct symbol + basic behavior; hidden-state propagation is not yet implemented.
-    py::function infer_wrap = py::cpp_function([infer_fn, lstm_hidden_dim, h_arr, c_arr](py::list obs_batch) {
-        // Call original infer with provided batch and constant (root) h/c.
-        py::tuple o = infer_fn(obs_batch, h_arr, c_arr).cast<py::tuple>();
-        // Return only (mean,std,value) to match parse_infer_out.
-        py::tuple out3(3);
-        out3[0] = o[0];
-        out3[1] = o[1];
-        out3[2] = o[2];
-        return out3;
-    });
-
-    auto res = mcts_search(
-        env,
-        root_state,
-        root_obs,
-        infer_wrap,
-        num_simulations,
-        num_action_samples,
-        rollout_depth,
-        c_puct,
-        temperature,
-        gamma,
-        dirichlet_alpha,
-        dirichlet_eps,
-        seed
-    );
-
-    // Attach h_next/c_next for callers that want to update hidden state.
-    py::dict stats = res.second;
-    stats["h_next"] = out[3];
-    stats["c_next"] = out[4];
     stats["lstm_hidden_dim"] = lstm_hidden_dim;
 
-    return {res.first, stats};
+    return {action_out, stats};
 }

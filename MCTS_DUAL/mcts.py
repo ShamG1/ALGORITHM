@@ -89,50 +89,48 @@ class MCTS:
 
         lstm_hidden_dim = int(getattr(self.network, 'lstm_hidden_dim', 128))
 
-        def infer_fn_lstm(
+        def infer_policy_value(
             obs_batch: List[List[float]],
             h: np.ndarray,
             c: np.ndarray
-        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             if not obs_batch:
                 empty = np.array([])
-                return empty, empty, empty, empty, empty
+                return empty, empty, empty
 
             obs_tensor = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
 
-            # h/c expected as flat (H,). Convert to (1,1,H) as required by nn.LSTM.
-            h_t = torch.as_tensor(np.asarray(h, dtype=np.float32), device=self.device).view(1, 1, -1)
-            c_t = torch.as_tensor(np.asarray(c, dtype=np.float32), device=self.device).view(1, 1, -1)
+            # h/c expected as (B,H) or flat; convert to (1,B,H) for PyTorch LSTM.
+            h_np = np.asarray(h, dtype=np.float32)
+            c_np = np.asarray(c, dtype=np.float32)
+            if h_np.ndim == 1:
+                h_np = np.tile(h_np[None, :], (obs_tensor.shape[0], 1))
+                c_np = np.tile(c_np[None, :], (obs_tensor.shape[0], 1))
+
+            h_t = torch.as_tensor(h_np, device=self.device).view(1, obs_tensor.shape[0], -1)
+            c_t = torch.as_tensor(c_np, device=self.device).view(1, obs_tensor.shape[0], -1)
 
             means_list = []
             stds_list = []
             values_list = []
-            hn_list = []
-            cn_list = []
 
             with torch.no_grad():
                 # Evaluate each item with its own recurrent state (tree nodes).
                 for i in range(obs_tensor.shape[0]):
                     x = obs_tensor[i].view(1, -1)  # (1, obs_dim)
-                    m, s, v, (hn, cn) = self.network(x, (h_t, c_t))
+                    m, s, v, _ = self.network(x, (h_t, c_t))
                     means_list.append(m.squeeze(0))
                     stds_list.append(s.squeeze(0))
                     values_list.append(v.view(-1)[0])
-                    hn_list.append(hn.squeeze(0).squeeze(0))
-                    cn_list.append(cn.squeeze(0).squeeze(0))
 
             means = torch.stack(means_list, dim=0)
             stds = torch.stack(stds_list, dim=0)
             values = torch.stack(values_list, dim=0)
-            hn = torch.stack(hn_list, dim=0)  # (B,H)
-            cn = torch.stack(cn_list, dim=0)  # (B,H)
 
             return (
                 means.cpu().numpy(),
                 stds.cpu().numpy(),
                 values.cpu().numpy(),
-                hn.cpu().numpy(),
-                cn.cpu().numpy()
             )
 
         # Root hidden state (1,1,H) in training code -> flatten to (H,)
@@ -143,13 +141,43 @@ class MCTS:
             h0 = np.zeros((lstm_hidden_dim,), dtype=np.float32)
             c0 = np.zeros((lstm_hidden_dim,), dtype=np.float32)
 
+        def infer_next_hidden(
+            obs_batch: List[List[float]],
+            h: np.ndarray,
+            c: np.ndarray,
+            action_batch: np.ndarray,
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            if not obs_batch:
+                empty = np.array([])
+                return empty, empty
+
+            obs_tensor = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
+            act_tensor = torch.as_tensor(np.asarray(action_batch, dtype=np.float32), device=self.device)
+
+            # h/c expected as (B,H) or flat; convert to (1,B,H)
+            h_np = np.asarray(h, dtype=np.float32)
+            c_np = np.asarray(c, dtype=np.float32)
+            if h_np.ndim == 1:
+                h_np = np.tile(h_np[None, :], (obs_tensor.shape[0], 1))
+                c_np = np.tile(c_np[None, :], (obs_tensor.shape[0], 1))
+
+            h_t = torch.as_tensor(h_np, device=self.device).view(1, obs_tensor.shape[0], -1)
+            c_t = torch.as_tensor(c_np, device=self.device).view(1, obs_tensor.shape[0], -1)
+
+            with torch.no_grad():
+                hn, cn = self.network.next_hidden(obs_tensor, act_tensor, (h_t, c_t))
+
+            # Return (B,H)
+            return hn.squeeze(0).cpu().numpy(), cn.squeeze(0).cpu().numpy()
+
         # Prefer recurrent C++ MCTS if available
         if hasattr(cpp_backend, 'mcts_search_lstm'):
             action, stats = cpp_backend.mcts_search_lstm(
                 cpp_env,
                 root_state_cpp,
                 root_obs.tolist(),
-                infer_fn_lstm,
+                infer_policy_value,
+                infer_next_hidden,
                 h0.tolist(),
                 c0.tolist(),
                 lstm_hidden_dim,
@@ -164,11 +192,12 @@ class MCTS:
                 seed=int(np.random.randint(0, 2**31 - 1, dtype=np.int64))
             )
         else:
+            # Fallback: non-LSTM C++ MCTS
             action, stats = cpp_backend.mcts_search(
                 cpp_env,
                 root_state_cpp,
                 root_obs.tolist(),
-                infer_fn_lstm,
+                infer_policy_value,
                 num_simulations=self.num_simulations,
                 num_action_samples=self.num_action_samples,
                 rollout_depth=self.rollout_depth,
