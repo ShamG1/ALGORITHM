@@ -14,22 +14,39 @@
 
 ![双网络架构图](images/dual_network_architecture.png)
 
-
 #### 数学表示
 
 对于观测序列 $o_{1:t} = \{o_1, o_2, \ldots, o_t\}$，网络前向传播为：
 
 **共享特征提取：**
-$$h_t = \text{LSTM}(f_{\text{input}}(o_t), h_{t-1})$$
-$$x_t = f_{\text{shared}}(h_t)$$
+
+$$
+h_t = \text{LSTM}(f_{\text{input}}(o_t), h_{t-1})
+$$
+
+$$
+x_t = f_{\text{shared}}(h_t)
+$$
 
 **策略输出：**
-$$\mu_t = \tanh(f_{\mu}(x_t)) \in [-1, 1]$$
-$$\log \sigma_t = \text{clamp}(f_{\sigma}(x_t), -5, 1)$$
-$$\sigma_t = \exp(\log \sigma_t)$$
+
+$$
+\mu_t = \tanh(f_{\mu}(x_t)) \in [-1, 1]
+$$
+
+$$
+\log \sigma_t = \text{clamp}(f_{\sigma}(x_t), -5, 1)
+$$
+
+$$
+\sigma_t = \exp(\log \sigma_t)
+$$
 
 **价值输出：**
-$$V_t = f_v(x_t)$$
+
+$$
+V_t = f_v(x_t)
+$$
 
 其中：
 - $f_{\text{input}}$: 输入投影层
@@ -40,10 +57,16 @@ $$V_t = f_v(x_t)$$
 #### 动作采样
 
 策略分布为多元高斯分布：
-$$a_t \sim \mathcal{N}(\mu_t, \sigma_t^2)$$
+
+$$
+a_t \sim \mathcal{N}(\mu_t, \sigma_t^2)
+$$
 
 动作被裁剪到 $[-1, 1]$ 范围内：
-$$a_t = \text{clip}(a_t, -1, 1)$$
+
+$$
+a_t = \text{clip}(a_t, -1, 1)
+$$
 
 ### 2. 蒙特卡洛树搜索（MCTS）
 
@@ -55,11 +78,9 @@ MCTS 搜索包含四个阶段，重复执行 $N$ 次模拟：
 
 ![MCTS 搜索流程图](images/mcts_search_flow.png)
 
-
 **搜索树结构：**
 
 ![MCTS 搜索树结构](images/mcts_tree_structure.png)
-
 
 每个节点存储：
 - $N(s)$: 节点访问次数
@@ -71,7 +92,9 @@ MCTS 搜索包含四个阶段，重复执行 $N$ 次模拟：
 
 对于节点 $s$，选择动作 $a$ 的 UCB 分数为：
 
-$$U(s, a) = Q(s, a) + c_{\text{puct}} \cdot P(s, a) \cdot \frac{\sqrt{N(s)}}{1 + N(s, a)}$$
+$$
+U(s, a) = Q(s, a) + c_{\text{puct}} \cdot P(s, a) \cdot \frac{\sqrt{N(s)}}{1 + N(s, a)}
+$$
 
 其中：
 - $Q(s, a)$: 动作价值估计
@@ -84,7 +107,9 @@ $$U(s, a) = Q(s, a) + c_{\text{puct}} \cdot P(s, a) \cdot \frac{\sqrt{N(s)}}{1 +
 
 在 MCTS 搜索完成后，根据访问次数分布采样动作：
 
-$$P(a|s) = \frac{N(s, a)^{1/\tau}}{\sum_{a'} N(s, a')^{1/\tau}}$$
+$$
+P(a|s) = \frac{N(s, a)^{1/\tau}}{\sum_{a'} N(s, a')^{1/\tau}}
+$$
 
 其中 $\tau$ 是温度参数：
 - $\tau = 1$: 按访问次数分布采样
@@ -103,11 +128,20 @@ $$P(a|s) = \frac{N(s, a)^{1/\tau}}{\sum_{a'} N(s, a')^{1/\tau}}$$
 #### 损失函数
 
 **策略损失（Policy Loss）：**
-$$\mathcal{L}_{\mathrm{policy}} = -\mathbb{E}_t[\log \pi(a_t|o_t) \cdot \hat{A}_t]$$
+
+$$
+\mathcal{L}_{\text{policy}} = -\mathbb{E}_t[\log \pi(a_t|o_t) \cdot \hat{A}_t]
+$$
 
 其中 $\hat{A}_t$ 是归一化后的优势函数：
-$$A_t = R_t - V(o_t)$$
-$$\hat{A}_t = \frac{A_t - \bar{A}}{\sigma_A + \epsilon}$$
+
+$$
+A_t = R_t - V(o_t)
+$$
+
+$$
+\hat{A}_t = \frac{A_t - \bar{A}}{\sigma_A + \epsilon}
+$$
 
 其中：
 - $R_t$: 回报（Returns）
@@ -119,15 +153,24 @@ $$\hat{A}_t = \frac{A_t - \bar{A}}{\sigma_A + \epsilon}$$
 归一化优势函数有助于稳定训练，减少方差。
 
 **价值损失（Value Loss）：**
-$$\mathcal{L}_{\mathrm{value}} = \mathbb{E}_t[(V(o_t) - R_t)^2]$$
 
-**总损失：**  
-ℒₜₒₜₐₗ = ℒᵥₐₗᵤₑ + λₚ · ℒₚₒₗᵢ𝒸ᵧ
+$$
+\mathcal{L}_{\text{value}} = \mathbb{E}_t[(V(o_t) - R_t)^2]
+$$
+
+**总损失：**
+
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{value}} + \lambda_p \cdot \mathcal{L}_{\text{policy}}
+$$
 
 其中 $\lambda_p = 0.5$ 是策略损失权重。
 
 **回报计算（Returns）：**
-$$R_t = r_t + \gamma R_{t+1} \cdot (1 - d_t)$$
+
+$$
+R_t = r_t + \gamma R_{t+1} \cdot (1 - d_t)
+$$
 
 其中：
 - $r_t$: 即时奖励
@@ -137,7 +180,6 @@ $$R_t = r_t + \gamma R_{t+1} \cdot (1 - d_t)$$
 #### 训练流程
 
 ![训练流程图](images/training_flow.jpg)
-
 
 ### 4. 多智能体设置
 
@@ -152,7 +194,10 @@ $$R_t = r_t + \gamma R_{t+1} \cdot (1 - d_t)$$
 #### 团队奖励（可选）
 
 支持团队奖励混合：
-$$r_i^{\text{mixed}} = (1 - \alpha) \cdot r_i + \alpha \cdot \bar{r}$$
+
+$$
+r_i^{\text{mixed}} = (1 - \alpha) \cdot r_i + \alpha \cdot \bar{r}
+$$
 
 其中：
 - $r_i$: 智能体 $i$ 的个体奖励
@@ -184,32 +229,6 @@ $$r_i^{\text{mixed}} = (1 - \alpha) \cdot r_i + \alpha \cdot \bar{r}$$
 - **Tanh**：用于策略均值输出（限制在 $[-1, 1]$）
 - **Softplus（clamped）**：用于标准差输出（确保正值）
 
-## 环境设置
-
-### 交叉路口环境
-
-- **观测维度**：127 维（包含位置、速度、LIDAR 等）
-- **动作空间**：连续 2 维（油门和转向），范围 $[-1, 1]$
-- **奖励函数**：
-  - 进度奖励：$+10.0 \times \text{progress}$
-  - 成功奖励：$+10.0$（到达目标）
-  - 碰撞惩罚：$-10.0$（车辆碰撞）或 $-5.0$（障碍物碰撞）
-  - 卡住惩罚：$-0.01$（速度低于阈值）
-
-### 多智能体配置
-
-- **智能体数量**：可配置
-- **车道数**：2 或 3 车道
-- **重生机制**：支持智能体碰撞后重生
-
-## 实验结果
-
-### 训练指标
-
-- **Episode 奖励**：每个 episode 的总奖励和平均奖励
-- **Episode 长度**：每个 episode 的步数
-- **成功率**：成功到达目标的智能体比例
-- **碰撞率**：发生碰撞的智能体比例
 
 ## 代码结构
 
