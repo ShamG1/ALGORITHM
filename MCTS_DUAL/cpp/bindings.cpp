@@ -108,4 +108,23 @@ PYBIND11_MODULE(cpp_mcts, m) {
         py::arg("dirichlet_eps"),
         py::arg("seed")
     );
+
+    m.def("mcts_search_lstm", &mcts_search_lstm,
+        py::arg("env"),
+        py::arg("root_state"),
+        py::arg("root_obs"),
+        py::arg("infer_fn"),
+        py::arg("root_h"),
+        py::arg("root_c"),
+        py::arg("lstm_hidden_dim"),
+        py::arg("num_simulations"),
+        py::arg("num_action_samples"),
+        py::arg("rollout_depth"),
+        py::arg("c_puct"),
+        py::arg("temperature"),
+        py::arg("gamma"),
+        py::arg("dirichlet_alpha"),
+        py::arg("dirichlet_eps"),
+        py::arg("seed")
+    );
 }

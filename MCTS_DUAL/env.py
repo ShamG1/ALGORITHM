@@ -108,6 +108,12 @@ class IntersectionEnv:
         self.lane_layout = build_lane_layout(self.num_lanes)
         self.points = self.lane_layout["points"]
 
+        if not cpp_backend.has_cpp_backend():
+            raise RuntimeError(
+                "cpp_mcts backend not available. Build it first, or run with the pure-Python environment. "
+                "(cpp/build or cpp/build/Release must contain the cpp_mcts extension)"
+            )
+
         self.env = cpp_backend.IntersectionEnv(self.num_lanes)
         self.env.configure(use_team, respawn, max_steps)
 

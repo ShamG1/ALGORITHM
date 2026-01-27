@@ -7,14 +7,27 @@ import sys
 # Suppress pygame messages in worker processes (set before any pygame imports)
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 
+# Avoid over-subscription when using multi-process MCTS: keep BLAS/OMP + torch single-threaded.
+# (These must be set before heavy numeric libraries fully initialize.)
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+
 import numpy as np
 import torch
 import torch.optim as optim
+
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
 from datetime import datetime
 from time import time
 from collections import deque
 import csv
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 import multiprocessing as mp
 from typing import Optional
 try:
@@ -58,19 +71,34 @@ _WORKER_CACHE = {
     "env": None
 }
 
+# Shared-memory weight broadcast (to avoid per-step pickling of state_dict)
+# These globals are initialized in the main process and inherited by worker processes.
+_SHARED_STATE = {
+    "tensors": None,   # Ordered list[torch.Tensor] on CPU, shared_memory_()
+    "version": None,   # multiprocessing.Value("Q")
+    "lock": None       # multiprocessing.Lock
+}
+
+def _init_worker_shared_state(shared_tensors, version, lock):
+    global _SHARED_STATE
+    _SHARED_STATE["tensors"] = shared_tensors
+    _SHARED_STATE["version"] = version
+    _SHARED_STATE["lock"] = lock
+
 def _search_agent_wrapper(args):
     """
     Wrapper function for process pool MCTS search.
     Must be at module level to be picklable.
     Uses global cache to persist objects across calls within the same process.
     """
-    agent_id, obs_data, obs_history_data, hidden_state_data, env_state_data, config = args
+    # suppress pygame initialization messages
+    import os
+    os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+
+    agent_id, obs_data, hidden_state_data, config = args
     
     # reference global variables
     global _WORKER_CACHE
-    
-    # suppress pygame initialization messages
-    os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
     
     try:
         # Deterministic per-call seed (optional)
@@ -104,7 +132,6 @@ def _search_agent_wrapper(args):
                 except ImportError:
                     # Fallback: import from MCTS_DUAL package
                     import sys
-                    import os
                     mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                     if mcts_dual_path not in sys.path:
                         sys.path.insert(0, mcts_dual_path)
@@ -122,9 +149,28 @@ def _search_agent_wrapper(args):
             network.eval()
             _WORKER_CACHE["network"] = network
         
-        # always load the latest weights (this is a lightweight operation)
-        _WORKER_CACHE["network"].load_state_dict(config['network_state_dict'])
-        
+        # Load latest weights from shared memory if configured; fallback to state_dict path.
+        if _SHARED_STATE.get("tensors") is not None and _SHARED_STATE.get("version") is not None:
+            last_ver = _WORKER_CACHE.get("_last_weight_version", -1)
+            cur_ver = int(_SHARED_STATE["version"].value)
+            if cur_ver != last_ver:
+                # Ensure consistent snapshot while we copy from shared tensors.
+                lock = _SHARED_STATE.get("lock")
+                if lock is None:
+                    # Best-effort without lock
+                    state = _WORKER_CACHE["network"].state_dict()
+                    for p, src in zip(state.values(), _SHARED_STATE["tensors"]):
+                        p.copy_(src)
+                else:
+                    with lock:
+                        state = _WORKER_CACHE["network"].state_dict()
+                        for p, src in zip(state.values(), _SHARED_STATE["tensors"]):
+                            p.copy_(src)
+                _WORKER_CACHE["_last_weight_version"] = cur_ver
+        else:
+            # Legacy: always load the latest weights (slow due to pickling)
+            _WORKER_CACHE["network"].load_state_dict(config['network_state_dict'])
+
         # 2. lazy load environment (for MCTS rollouts)
         if _WORKER_CACHE["env"] is None:
             # Handle both relative and absolute imports for worker process
@@ -138,7 +184,6 @@ def _search_agent_wrapper(args):
                 except ImportError:
                     # Fallback: import from MCTS_DUAL package
                     import sys
-                    import os
                     mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                     if mcts_dual_path not in sys.path:
                         sys.path.insert(0, mcts_dual_path)
@@ -165,7 +210,6 @@ def _search_agent_wrapper(args):
                         from utils import DEFAULT_REWARD_CONFIG
                     except ImportError:
                         import sys
-                        import os
                         mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                         if mcts_dual_path not in sys.path:
                             sys.path.insert(0, mcts_dual_path)
@@ -232,9 +276,9 @@ def _search_agent_wrapper(args):
         action, search_stats = mcts.search(
             obs_data,
             _WORKER_CACHE["env"],
-            obs_history_data,
+            None,
             hidden_state_tensor,
-            env_state_data
+            None
         )
         
         # Ensure action is numpy array
@@ -339,6 +383,34 @@ def generate_ego_routes(num_agents: int, num_lanes: int):
 class MCTSTrainer:
     """Multi-Agent MCTS Trainer."""
     
+    def close(self):
+        """Release resources like process pools and environments."""
+        if self._process_pool is not None:
+            try:
+                # cancel_futures is supported on Python 3.9+
+                self._process_pool.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                # Older Python: no cancel_futures
+                self._process_pool.shutdown(wait=True)
+            except Exception:
+                pass
+            finally:
+                self._process_pool = None
+
+        # Best-effort env cleanup (pygame windows, etc.)
+        try:
+            if hasattr(self, 'env') and hasattr(self.env, 'close'):
+                self.env.close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        # Best-effort cleanup; not guaranteed to run.
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def __init__(
         self,
         num_agents: int = 6,
@@ -567,322 +639,344 @@ class MCTSTrainer:
         self.log("Starting Multi-Agent MCTS Training")
         self.log("=" * 80)
 
-        if self.seed is not None:
-            self.log(f"[Seed] seed={self.seed} deterministic={self.deterministic}")
-        
-        episode = 0
-        step_count = 0
-        
-        while episode < self.max_episodes:
-            episode_start_time = time()
-            episode += 1
-            self.stats['episode'] = episode
+        try:
+
+            if self.seed is not None:
+                self.log(f"[Seed] seed={self.seed} deterministic={self.deterministic}")
             
-            try:
-                # Reset environment
-                obs, info = self.env.reset()
-            except Exception as e:
-                self.log(f"Error resetting environment at episode {episode}: {e}")
-                import traceback
-                traceback.print_exc()
-                break
+            episode = 0
+            step_count = 0
             
-            # Debug: Check initial agent positions for first few episodes
-            if self.enable_debug and episode <= 3:
-                if hasattr(self.env, 'agents'):
-                    print(f"\n[Episode {episode}] Initial agent positions:")
-                    positions = {}
-                    for i, agent in enumerate(self.env.agents):
-                        pos_key = (round(agent.pos_x, 1), round(agent.pos_y, 1))
-                        if pos_key not in positions:
-                            positions[pos_key] = []
-                        positions[pos_key].append(i)
-                        route_info = self.ego_routes[i] if i < len(self.ego_routes) else 'N/A'
-                        print(f"  Agent {i}: pos=({agent.pos_x:.1f}, {agent.pos_y:.1f}), heading={agent.heading:.2f}, route={route_info}")
-                    # Check for overlapping positions
-                    overlaps = {pos: agents for pos, agents in positions.items() if len(agents) > 1}
-                    if overlaps:
-                        print(f"  WARNING: Agents with overlapping positions: {overlaps}")
-            
-            # Reset observation history and hidden states
-            for i in range(self.num_agents):
-                self.obs_history[i].clear()
-                self.hidden_states[i] = None
-                # Initialize history with first observation
-                self.obs_history[i].append(obs[i])
-            
-            # Reset buffer at start of episode
-            if hasattr(self, 'buffer'):
-                self.buffer = {
-                    'obs': [[] for _ in range(self.num_agents)],
-                    'next_obs': [[] for _ in range(self.num_agents)],
-                    'actions': [[] for _ in range(self.num_agents)],
-                    'rewards': [[] for _ in range(self.num_agents)],
-                    'dones': [[] for _ in range(self.num_agents)],
-                }
-            
-            episode_reward = np.zeros(self.num_agents)
-            episode_length = 0
-            done = False
-            
-            # Create progress bar for this episode (optional)
-            pbar = None
-            if getattr(self, 'use_tqdm', True) and tqdm is not None:
-                # Use miniters=1 and mininterval=0.1 for more frequent updates
-                # Use smaller smoothing (0.05) to show more recent rate
-                pbar = tqdm(
-                    total=self.max_steps_per_episode,
-                    desc=f"Episode {episode}",
-                    unit="step",
-                    leave=False,  # Don't leave progress bar after completion
-                    ncols=100,  # Width of progress bar
-                    miniters=1,  # Update every iteration
-                    mininterval=0.1,  # Update at least every 0.1 seconds
-                    smoothing=0.05,  # Smaller smoothing for more recent rate (was 0.1)
-                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
-                )
-            
-            # Episode loop
-            while not done and episode_length < self.max_steps_per_episode:
-                # Render current state before MCTS search (so user can see what's happening)
-                if self.render:
-                    try:
-                        self.env.render(show_lane_ids=self.show_lane_ids, show_lidar=self.show_lidar)
-                        # Process events to keep window responsive
-                        import pygame
-                        if pygame.get_init():
-                            pygame.event.pump()
-                    except Exception:
-                        pass
+            while episode < self.max_episodes:
+                episode_start_time = time()
+                episode += 1
+                self.stats['episode'] = episode
                 
-                # Select actions using MCTS for each agent
-                # Prepare environment state for rollouts (shared by all agents)
-                # Only include serializable data (no pygame objects)
-                env_state = {
-                    'step_count': getattr(self.env, 'step_count', 0),
-                    'obs': obs.copy() if isinstance(obs, np.ndarray) else obs,  # Current observations for all agents
-                    # Extract only serializable agent data (no pygame surfaces)
-                    'agent_states': []
-                }
-                if hasattr(self.env, 'agents') and self.env.agents:
-                    for agent in self.env.agents:
-                        # Extract only basic attributes (no pygame objects)
-                        # Use getattr with safe defaults to avoid AttributeError
-                        agent_state = {
-                            'pos_x': getattr(agent, 'pos_x', 0.0),
-                            'pos_y': getattr(agent, 'pos_y', 0.0),
-                            'heading': getattr(agent, 'heading', 0.0),
-                            'speed': getattr(agent, 'speed', 0.0),  # Car uses 'speed', not 'velocity'
-                            'target_lane': getattr(agent, 'target_lane', None),
-                            'route': getattr(agent, 'route', None)
-                        }
-                        env_state['agent_states'].append(agent_state)
-                
-                # Update observation history for all agents
-                for i in range(self.num_agents):
-                    if episode_length > 0:
-                        self.obs_history[i].append(obs[i])
-                
-                # Enable debug output for first episode to diagnose hanging issue
-                for i in range(self.num_agents):
-                    # Enable debug for first episode only
-                    self.mcts_instances[i].debug_rollout = (episode == 1 and episode_length == 0)
-                
-                # Handle pygame events before MCTS search
-                if self.render:
-                    try:
-                        import pygame
-                        if pygame.get_init() and hasattr(self.env, 'screen') and self.env.screen is not None:
-                            for event in pygame.event.get():
-                                if event.type == pygame.QUIT:
-                                    return
-                    except Exception:
-                        pass
-                
-                # Perform MCTS search: parallel or sequential
                 try:
-                    if self.parallel_mcts and self.num_agents > 1:
-                        # Parallel MCTS: all agents search simultaneously
-                        actions = self._parallel_mcts_search(obs, env_state, episode=episode, step=episode_length)
-                    else:
-                        # Sequential MCTS: one agent at a time (original behavior)
-                        actions = self._sequential_mcts_search(obs, env_state)
-                    
-                    # MCTS search completed (output disabled - only episode-level logs are shown)
+                    # Reset environment
+                    obs, info = self.env.reset()
                 except Exception as e:
-                    self.log(f"Error in MCTS search at episode {episode}, step {episode_length}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    # Use zero actions as fallback
-                    actions = np.zeros((self.num_agents, 2))
-                
-                # Debug: print actions for first few episodes
-                if self.enable_debug and episode <= 10 and episode_length == 0:
-                    print(f"\n[Episode {episode}, Step 0] Actions selected:")
-                    for i, act in enumerate(actions):
-                        print(f"  Agent {i}: {act} (shape: {act.shape}, dtype: {act.dtype})")
-                    # Check if actions are valid
-                    if np.any(np.isnan(actions)) or np.any(np.isinf(actions)):
-                        print(f"  WARNING: Invalid actions detected (NaN or Inf)!")
-                    if np.any(np.abs(actions) > 1.0):
-                        print(f"  WARNING: Actions out of range [-1, 1]!")
-                        print(f"  Actions range: [{actions.min():.3f}, {actions.max():.3f}]")
-                
-                # Step environment
-                try:
-                    # Environment step (output disabled - only episode-level logs are shown)
-                    next_obs, rewards, terminated, truncated, info = self.env.step(actions)
-                    # Environment step completed (output disabled - only episode-level logs are shown)
-                except Exception as e:
-                    self.log(f"Error stepping environment at episode {episode}, step {episode_length}: {e}")
+                    self.log(f"Error resetting environment at episode {episode}: {e}")
                     import traceback
                     traceback.print_exc()
                     break
                 
-                # Handle reward format
-                if isinstance(rewards, (list, np.ndarray)):
-                    rewards = np.array(rewards)
-                else:
-                    rewards = np.array([rewards] * self.num_agents)
-                
-                done = terminated or truncated
-                
-                # Debug: check why episode ended (moved after done is set)
-                if self.enable_debug and done and episode_length == 0 and episode <= 10:
-                    collisions = info.get('collisions', {})
-                    print(f"\n[Episode {episode}] Ended at step 0!")
-                    print(f"  Terminated: {terminated}, Truncated: {truncated}")
-                    print(f"  Rewards: {rewards}")
-                    print(f"  Mean reward: {rewards.mean():.2f}")
-                    print(f"  Collisions: {collisions}")
+                # Debug: Check initial agent positions for first few episodes
+                if self.enable_debug and episode <= 3:
                     if hasattr(self.env, 'agents'):
+                        print(f"\n[Episode {episode}] Initial agent positions:")
+                        positions = {}
                         for i, agent in enumerate(self.env.agents):
-                            agent_id = id(agent)
-                            if agent_id in collisions:
-                                print(f"  Agent {i} (id={agent_id}): {collisions[agent_id]}")
-                    # Check agent positions
-                    if hasattr(self.env, 'agents'):
-                        print(f"  Agent positions:")
-                        for i, agent in enumerate(self.env.agents):
-                            print(f"    Agent {i}: pos=({agent.pos_x:.1f}, {agent.pos_y:.1f}), heading={agent.heading:.2f}, speed={agent.speed:.2f}")
+                            pos_key = (round(agent.pos_x, 1), round(agent.pos_y, 1))
+                            if pos_key not in positions:
+                                positions[pos_key] = []
+                            positions[pos_key].append(i)
+                            route_info = self.ego_routes[i] if i < len(self.ego_routes) else 'N/A'
+                            print(f"  Agent {i}: pos=({agent.pos_x:.1f}, {agent.pos_y:.1f}), heading={agent.heading:.2f}, route={route_info}")
+                        # Check for overlapping positions
+                        overlaps = {pos: agents for pos, agents in positions.items() if len(agents) > 1}
+                        if overlaps:
+                            print(f"  WARNING: Agents with overlapping positions: {overlaps}")
                 
-                # Store transitions and update in batches
-                self._update_networks(obs, actions, rewards, next_obs, done)
+                # Reset observation history and hidden states
+                for i in range(self.num_agents):
+                    self.obs_history[i].clear()
+                    self.hidden_states[i] = None
+                    # Initialize history with first observation
+                    self.obs_history[i].append(obs[i])
                 
-                episode_reward += rewards
-                episode_length += 1
-                step_count += 1
+                # Reset buffer at start of episode
+                if hasattr(self, 'buffer'):
+                    self.buffer = {
+                        'obs': [[] for _ in range(self.num_agents)],
+                        'next_obs': [[] for _ in range(self.num_agents)],
+                        'actions': [[] for _ in range(self.num_agents)],
+                        'rewards': [[] for _ in range(self.num_agents)],
+                        'dones': [[] for _ in range(self.num_agents)],
+                    }
                 
-                # Update progress bar
-                if pbar is not None:
-                    pbar.update(1)
-                    # Update progress bar description with current reward
-                    avg_reward = episode_reward.mean()
-                    pbar.set_postfix({
-                        'reward': f'{avg_reward:.2f}',
-                        'done': done
-                    })
+                episode_reward = np.zeros(self.num_agents)
+                episode_length = 0
+                done = False
                 
-                obs = next_obs
+                # Create progress bar for this episode (optional)
+                pbar = None
+                if getattr(self, 'use_tqdm', True) and tqdm is not None:
+                    # Use miniters=1 and mininterval=0.1 for more frequent updates
+                    # Use smaller smoothing (0.05) to show more recent rate
+                    pbar = tqdm(
+                        total=self.max_steps_per_episode,
+                        desc=f"Episode {episode}",
+                        unit="step",
+                        leave=False,  # Don't leave progress bar after completion
+                        ncols=100,  # Width of progress bar
+                        miniters=1,  # Update every iteration
+                        mininterval=0.1,  # Update at least every 0.1 seconds
+                        smoothing=0.05,  # Smaller smoothing for more recent rate (was 0.1)
+                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+                    )
                 
-                # Render if enabled (after action execution)
-                if self.render:
-                    self.env.render(show_lane_ids=self.show_lane_ids, show_lidar=self.show_lidar)
-                    # Add small delay to make rendering visible and keep window responsive
-                    from time import sleep
-                    sleep(0.1)  # 100ms delay to make rendering visible
-                    # Also handle events to keep window responsive
+                # Episode loop
+                while not done and episode_length < self.max_steps_per_episode:
+                    # Render current state before MCTS search (so user can see what's happening)
+                    if self.render:
+                        try:
+                            self.env.render(show_lane_ids=self.show_lane_ids, show_lidar=self.show_lidar)
+                            # Process events to keep window responsive
+                            import pygame
+                            if pygame.get_init():
+                                pygame.event.pump()
+                        except Exception:
+                            pass
+                    
+                    # Select actions using MCTS for each agent
+                    # Prepare environment state for rollouts (shared by all agents)
+                    # Only include serializable data (no pygame objects)
+                    env_state = {
+                        'step_count': getattr(self.env, 'step_count', 0),
+                        'obs': obs.copy() if isinstance(obs, np.ndarray) else obs,  # Current observations for all agents
+                        # Extract only serializable agent data (no pygame surfaces)
+                        'agent_states': []
+                    }
+                    if hasattr(self.env, 'agents') and self.env.agents:
+                        for agent in self.env.agents:
+                            # Extract only basic attributes (no pygame objects)
+                            # Use getattr with safe defaults to avoid AttributeError
+                            agent_state = {
+                                'pos_x': getattr(agent, 'pos_x', 0.0),
+                                'pos_y': getattr(agent, 'pos_y', 0.0),
+                                'heading': getattr(agent, 'heading', 0.0),
+                                'speed': getattr(agent, 'speed', 0.0),  # Car uses 'speed', not 'velocity'
+                                'target_lane': getattr(agent, 'target_lane', None),
+                                'route': getattr(agent, 'route', None)
+                            }
+                            env_state['agent_states'].append(agent_state)
+                    
+                    # Update observation history for all agents
+                    for i in range(self.num_agents):
+                        if episode_length > 0:
+                            self.obs_history[i].append(obs[i])
+                    
+                    # Enable debug output for first episode to diagnose hanging issue
+                    for i in range(self.num_agents):
+                        # Enable debug for first episode only
+                        self.mcts_instances[i].debug_rollout = (episode == 1 and episode_length == 0)
+                    
+                    # Handle pygame events before MCTS search
+                    if self.render:
+                        try:
+                            import pygame
+                            if pygame.get_init() and hasattr(self.env, 'screen') and self.env.screen is not None:
+                                for event in pygame.event.get():
+                                    if event.type == pygame.QUIT:
+                                        return
+                        except Exception:
+                            pass
+                    
+                    # Perform MCTS search: parallel or sequential
                     try:
-                        import pygame
-                        if pygame.get_init():
-                            pygame.event.pump()
-                    except:
-                        pass
-            
-            # Close progress bar
-            if pbar is not None:
-                pbar.close()
-            
-            # Final update if buffer has remaining data
-            if hasattr(self, 'buffer') and len(self.buffer['obs'][0]) > 0:
-                self._batch_update_networks(obs, done)
-            
-            # Update statistics
-            self.stats['total_steps'] = step_count
-            self.stats['episode_rewards'].append(episode_reward.mean())
-            self.stats['episode_lengths'].append(episode_length)
-            
-            # Output episode summary (every episode)
-            total_reward = episode_reward.sum()
-            mean_reward = episode_reward.mean()
-            collisions = info.get('collisions', {})
-            has_success = any(status == 'SUCCESS' for status in collisions.values())
-            has_crash = any(status in ['CRASH_CAR', 'CRASH_WALL', 'CRASH_LINE'] for status in collisions.values())
-            
-            # Get rollout statistics
-            rollout_info = ""
-            total_rollouts = sum(mcts.get_rollout_stats()['total_rollouts'] for mcts in self.mcts_instances)
-            total_env_steps = sum(mcts.get_rollout_stats()['total_env_steps'] for mcts in self.mcts_instances)
-            successful_rollouts = sum(mcts.get_rollout_stats()['successful_rollouts'] for mcts in self.mcts_instances)
-            if total_rollouts > 0:
-                rollout_info = f" | Rollouts: {total_rollouts}({successful_rollouts}✓) | EnvSteps: {total_env_steps}"
-            
-            # Calculate episode duration
-            episode_duration = time() - episode_start_time
-            
-            # Print episode summary with duration
-            status_str = ""
-            if has_success:
-                status_str = " [SUCCESS]"
-            elif has_crash:
-                status_str = " [CRASH]"
-            
-            print(
-                f"Episode {episode:5d} | "
-                f"Reward: {mean_reward:7.2f} (Total: {total_reward:7.2f}) | "
-                f"Length: {episode_length:5d} | "
-                f"Time: {episode_duration:.1f}s{status_str}{rollout_info}"
-            )
-            
-            # Write episode rewards to CSV
-            with open(self.csv_file, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow([episode, total_reward, mean_reward, episode_length])
-            
-            # Update success/crash counters
-            if has_success:
-                self.stats['success_count'] += 1
-            if has_crash:
-                self.stats['crash_count'] += 1
-            
-            # Reset rollout stats after each episode (for accurate per-episode reporting)
-            for mcts in self.mcts_instances:
-                mcts.reset_rollout_stats()
-            
-            # Debug: print detailed info for early episodes
-            if self.enable_debug and episode <= 10:
-                print(f"[Episode {episode}] Detailed Summary:")
-                print(f"  Episode length: {episode_length}")
-                print(f"  Total reward: {total_reward:.2f}")
-                print(f"  Mean reward: {mean_reward:.2f}")
-                print(f"  Reward per agent: {episode_reward}")
-                if collisions:
-                    print(f"  Collisions: {collisions}")
-            
-            # Reset counters (success/crash are tracked per log_frequency in other versions;
-            # here we print per-episode already, so keep counters reset every episode)
-            self.stats['success_count'] = 0
-            self.stats['crash_count'] = 0
-            
-            # Save checkpoint
-            if episode % self.save_frequency == 0:
-                checkpoint_path = os.path.join(
-                    self.save_dir, f"mcts_episode_{episode}.pth"
+                        if self.parallel_mcts and self.num_agents > 1:
+                            # Parallel MCTS: all agents search simultaneously
+                            actions = self._parallel_mcts_search(obs, env_state, episode=episode, step=episode_length)
+
+                            # Advance per-agent LSTM hidden state so the next step's MCTS sees updated memory.
+                            # This matches the semantics used in _batched_mcts_search.
+                            with torch.no_grad():
+                                seq_len = int(getattr(self.network, 'sequence_length', 5))
+                                for i in range(self.num_agents):
+                                    obs_seq = np.array(list(self.obs_history[i]), dtype=np.float32)
+                                    if obs_seq.size == 0:
+                                        continue
+                                    if obs_seq.shape[0] < seq_len:
+                                        pad_n = seq_len - obs_seq.shape[0]
+                                        obs_seq = np.concatenate([np.repeat(obs_seq[:1], pad_n, axis=0), obs_seq], axis=0)
+                                    elif obs_seq.shape[0] > seq_len:
+                                        obs_seq = obs_seq[-seq_len:]
+
+                                    obs_tensor = torch.from_numpy(obs_seq).unsqueeze(0).to(self.device)
+                                    _, _, _, self.hidden_states[i] = self.network(obs_tensor, self.hidden_states[i])
+                        else:
+                            # Sequential MCTS: one agent at a time (original behavior)
+                            actions = self._sequential_mcts_search(obs, env_state)
+                        
+                        # MCTS search completed (output disabled - only episode-level logs are shown)
+                    except Exception as e:
+                        self.log(f"Error in MCTS search at episode {episode}, step {episode_length}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Use zero actions as fallback
+                        actions = np.zeros((self.num_agents, 2))
+                    
+                    # Debug: print actions for first few episodes
+                    if self.enable_debug and episode <= 10 and episode_length == 0:
+                        print(f"\n[Episode {episode}, Step 0] Actions selected:")
+                        for i, act in enumerate(actions):
+                            print(f"  Agent {i}: {act} (shape: {act.shape}, dtype: {act.dtype})")
+                        # Check if actions are valid
+                        if np.any(np.isnan(actions)) or np.any(np.isinf(actions)):
+                            print(f"  WARNING: Invalid actions detected (NaN or Inf)!")
+                        if np.any(np.abs(actions) > 1.0):
+                            print(f"  WARNING: Actions out of range [-1, 1]!")
+                            print(f"  Actions range: [{actions.min():.3f}, {actions.max():.3f}]")
+                    
+                    # Step environment
+                    try:
+                        # Environment step (output disabled - only episode-level logs are shown)
+                        next_obs, rewards, terminated, truncated, info = self.env.step(actions)
+                        # Environment step completed (output disabled - only episode-level logs are shown)
+                    except Exception as e:
+                        self.log(f"Error stepping environment at episode {episode}, step {episode_length}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        break
+                    
+                    # Handle reward format
+                    if isinstance(rewards, (list, np.ndarray)):
+                        rewards = np.array(rewards)
+                    else:
+                        rewards = np.array([rewards] * self.num_agents)
+                    
+                    done = terminated or truncated
+                    
+                    # Debug: check why episode ended (moved after done is set)
+                    if self.enable_debug and done and episode_length == 0 and episode <= 10:
+                        collisions = info.get('collisions', {})
+                        print(f"\n[Episode {episode}] Ended at step 0!")
+                        print(f"  Terminated: {terminated}, Truncated: {truncated}")
+                        print(f"  Rewards: {rewards}")
+                        print(f"  Mean reward: {rewards.mean():.2f}")
+                        print(f"  Collisions: {collisions}")
+                        if hasattr(self.env, 'agents'):
+                            for i, agent in enumerate(self.env.agents):
+                                agent_id = id(agent)
+                                if agent_id in collisions:
+                                    print(f"  Agent {i} (id={agent_id}): {collisions[agent_id]}")
+                        # Check agent positions
+                        if hasattr(self.env, 'agents'):
+                            print(f"  Agent positions:")
+                            for i, agent in enumerate(self.env.agents):
+                                print(f"    Agent {i}: pos=({agent.pos_x:.1f}, {agent.pos_y:.1f}), heading={agent.heading:.2f}, speed={agent.speed:.2f}")
+                    
+                    # Store transitions and update in batches
+                    self._update_networks(obs, actions, rewards, next_obs, done)
+                    
+                    episode_reward += rewards
+                    episode_length += 1
+                    step_count += 1
+                    
+                    # Update progress bar
+                    if pbar is not None:
+                        pbar.update(1)
+                        # Update progress bar description with current reward
+                        avg_reward = episode_reward.mean()
+                        pbar.set_postfix({
+                            'reward': f'{avg_reward:.2f}',
+                            'done': done
+                        })
+                    
+                    obs = next_obs
+                    
+                    # Render if enabled (after action execution)
+                    if self.render:
+                        self.env.render(show_lane_ids=self.show_lane_ids, show_lidar=self.show_lidar)
+                        # Add small delay to make rendering visible and keep window responsive
+                        from time import sleep
+                        sleep(0.1)  # 100ms delay to make rendering visible
+                        # Also handle events to keep window responsive
+                        try:
+                            import pygame
+                            if pygame.get_init():
+                                pygame.event.pump()
+                        except:
+                            pass
+                
+                # Close progress bar
+                if pbar is not None:
+                    pbar.close()
+                
+                # Final update if buffer has remaining data
+                if hasattr(self, 'buffer') and len(self.buffer['obs'][0]) > 0:
+                    self._batch_update_networks(obs, done)
+                
+                # Update statistics
+                self.stats['total_steps'] = step_count
+                self.stats['episode_rewards'].append(episode_reward.mean())
+                self.stats['episode_lengths'].append(episode_length)
+                
+                # Output episode summary (every episode)
+                total_reward = episode_reward.sum()
+                mean_reward = episode_reward.mean()
+                collisions = info.get('collisions', {})
+                has_success = any(status == 'SUCCESS' for status in collisions.values())
+                has_crash = any(status in ['CRASH_CAR', 'CRASH_WALL', 'CRASH_LINE'] for status in collisions.values())
+                
+                # Get rollout statistics
+                rollout_info = ""
+                total_rollouts = sum(mcts.get_rollout_stats()['total_rollouts'] for mcts in self.mcts_instances)
+                total_env_steps = sum(mcts.get_rollout_stats()['total_env_steps'] for mcts in self.mcts_instances)
+                successful_rollouts = sum(mcts.get_rollout_stats()['successful_rollouts'] for mcts in self.mcts_instances)
+                if total_rollouts > 0:
+                    rollout_info = f" | Rollouts: {total_rollouts}({successful_rollouts}✓) | EnvSteps: {total_env_steps}"
+                
+                # Calculate episode duration
+                episode_duration = time() - episode_start_time
+                
+                # Print episode summary with duration
+                status_str = ""
+                if has_success:
+                    status_str = " [SUCCESS]"
+                elif has_crash:
+                    status_str = " [CRASH]"
+                
+                print(
+                    f"Episode {episode:5d} | "
+                    f"Reward: {mean_reward:7.2f} (Total: {total_reward:7.2f}) | "
+                    f"Length: {episode_length:5d} | "
+                    f"Time: {episode_duration:.1f}s{status_str}{rollout_info}"
                 )
-                self.save_checkpoint(checkpoint_path, episode)
-                self.log(f"Checkpoint saved: {checkpoint_path}")
-        
-        self.log("Training completed!")
+                
+                # Write episode rewards to CSV
+                with open(self.csv_file, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([episode, total_reward, mean_reward, episode_length])
+                
+                # Update success/crash counters
+                if has_success:
+                    self.stats['success_count'] += 1
+                if has_crash:
+                    self.stats['crash_count'] += 1
+                
+                # Reset rollout stats after each episode (for accurate per-episode reporting)
+                for mcts in self.mcts_instances:
+                    mcts.reset_rollout_stats()
+                
+                # Debug: print detailed info for early episodes
+                if self.enable_debug and episode <= 10:
+                    print(f"[Episode {episode}] Detailed Summary:")
+                    print(f"  Episode length: {episode_length}")
+                    print(f"  Total reward: {total_reward:.2f}")
+                    print(f"  Mean reward: {mean_reward:.2f}")
+                    print(f"  Reward per agent: {episode_reward}")
+                    if collisions:
+                        print(f"  Collisions: {collisions}")
+                
+                # Reset counters (success/crash are tracked per log_frequency in other versions;
+                # here we print per-episode already, so keep counters reset every episode)
+                self.stats['success_count'] = 0
+                self.stats['crash_count'] = 0
+                
+                # Save checkpoint
+                if episode % self.save_frequency == 0:
+                    checkpoint_path = os.path.join(
+                        self.save_dir, f"mcts_episode_{episode}.pth"
+                    )
+                    self.save_checkpoint(checkpoint_path, episode)
+                    self.log(f"Checkpoint saved: {checkpoint_path}")
+            
+            self.log("Training completed!")
+        finally:
+            # Ensure subprocess workers are torn down to avoid lingering python processes
+            self.close()
     
     def _parallel_mcts_search(self, obs, env_state, episode: int = 0, step: int = 0):
         """
@@ -897,7 +991,29 @@ class MCTSTrainer:
         """
         # Create process pool if not exists
         if self._process_pool is None:
-            self._process_pool = ProcessPoolExecutor(max_workers=self.max_workers)
+            # Initialize shared-memory weights for per-step freshness without pickling state_dict.
+            if not hasattr(self, "_shared_weight_tensors"):
+                self._shared_weight_tensors = None
+                self._shared_weight_version = None
+                self._shared_weight_lock = None
+
+            if self._shared_weight_tensors is None:
+                self._shared_weight_tensors = []
+                # Create shared CPU buffers matching state_dict order
+                with torch.no_grad():
+                    for v in self.network.state_dict().values():
+                        t = v.detach().to("cpu").clone()
+                        t.share_memory_()
+                        self._shared_weight_tensors.append(t)
+                self._shared_weight_version = mp.Value('Q', 0)
+                self._shared_weight_lock = mp.Lock()
+
+            # Worker processes will inherit these objects (default 'fork' on Linux)
+            self._process_pool = ProcessPoolExecutor(
+                max_workers=self.max_workers,
+                initializer=_init_worker_shared_state,
+                initargs=(self._shared_weight_tensors, self._shared_weight_version, self._shared_weight_lock)
+            )
         
         # Submit searches (output disabled - only episode-level logs are shown)
         
@@ -905,11 +1021,16 @@ class MCTSTrainer:
         # Networks and MCTS instances cannot be passed directly, so we'll need to
         # recreate them in each process using the module-level wrapper function
         # Prepare arguments for each agent (must be serializable)
+        # Broadcast latest weights to shared memory once per step.
+        if hasattr(self, "_shared_weight_tensors") and self._shared_weight_tensors is not None:
+            with self._shared_weight_lock:
+                state = self.network.state_dict()
+                for src, dst in zip(state.values(), self._shared_weight_tensors):
+                    dst.copy_(src.detach().to("cpu"))
+                self._shared_weight_version.value += 1
+
         search_args = []
         for i in range(self.num_agents):
-            # Get network state dict
-            network_state_dict = {k: v.cpu() for k, v in self.network.state_dict().items()}
-            
             config = {
                 'hidden_dim': 256,
                 'lstm_hidden_dim': 128,
@@ -921,7 +1042,8 @@ class MCTSTrainer:
                 'temperature': 1.0,
                 'rollout_depth': self.rollout_depth,
                 'num_action_samples': self.num_action_samples,
-                'network_state_dict': network_state_dict,
+                # With shared-memory broadcast, workers read weights directly; no need to send state_dict.
+                'network_state_dict': None,
                 'base_seed': self.seed,
                 'episode': int(episode),
                 'step': int(step),
@@ -944,20 +1066,10 @@ class MCTSTrainer:
                 else:
                     hidden_state_cpu = self.hidden_states[i].cpu().numpy()
             
-            # Ensure env_state is fully serializable (deep copy and convert to basic types)
-            import copy as cp
-            env_state_serializable = {
-                'step_count': int(env_state.get('step_count', 0)),
-                'obs': [obs_arr.copy() if isinstance(obs_arr, np.ndarray) else obs_arr for obs_arr in env_state.get('obs', [])],
-                'agent_states': env_state.get('agent_states', [])
-            }
-            
             search_args.append((
                 i,
                 obs[i].copy(),
-                [h.copy() if isinstance(h, np.ndarray) else h for h in list(self.obs_history[i])],
                 hidden_state_cpu,
-                env_state_serializable,  # Fully serializable
                 config
             ))
         
@@ -1262,7 +1374,7 @@ def main():
     parser.add_argument('--rollout-depth', type=int, default=3, help='Number of steps to rollout in environment (default: 3)')
     parser.add_argument('--num-action-samples', type=int, default=3, help='Number of actions to sample per node expansion (default: 3)')
     parser.add_argument('--save-frequency', type=int, default=100, help='Episodes before saving checkpoint')
-    parser.add_argument('--device', type=str, default='auto', help='Device to use (cpu, cuda, or auto)')
+    parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu, cuda, or auto)')
     parser.add_argument('--no-team-reward', action='store_false', dest='use_team_reward', default=True, help='Disable team reward (enabled by default for multi-agent mode)')
     parser.add_argument('--render', action='store_true', help='Render environment')
     parser.add_argument('--show-lane-ids', action='store_true', help='Show lane IDs in render')
@@ -1341,18 +1453,13 @@ def main():
             final_checkpoint = os.path.join(args.save_dir, 'mcts_error.pth')
             trainer.save_checkpoint(final_checkpoint, trainer.stats.get('episode', 0))
             print(f"Error checkpoint saved: {final_checkpoint}")
-        except:
+        except Exception:
             pass
-    except Exception as e:
-        print(f"\nTraining error: {e}")
-        import traceback
-        traceback.print_exc()
-        # Save final checkpoint if possible
+    finally:
+        # Always shutdown worker processes
         try:
-            final_checkpoint = os.path.join(args.save_dir, 'mcts_error.pth')
-            trainer.save_checkpoint(final_checkpoint, trainer.stats.get('episode', 0))
-            print(f"Error checkpoint saved: {final_checkpoint}")
-        except:
+            trainer.close()
+        except Exception:
             pass
 
 

@@ -1,5 +1,7 @@
 #include "IntersectionEnv.h"
+#ifdef CPP_MCTS_ENABLE_RENDER
 #include "Renderer.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <random>

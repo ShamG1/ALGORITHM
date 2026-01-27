@@ -13,12 +13,17 @@
 #include "constants.h"
 #include "Reward.h"
 #include "EnvState.h"
+
+#ifdef CPP_MCTS_ENABLE_RENDER
 #include "Renderer.h"
+#endif
 
 // Match Intersection/config.py constants
 constexpr int NEIGHBOR_COUNT = 5;
 
+#ifdef CPP_MCTS_ENABLE_RENDER
 class Renderer;
+#endif
 
 class IntersectionEnv {
 public:
@@ -84,17 +89,27 @@ public:
     EnvState get_state() const;
     void set_state(const EnvState& s);
 
+#ifdef CPP_MCTS_ENABLE_RENDER
     void render(bool show_lane_ids = false, bool show_lidar = false);
 
     // GLFW input/window helpers (available only after first render() creates a window)
     bool window_should_close() const;
     void poll_events() const;
     bool key_pressed(int glfw_key) const;
+#else
+    // Headless build stubs
+    void render(bool show_lane_ids = false, bool show_lidar = false);
+    bool window_should_close() const;
+    void poll_events() const;
+    bool key_pressed(int glfw_key) const;
+#endif
 
 private:
     // Rendering
+#ifdef CPP_MCTS_ENABLE_RENDER
     bool render_enabled{false};
     std::unique_ptr<Renderer> renderer; // allocated only when render_enabled
+#endif
 
     void init_traffic_routes();
     void update_traffic_flow(float dt);

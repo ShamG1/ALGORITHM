@@ -5,9 +5,6 @@
 #include <string>
 #include "constants.h"
 
-#ifndef _WIN32
-#error "Renderer is Windows-only. Build on Windows (_WIN32) only."
-#endif
 
 // Forward declaration
 class IntersectionEnv;

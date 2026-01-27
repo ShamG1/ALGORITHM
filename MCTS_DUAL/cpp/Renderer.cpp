@@ -4,10 +4,17 @@
 
 #include <GLFW/glfw3.h>
 
+#ifndef _WIN32
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#endif
+
+#ifdef _WIN32
 #define NOMINMAX
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <Windows.h>
 #include <GLFW/glfw3native.h>
+#endif
 
 #include <cmath>
 #include <iostream>
@@ -18,12 +25,14 @@
 
 struct Renderer::Impl {
     GLFWwindow* window{nullptr};
+#ifdef _WIN32
     HWND hwnd{nullptr};
     HDC hdc{nullptr};
     HFONT font{nullptr};
     HFONT font_lane_ids{nullptr};
     HICON hicon_small{nullptr};
     HICON hicon_big{nullptr};
+#endif
     int fb_w{0};
     int fb_h{0};
 };
@@ -87,6 +96,7 @@ Renderer::Renderer() {
         return;
     }
 
+#ifdef _WIN32
     // Set window icon (ICO only; PNG via GDI+ was unstable)
     impl->hwnd = glfwGetWin32Window(impl->window);
     if(impl->hwnd){
@@ -108,6 +118,19 @@ Renderer::Renderer() {
             impl->hicon_small = icon_small;
         }
     }
+#else
+    // Linux/macOS: set icon via GLFW (expects RGBA pixels)
+    int icon_w = 0, icon_h = 0, icon_comp = 0;
+    unsigned char* pixels = stbi_load("MCTS_DUAL/cpp/assets/icon.png", &icon_w, &icon_h, &icon_comp, 4);
+    if(pixels && icon_w > 0 && icon_h > 0){
+        GLFWimage image;
+        image.width = icon_w;
+        image.height = icon_h;
+        image.pixels = pixels;
+        glfwSetWindowIcon(impl->window, 1, &image);
+    }
+    if(pixels) stbi_image_free(pixels);
+#endif
 
     glfwMakeContextCurrent(impl->window);
     glfwSwapInterval(1);
@@ -219,19 +242,21 @@ void Renderer::render(const IntersectionEnv& env, bool show_lane_ids, bool show_
     draw_cars(env);
     if(show_lidar) draw_lidar(env);
 
-    // Lane IDs + HUD are drawn via Win32 GDI overlay
-
     glfwSwapBuffers(impl->window);
 
+#ifdef _WIN32
     if(show_lane_ids){
         gdi_begin_frame(full_w, full_h);
         draw_lane_ids(env);
         gdi_end_frame();
     }
+#endif
 
     // Keep GLFW input responsive even if Python doesn't call poll_events()
     glfwPollEvents();
 }
+
+#ifdef _WIN32
 
 static std::wstring to_wide(const std::string& s){
     if(s.empty()) return std::wstring();
@@ -371,6 +396,18 @@ void Renderer::draw_hud(const IntersectionEnv& env) const{
         gdi_draw_text_px(10, 34, lidar_line, RenderColors::HudTextRGB);
     }
 }
+
+#else // NOT _WIN32
+
+void Renderer::draw_lane_ids(const IntersectionEnv& env) const{
+    (void)env;
+}
+
+void Renderer::draw_hud(const IntersectionEnv& env) const{
+    (void)env;
+}
+
+#endif // _WIN32
 
 
 // ROUTE ---------------------------------------------------

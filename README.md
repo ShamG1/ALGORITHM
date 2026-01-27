@@ -228,6 +228,13 @@ MCTS_DUAL/
 
 ## 使用方法
 
+### 构建 C++ 后端（推荐：Release + LTO）
+
+```bash
+cmake -S MCTS_DUAL/cpp -B MCTS_DUAL/cpp/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+cmake --build MCTS_DUAL/cpp/build -j
+```
+
 ### 训练
 
 ```bash

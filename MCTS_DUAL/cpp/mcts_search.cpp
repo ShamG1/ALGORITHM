@@ -10,6 +10,7 @@
 
 #include "IntersectionEnv.h"
 #include "EnvState.h"
+#include "mcts_search.h"
 
 namespace py = pybind11;
 
@@ -83,7 +84,6 @@ static void parse_infer_out(const py::tuple& out,
     py::array std_arr  = py::array::ensure(out[1]);
     py::array val_arr  = py::array::ensure(out[2]);
 
-    // 修正：为 unchecked<> 提供数据类型
     auto m = mean_arr.unchecked<float, 2>();
     auto s = std_arr.unchecked<float, 2>();
 
@@ -117,7 +117,6 @@ static void expand_node(IntersectionEnv& env,
                         float dirichlet_alpha,
                         float dirichlet_eps,
                         std::mt19937& rng) {
-    // Get mean/std/value from network
     py::tuple out = infer_fn(py::cast(std::vector<std::vector<float>>{node_obs})).cast<py::tuple>();
 
     std::vector<std::array<float,2>> means, stds;
@@ -126,7 +125,6 @@ static void expand_node(IntersectionEnv& env,
 
     node.V = values.empty() ? 0.0f : values[0];
 
-    // Sample K actions from Gaussian, compute prior from Gaussian log-prob
     node.edges.clear();
     node.edges.reserve((size_t)num_action_samples);
 
@@ -147,10 +145,8 @@ static void expand_node(IntersectionEnv& env,
         logps.push_back(lp);
     }
 
-    // Convert log-probs to normalized priors
     softmax_inplace(logps);
 
-    // Optional Dirichlet noise (should be applied only at root; callers pass eps/alpha accordingly)
     if (dirichlet_eps > 0.0f && dirichlet_alpha > 0.0f) {
         std::gamma_distribution<float> gd(dirichlet_alpha, 1.0f);
         std::vector<float> noise((size_t)num_action_samples, 0.0f);
@@ -182,7 +178,6 @@ static std::vector<float> step_env_with_action(IntersectionEnv& env,
                                                float gamma,
                                                bool& done_out,
                                                EnvState& next_state_out) {
-    // Save current env
     EnvState saved = env.get_state();
     env.set_state(base_state);
 
@@ -190,7 +185,6 @@ static std::vector<float> step_env_with_action(IntersectionEnv& env,
     float discount = 1.0f;
     bool terminated = false;
 
-    // Only ego actions (single ego mode expected for traffic_flow). If multi-agent, we apply to all.
     for (int t = 0; t < rollout_depth; ++t) {
         auto res = env.step({action[0]}, {action[1]});
         if (!res.rewards.empty()) total_reward += discount * res.rewards[0];
@@ -200,20 +194,18 @@ static std::vector<float> step_env_with_action(IntersectionEnv& env,
 
     next_state_out = env.get_state();
 
-    // Get obs for ego
     auto obs = env.get_observations();
     std::vector<float> ego_obs;
     if (!obs.empty()) ego_obs = obs[0];
 
-    // Restore
     env.set_state(saved);
 
     done_out = terminated;
+    (void)total_reward; // currently unused
     return ego_obs;
 }
 
 static void backup(std::vector<std::pair<int,int>>& path, std::vector<Node>& nodes, float value) {
-    // path elements: (node_idx, edge_idx) for chosen edge in that node; last node has edge_idx=-1
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
         int nidx = it->first;
         int eidx = it->second;
@@ -222,7 +214,6 @@ static void backup(std::vector<std::pair<int,int>>& path, std::vector<Node>& nod
             nodes[nidx].edges[(size_t)eidx].N += 1;
             nodes[nidx].edges[(size_t)eidx].W += value;
         }
-        // Optional discount by depth can be applied; keep as-is for now.
     }
 }
 
@@ -250,20 +241,18 @@ std::pair<std::vector<float>, py::dict> mcts_search(
     root.state = root_state;
     nodes.push_back(std::move(root));
 
-    // Expand root once
     expand_node(env, nodes[0], root_obs, infer_fn, num_action_samples, dirichlet_alpha, dirichlet_eps, rng);
 
     for (int sim = 0; sim < num_simulations; ++sim) {
-        std::vector<std::pair<int,int>> path; // (node_idx, edge_idx)
+        std::vector<std::pair<int,int>> path;
         int cur = 0;
 
-        // Selection
         while (true) {
             Node& n = nodes[(size_t)cur];
             if (n.edges.empty()) {
                 break;
             }
-            // pick best edge
+
             float best = -1e9f;
             int best_e = 0;
             for (int ei = 0; ei < (int)n.edges.size(); ++ei) {
@@ -275,7 +264,6 @@ std::pair<std::vector<float>, py::dict> mcts_search(
 
             ChildEdge& e = n.edges[(size_t)best_e];
             if (e.child < 0) {
-                // Expand new child by stepping env
                 bool done = false;
                 EnvState next_state;
                 auto next_obs = step_env_with_action(env, n.state, e.action, rollout_depth, gamma, done, next_state);
@@ -286,27 +274,21 @@ std::pair<std::vector<float>, py::dict> mcts_search(
                 nodes.push_back(std::move(child));
                 e.child = child_idx;
 
-                // Expand child (network eval) and get value
                 expand_node(env, nodes[(size_t)child_idx], next_obs, infer_fn, num_action_samples, 0.0f, 0.0f, rng);
                 float leaf_value = nodes[(size_t)child_idx].V;
 
-                // If terminal, override value with 0 (or could use rollout reward already included in V logic).
-                // Keep leaf_value.
                 backup(path, nodes, leaf_value);
                 break;
             } else {
                 cur = e.child;
-                // continue down
             }
         }
     }
 
-    // Choose action from root visits
     const Node& rootn = nodes[0];
     std::vector<float> action_out = {0.0f, 0.0f};
 
     if (!rootn.edges.empty()) {
-        // compute probabilities from N
         std::vector<float> probs(rootn.edges.size(), 0.0f);
         float sum = 0.0f;
         for (size_t i = 0; i < rootn.edges.size(); ++i) {
@@ -318,11 +300,9 @@ std::pair<std::vector<float>, py::dict> mcts_search(
         size_t best_i = 0;
         if (sum > 0.0f) {
             for (auto& p : probs) p /= sum;
-            // sample
             std::discrete_distribution<int> dd(probs.begin(), probs.end());
             best_i = (size_t)dd(rng);
         } else {
-            // fallback
             best_i = 0;
         }
 
@@ -344,3 +324,87 @@ std::pair<std::vector<float>, py::dict> mcts_search(
     return {action_out, stats};
 }
 
+// Minimal LSTM variant.
+// For now, this keeps the same tree/search logic as mcts_search, but calls the LSTM infer_fn
+// once at the root to validate the interface and returns h/c passthrough in stats.
+// A full LSTM-MCTS (propagating hidden state per node) can be implemented later.
+std::pair<std::vector<float>, py::dict> mcts_search_lstm(
+    IntersectionEnv& env,
+    const EnvState& root_state,
+    const std::vector<float>& root_obs,
+    const py::function& infer_fn,
+    const std::vector<float>& root_h,
+    const std::vector<float>& root_c,
+    int lstm_hidden_dim,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed
+) {
+    // Build (1,H) numpy arrays for h/c
+    py::array_t<float> h_arr({1, lstm_hidden_dim});
+    py::array_t<float> c_arr({1, lstm_hidden_dim});
+    auto h_mut = h_arr.mutable_unchecked<2>();
+    auto c_mut = c_arr.mutable_unchecked<2>();
+    for (int i = 0; i < lstm_hidden_dim; ++i) {
+        h_mut(0, i) = (i < (int)root_h.size()) ? root_h[(size_t)i] : 0.0f;
+        c_mut(0, i) = (i < (int)root_c.size()) ? root_c[(size_t)i] : 0.0f;
+    }
+
+    // Call LSTM infer once to ensure contract is satisfied and to get a value estimate.
+    // Expected: (mean, std, value, h_next, c_next)
+    py::list obs_lst;
+    {
+        py::list row;
+        row.attr("reserve")(root_obs.size());
+        for (float v : root_obs) row.append(v);
+        obs_lst.append(row);
+    }
+
+    py::tuple out = infer_fn(obs_lst, h_arr, c_arr).cast<py::tuple>();
+    if (out.size() < 5) {
+        throw std::runtime_error("infer_fn for mcts_search_lstm must return 5-tuple (mean,std,value,h_next,c_next)");
+    }
+
+    // Reuse the existing non-LSTM search by wrapping infer_fn to ignore h/c.
+    // This provides correct symbol + basic behavior; hidden-state propagation is not yet implemented.
+    py::function infer_wrap = py::cpp_function([infer_fn, lstm_hidden_dim, h_arr, c_arr](py::list obs_batch) {
+        // Call original infer with provided batch and constant (root) h/c.
+        py::tuple o = infer_fn(obs_batch, h_arr, c_arr).cast<py::tuple>();
+        // Return only (mean,std,value) to match parse_infer_out.
+        py::tuple out3(3);
+        out3[0] = o[0];
+        out3[1] = o[1];
+        out3[2] = o[2];
+        return out3;
+    });
+
+    auto res = mcts_search(
+        env,
+        root_state,
+        root_obs,
+        infer_wrap,
+        num_simulations,
+        num_action_samples,
+        rollout_depth,
+        c_puct,
+        temperature,
+        gamma,
+        dirichlet_alpha,
+        dirichlet_eps,
+        seed
+    );
+
+    // Attach h_next/c_next for callers that want to update hidden state.
+    py::dict stats = res.second;
+    stats["h_next"] = out[3];
+    stats["c_next"] = out[4];
+    stats["lstm_hidden_dim"] = lstm_hidden_dim;
+
+    return {res.first, stats};
+}

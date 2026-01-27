@@ -87,31 +87,98 @@ class MCTS:
         cpp_env = env.env
         root_state_cpp = cpp_env.get_state()
 
-        def infer_fn(obs_batch: List[List[float]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        lstm_hidden_dim = int(getattr(self.network, 'lstm_hidden_dim', 128))
+
+        def infer_fn_lstm(
+            obs_batch: List[List[float]],
+            h: np.ndarray,
+            c: np.ndarray
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
             if not obs_batch:
-                return np.array([]), np.array([]), np.array([])
+                empty = np.array([])
+                return empty, empty, empty, empty, empty
 
-            obs_tensor = torch.FloatTensor(np.array(obs_batch)).to(self.device)
+            obs_tensor = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
+
+            # h/c expected as flat (H,). Convert to (1,1,H) as required by nn.LSTM.
+            h_t = torch.as_tensor(np.asarray(h, dtype=np.float32), device=self.device).view(1, 1, -1)
+            c_t = torch.as_tensor(np.asarray(c, dtype=np.float32), device=self.device).view(1, 1, -1)
+
+            means_list = []
+            stds_list = []
+            values_list = []
+            hn_list = []
+            cn_list = []
+
             with torch.no_grad():
-                # Note: hidden_state is not batched; C++ MCTS does not handle recurrent state yet.
-                means, stds, values, _ = self.network(obs_tensor, None)
-            return means.cpu().numpy(), stds.cpu().numpy(), values.cpu().numpy()
+                # Evaluate each item with its own recurrent state (tree nodes).
+                for i in range(obs_tensor.shape[0]):
+                    x = obs_tensor[i].view(1, -1)  # (1, obs_dim)
+                    m, s, v, (hn, cn) = self.network(x, (h_t, c_t))
+                    means_list.append(m.squeeze(0))
+                    stds_list.append(s.squeeze(0))
+                    values_list.append(v.view(-1)[0])
+                    hn_list.append(hn.squeeze(0).squeeze(0))
+                    cn_list.append(cn.squeeze(0).squeeze(0))
 
-        action, stats = cpp_backend.mcts_search(
-            cpp_env,
-            root_state_cpp,
-            root_obs.tolist(),
-            infer_fn,
-            num_simulations=self.num_simulations,
-            num_action_samples=self.num_action_samples,
-            rollout_depth=self.rollout_depth,
-            c_puct=self.c_puct,
-            temperature=self.temperature,
-            gamma=0.99,  # Standard gamma, can be parameterized if needed
-            dirichlet_alpha=0.3,  # Common value
-            dirichlet_eps=0.25,  # Common value
-            seed=int(np.random.randint(0, 2**31 - 1, dtype=np.int64))
-        )
+            means = torch.stack(means_list, dim=0)
+            stds = torch.stack(stds_list, dim=0)
+            values = torch.stack(values_list, dim=0)
+            hn = torch.stack(hn_list, dim=0)  # (B,H)
+            cn = torch.stack(cn_list, dim=0)  # (B,H)
+
+            return (
+                means.cpu().numpy(),
+                stds.cpu().numpy(),
+                values.cpu().numpy(),
+                hn.cpu().numpy(),
+                cn.cpu().numpy()
+            )
+
+        # Root hidden state (1,1,H) in training code -> flatten to (H,)
+        if hidden_state is not None and isinstance(hidden_state, tuple) and len(hidden_state) == 2:
+            h0 = np.asarray(hidden_state[0], dtype=np.float32).reshape(-1)
+            c0 = np.asarray(hidden_state[1], dtype=np.float32).reshape(-1)
+        else:
+            h0 = np.zeros((lstm_hidden_dim,), dtype=np.float32)
+            c0 = np.zeros((lstm_hidden_dim,), dtype=np.float32)
+
+        # Prefer recurrent C++ MCTS if available
+        if hasattr(cpp_backend, 'mcts_search_lstm'):
+            action, stats = cpp_backend.mcts_search_lstm(
+                cpp_env,
+                root_state_cpp,
+                root_obs.tolist(),
+                infer_fn_lstm,
+                h0.tolist(),
+                c0.tolist(),
+                lstm_hidden_dim,
+                num_simulations=self.num_simulations,
+                num_action_samples=self.num_action_samples,
+                rollout_depth=self.rollout_depth,
+                c_puct=self.c_puct,
+                temperature=self.temperature,
+                gamma=0.99,
+                dirichlet_alpha=0.3,
+                dirichlet_eps=0.25,
+                seed=int(np.random.randint(0, 2**31 - 1, dtype=np.int64))
+            )
+        else:
+            action, stats = cpp_backend.mcts_search(
+                cpp_env,
+                root_state_cpp,
+                root_obs.tolist(),
+                infer_fn_lstm,
+                num_simulations=self.num_simulations,
+                num_action_samples=self.num_action_samples,
+                rollout_depth=self.rollout_depth,
+                c_puct=self.c_puct,
+                temperature=self.temperature,
+                gamma=0.99,
+                dirichlet_alpha=0.3,
+                dirichlet_eps=0.25,
+                seed=int(np.random.randint(0, 2**31 - 1, dtype=np.int64))
+            )
 
         # Rough compatibility counters: 1 search == 1 rollout batch.
         self._rollout_stats['total_rollouts'] += 1
