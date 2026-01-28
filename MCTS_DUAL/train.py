@@ -17,7 +17,6 @@ os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 import numpy as np
 import torch
 import torch.optim as optim
-
 torch.set_num_threads(1)
 try:
     torch.set_num_interop_threads(1)
@@ -27,7 +26,6 @@ from datetime import datetime
 from time import time
 from collections import deque
 import csv
-from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 import multiprocessing as mp
 from typing import Optional
 try:
@@ -88,234 +86,128 @@ def _init_worker_shared_state(shared_tensors, version, lock, env_config=None):
     if env_config is not None:
         _WORKER_CACHE["env_config"] = env_config
 
-def _search_agent_wrapper(args):
+def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
     """
-    Wrapper function for process pool MCTS search.
-    Must be at module level to be picklable.
-    Uses global cache to persist objects across calls within the same process.
+    Pinned worker: one process per agent, holding its own recurrent state.
+    Receives messages: ('RESET',), ('STEP', obs, config), ('CLOSE',)
+    Sends: (agent_id, action_array)
     """
-    # suppress pygame initialization messages
-    import os
     os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+    torch.set_num_threads(1)
 
-    agent_id, obs_data, hidden_state_data, config = args
-    
-    # reference global variables
+    # Worker holds its own hidden state
     global _WORKER_CACHE
-    
-    try:
-        # Deterministic per-call seed (optional)
-        base_seed = config.get("base_seed", None)
-        if base_seed is not None:
-            episode_i = int(config.get("episode", 0))
-            step_i = int(config.get("step", 0))
-            # Mix in identifiers to avoid identical streams across agents/steps.
-            call_seed = int(base_seed) + episode_i * 100000 + step_i * 100 + int(agent_id)
-            import random as _random
-            _random.seed(call_seed)
-            np.random.seed(call_seed)
-            torch.manual_seed(call_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(call_seed)
+    _WORKER_CACHE["agent_id"] = agent_id
+    _WORKER_CACHE["hidden"] = None
 
-        torch.set_num_threads(1)
-        device = torch.device(config['device'])
-        
-        # 1. lazy load network (only initialize objects when called for the first time)
-        if _WORKER_CACHE["network"] is None:
-            # Import strictly inside function/worker to avoid circular imports or pickling issues
-            # Handle both relative and absolute imports for worker process
-            try:
-                from .dual_net import DualNetwork
-                from .utils import OBS_DIM
-            except ImportError:
+    while True:
+        try:
+            msg = in_q.get()
+            if not msg: continue
+            mtype = msg[0]
+
+            if mtype == 'CLOSE':
+                break
+
+            if mtype == 'RESET':
+                _WORKER_CACHE["hidden"] = None
+                continue
+
+            if mtype != 'STEP':
+                continue
+
+            # Unpack step data: ('STEP', obs_numpy_array, config_dict)
+            obs_data = msg[1]
+            config = msg[2]
+
+            # --- Lazy Initialization (once per worker) ---
+            device = torch.device(config['device'])
+            if _WORKER_CACHE.get("network") is None:
                 try:
-                    from dual_net import DualNetwork
-                    from utils import OBS_DIM
+                    from .dual_net import DualNetwork
+                    from .utils import OBS_DIM as _OBS_DIM
                 except ImportError:
-                    # Fallback: import from MCTS_DUAL package
-                    import sys
-                    mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                    if mcts_dual_path not in sys.path:
-                        sys.path.insert(0, mcts_dual_path)
-                    from MCTS_DUAL.dual_net import DualNetwork
-                    from MCTS_DUAL.utils import OBS_DIM
-            
-            network = DualNetwork(
-                obs_dim=OBS_DIM,
-                action_dim=2,
-                hidden_dim=config['hidden_dim'],
-                lstm_hidden_dim=config['lstm_hidden_dim'],
-                use_lstm=config['use_lstm'],
-                sequence_length=config['sequence_length']
-            ).to(device)
-            network.eval()
-            _WORKER_CACHE["network"] = network
-        
-        # Load latest weights from shared memory if configured; fallback to state_dict path.
-        if _SHARED_STATE.get("tensors") is not None and _SHARED_STATE.get("version") is not None:
-            last_ver = _WORKER_CACHE.get("_last_weight_version", -1)
-            cur_ver = int(_SHARED_STATE["version"].value)
-            if cur_ver != last_ver:
-                # Ensure consistent snapshot while we copy from shared tensors.
-                lock = _SHARED_STATE.get("lock")
-                if lock is None:
-                    # Best-effort without lock
-                    state = _WORKER_CACHE["network"].state_dict()
-                    for p, src in zip(state.values(), _SHARED_STATE["tensors"]):
-                        p.copy_(src)
-                else:
-                    with lock:
+                    from dual_net import DualNetwork
+                    from utils import OBS_DIM as _OBS_DIM
+
+                net = DualNetwork(
+                    obs_dim=_OBS_DIM, action_dim=2,
+                    hidden_dim=config['hidden_dim'], lstm_hidden_dim=config['lstm_hidden_dim'],
+                    use_lstm=config['use_lstm'], sequence_length=config['sequence_length']
+                ).to(device)
+                net.eval()
+                _WORKER_CACHE["network"] = net
+
+            if _WORKER_CACHE.get("env") is None:
+                try:
+                    from .train import generate_ego_routes
+                    from .env import IntersectionEnv as _IntersectionEnv
+                except ImportError:
+                    from train import generate_ego_routes
+                    from env import IntersectionEnv as _IntersectionEnv
+
+                env_cfg = _WORKER_CACHE.get('env_config') or {}
+                _WORKER_CACHE["env"] = _IntersectionEnv({
+                    'traffic_flow': False, 'num_agents': env_cfg.get('num_agents', 1),
+                    'num_lanes': env_cfg.get('num_lanes', 3), 'render_mode': None,
+                    'max_steps': env_cfg.get('max_steps', 2000),
+                    'respawn_enabled': env_cfg.get('respawn_enabled', True),
+                    'reward_config': env_cfg.get('reward_config', {}),
+                    'ego_routes': list(env_cfg.get('ego_routes', [])),
+                })
+
+            if _WORKER_CACHE.get("mcts") is None:
+                try: from .mcts import MCTS
+                except ImportError: from mcts import MCTS
+                env_cfg = _WORKER_CACHE.get('env_config') or {}
+                num_agents = int(env_cfg.get('num_agents', 1))
+                mcts = MCTS(
+                    network=_WORKER_CACHE["network"], action_space=None,
+                    num_simulations=config['num_simulations'], c_puct=config['c_puct'],
+                    temperature=config['temperature'], device=device,
+                    rollout_depth=config['rollout_depth'], env_factory=None,
+                    all_networks=[_WORKER_CACHE["network"]] * num_agents,
+                    agent_id=agent_id, num_action_samples=config['num_action_samples']
+                )
+                mcts._env_cache = _WORKER_CACHE["env"]
+                mcts.env_factory = lambda: None
+                _WORKER_CACHE["mcts"] = mcts
+
+            # --- Per-step work ---
+            # Sync weights if version changed
+            if _SHARED_STATE.get("version") is not None:
+                last_ver = _WORKER_CACHE.get("_last_weight_version", -1)
+                cur_ver = int(_SHARED_STATE["version"].value)
+                if cur_ver != last_ver:
+                    with _SHARED_STATE["lock"]:
                         state = _WORKER_CACHE["network"].state_dict()
                         for p, src in zip(state.values(), _SHARED_STATE["tensors"]):
                             p.copy_(src)
-                _WORKER_CACHE["_last_weight_version"] = cur_ver
-        else:
-            # Legacy: always load the latest weights (slow due to pickling)
-            _WORKER_CACHE["network"].load_state_dict(config['network_state_dict'])
+                    _WORKER_CACHE["_last_weight_version"] = cur_ver
 
-        # 2. lazy load environment (for MCTS rollouts)
-        if _WORKER_CACHE["env"] is None:
-            # Handle both relative and absolute imports for worker process
-            try:
-                from .train import generate_ego_routes
-                from .env import IntersectionEnv
-            except ImportError:
-                try:
-                    from train import generate_ego_routes
-                    from env import IntersectionEnv
-                except ImportError:
-                    # Fallback: import from MCTS_DUAL package
-                    import sys
-                    mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                    if mcts_dual_path not in sys.path:
-                        sys.path.insert(0, mcts_dual_path)
-                    from MCTS_DUAL.train import generate_ego_routes
-                    from MCTS_DUAL.env import IntersectionEnv
-                    from MCTS_DUAL.utils import DEFAULT_REWARD_CONFIG
-            env_cfg = config.get('env_config', None)
-            if env_cfg is None:
-                env_cfg = _WORKER_CACHE.get('env_config') or {}
-            num_agents_cfg = env_cfg.get('num_agents', 1)
-            num_lanes_cfg = env_cfg.get('num_lanes', 3)
-            ego_routes_copy = env_cfg.get('ego_routes')
-            if ego_routes_copy is None:
-                ego_routes_copy = generate_ego_routes(num_agents_cfg, num_lanes_cfg)
-            else:
-                # ensure worker copy is independent
-                ego_routes_copy = list(ego_routes_copy)
-            # Import DEFAULT_REWARD_CONFIG if not already imported
-            try:
-                DEFAULT_REWARD_CONFIG
-            except NameError:
-                try:
-                    from .utils import DEFAULT_REWARD_CONFIG
-                except ImportError:
-                    try:
-                        from utils import DEFAULT_REWARD_CONFIG
-                    except ImportError:
-                        import sys
-                        mcts_dual_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                        if mcts_dual_path not in sys.path:
-                            sys.path.insert(0, mcts_dual_path)
-                        from MCTS_DUAL.utils import DEFAULT_REWARD_CONFIG
-            reward_cfg = env_cfg.get('reward_config', DEFAULT_REWARD_CONFIG.get('reward_config', {}))
-            # create FastIntersectionEnv (C++ backend) for C++ MCTS
-            _WORKER_CACHE["env"] = IntersectionEnv({
-                'traffic_flow': False,
-                'traffic_density': 0,
-                'num_agents': num_agents_cfg,
-                'num_lanes': num_lanes_cfg,
-                'render_mode': None,
-                'max_steps': env_cfg.get('max_steps', 2000),
-                'respawn_enabled': env_cfg.get('respawn_enabled', True),
-                'reward_config': reward_cfg,
-                'ego_routes': ego_routes_copy,
-            })
-
-        # 3. lazy load MCTS instance
-        if _WORKER_CACHE["mcts"] is None:
-            from mcts import MCTS
+            mcts = _WORKER_CACHE["mcts"]
+            mcts.agent_id = agent_id # Ensure agent_id is correct
             
-            # build shared network list
-            env_cfg_for_mcts = config.get('env_config', None)
-            if env_cfg_for_mcts is None:
-                env_cfg_for_mcts = _WORKER_CACHE.get('env_config') or {}
-            num_agents = int(env_cfg_for_mcts.get('num_agents', 1))
-            shared_network_list = [_WORKER_CACHE["network"] for _ in range(num_agents)]
-            
-            mcts = MCTS(
-                network=_WORKER_CACHE["network"],
-                action_space=None,
-                num_simulations=config['num_simulations'],
-                c_puct=config['c_puct'],
-                temperature=config['temperature'],
-                device=device,
-                rollout_depth=config['rollout_depth'],
-                env_factory=None, 
-                all_networks=shared_network_list, 
-                agent_id=agent_id,
-                num_action_samples=config['num_action_samples']
-            )
-            
-            # inject the cached env into MCTS's internal cache
-            mcts._env_cache = _WORKER_CACHE["env"]
-            # avoid assertion error
-            mcts.env_factory = lambda: None 
-            
-            _WORKER_CACHE["mcts"] = mcts
-        
-        # get the reused MCTS instance
-        mcts = _WORKER_CACHE["mcts"]
-        
-        # update ID (because the same Worker process may serve different Agents)
-        mcts.agent_id = agent_id 
-        
-        # Convert hidden state back to tensor if needed (only when using LSTM)
-        hidden_state_tensor = None
-        if config.get('use_lstm', True) and hidden_state_data is not None:
-            if isinstance(hidden_state_data, tuple):
-                hidden_state_tensor = tuple(torch.as_tensor(h, device=device) for h in hidden_state_data)
-            else:
-                hidden_state_tensor = torch.as_tensor(hidden_state_data, device=device)
-        
-        # Perform search
-        # Use positional args to avoid keyword mismatches across different MCTS wrappers
-        with torch.inference_mode():
-            action, search_stats = mcts.search(
-                obs_data,
-                _WORKER_CACHE["env"],
-                None,
-                hidden_state_tensor,
-                None
-            )
+            hidden_state_tensor = _WORKER_CACHE.get('hidden') if config.get('use_lstm') else None
 
-        
-        # Ensure action is numpy array
-        if not isinstance(action, np.ndarray):
-            action = np.array(action)
-        action = action.flatten()
-        
-        # Return updated hidden state if provided by C++ LSTM-MCTS
-        hidden_out = None
-        try:
-            if config.get('use_lstm', True) and isinstance(search_stats, dict) and ("h_next" in search_stats) and ("c_next" in search_stats):
-                hn = search_stats["h_next"]
-                cn = search_stats["c_next"]
-                # Convert to torch tensors shaped (1,1,H)
-                hn_t = torch.as_tensor(np.asarray(hn, dtype=np.float32), device=device).view(1, 1, -1)
-                cn_t = torch.as_tensor(np.asarray(cn, dtype=np.float32), device=device).view(1, 1, -1)
-                hidden_out = (hn_t, cn_t)
-        except Exception:
-            hidden_out = None
+            with torch.inference_mode():
+                action, search_stats = mcts.search(
+                    obs_data, _WORKER_CACHE["env"], None, hidden_state_tensor, None
+                )
 
-        return agent_id, action, hidden_out
-    except Exception as e:
-        import sys
-        sys.stdout.write(f"[Process {agent_id}] Error: {e}\n")
-        sys.stdout.flush()
-        return agent_id, np.zeros(2), None
+            # Update worker's own hidden state
+            if config.get('use_lstm') and isinstance(search_stats, dict) and ("h_next" in search_stats):
+                hn = torch.as_tensor(np.asarray(search_stats["h_next"], dtype=np.float32), device=device).view(1, 1, -1)
+                cn = torch.as_tensor(np.asarray(search_stats["c_next"], dtype=np.float32), device=device).view(1, 1, -1)
+                _WORKER_CACHE["hidden"] = (hn, cn)
 
+            out_q.put((agent_id, np.array(action, dtype=np.float32).flatten()))
+
+        except Exception as e:
+            import traceback
+            sys.stdout.write(f"[PinnedWorker {agent_id}] Error: {e}\\n{traceback.format_exc()}\\n")
+            sys.stdout.flush()
+            out_q.put((agent_id, np.zeros(2, dtype=np.float32)))
 try:
     from .dual_net import DualNetwork
     from .mcts import MCTS
@@ -407,20 +299,30 @@ class MCTSTrainer:
     """Multi-Agent MCTS Trainer."""
     
     def close(self):
-        """Release resources like process pools and environments."""
-        if self._process_pool is not None:
-            try:
-                # cancel_futures is supported on Python 3.9+
-                self._process_pool.shutdown(wait=True, cancel_futures=True)
-            except TypeError:
-                # Older Python: no cancel_futures
-                self._process_pool.shutdown(wait=True)
-            except Exception:
-                pass
-            finally:
-                self._process_pool = None
+        """Release resources like worker processes and environments."""
+        # 先停 pinned workers
+        try:
+            if getattr(self, "_pinned_in_queues", None) is not None:
+                for q in self._pinned_in_queues:
+                    try:
+                        q.put(('CLOSE',))
+                    except Exception:
+                        pass
 
-        # Best-effort env cleanup (pygame windows, etc.)
+            if getattr(self, "_pinned_procs", None) is not None:
+                for p in self._pinned_procs:
+                    try:
+                        p.join(timeout=5)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
+            self._pinned_in_queues = None
+            self._pinned_out_queues = None
+            self._pinned_procs = None
+
+        # Best-effort env cleanup
         try:
             if hasattr(self, 'env') and hasattr(self.env, 'close'):
                 self.env.close()
@@ -496,12 +398,14 @@ class MCTSTrainer:
         self.parallel_mcts = parallel_mcts
         self.max_workers = max_workers if max_workers is not None else num_agents
         self.use_tqdm = use_tqdm and tqdm is not None
-        self._process_pool = None  # Initialize process pool to None
+        # pinned worker resources
+        self._pinned_in_queues = None
+        self._pinned_out_queues = None
+        self._pinned_procs = None
         self.seed = seed
 
         # Shared-memory weight broadcast optimization:
         # only copy weights to shared memory when they've actually changed (after optimizer.step()).
-        self._weights_dirty = True
         self.deterministic = deterministic
         
         # Create save directory
@@ -547,7 +451,6 @@ class MCTSTrainer:
         ).to(self.device)
 
         # Keep a compatibility list so existing code that expects per-agent networks still works.
-        # IMPORTANT: Per-agent LSTM hidden states are tracked separately in self.hidden_states.
         self.networks = [self.network for _ in range(num_agents)]
         
         # Create environment factory function for MCTS rollouts
@@ -613,16 +516,36 @@ class MCTSTrainer:
         # Enable rollout debugging for first few episodes
         self.enable_rollout_debug = False  # Set to True to enable detailed rollout logs
         self.enable_debug = False  # Set to True to enable all debug output
-        
-        # Process pool for parallel MCTS (created on first use)
-        self._process_pool = None
+    
+        # === pinned workers (Linux+fork only) ===
+        self._pinned_in_queues = None
+        self._pinned_out_queues = None
+        self._pinned_procs = None
+
+        # === shared-memory weights for pinned workers ===
+        # (Workers inherit these via fork; we broadcast updated weights by version number.)
+        if not hasattr(self, "_shared_weight_tensors"):
+            self._shared_weight_tensors = []
+
+        if self._shared_weight_tensors is None or len(self._shared_weight_tensors) == 0:
+            self._shared_weight_tensors = []
+            with torch.no_grad():
+                for v in self.network.state_dict().values():
+                    t = v.detach().to("cpu").clone()
+                    t.share_memory_()
+                    self._shared_weight_tensors.append(t)
+
+        self._shared_weight_version = mp.Value('Q', 0)
+        self._shared_weight_lock = mp.Lock()
+
+        # Mark dirty initially so first step broadcasts once
+        self._weights_dirty = True
         
         # Single optimizer for the shared network
         self.optimizer = optim.Adam(self.network.parameters(), lr=3e-4)
         
         # Observation history for LSTM
         self.obs_history = [deque(maxlen=5) for _ in range(num_agents)] if self.use_lstm else None
-        self.hidden_states = [None for _ in range(num_agents)] if self.use_lstm else None
         # TBPTT settings (sequence training)
         self.unroll_len = 16
         
@@ -711,7 +634,7 @@ class MCTSTrainer:
                 if self.use_lstm:
                     for i in range(self.num_agents):
                         self.obs_history[i].clear()
-                        self.hidden_states[i] = None
+                        pass
                         # Initialize history with first observation
                         self.obs_history[i].append(obs[i])
                 
@@ -995,160 +918,96 @@ class MCTSTrainer:
         finally:
             # Ensure subprocess workers are torn down to avoid lingering python processes
             self.close()
-    
-    def _parallel_mcts_search(self, obs, env_state, episode: int = 0, step: int = 0):
-        """
-        Perform MCTS search for all agents in parallel using process pool.
-        
-        Args:
-            obs: Current observations for all agents
-            env_state: Environment state for rollouts
-            
-        Returns:
-            actions: Array of actions for all agents
-        """
-        # Create process pool if not exists
-        if self._process_pool is None:
-            # Initialize shared-memory weights for per-step freshness without pickling state_dict.
-            if not hasattr(self, "_shared_weight_tensors"):
-                self._shared_weight_tensors = None
-                self._shared_weight_version = None
-                self._shared_weight_lock = None
 
-            if self._shared_weight_tensors is None:
-                self._shared_weight_tensors = []
-                # Create shared CPU buffers matching state_dict order
-                with torch.no_grad():
-                    for v in self.network.state_dict().values():
-                        t = v.detach().to("cpu").clone()
-                        t.share_memory_()
-                        self._shared_weight_tensors.append(t)
-                self._shared_weight_version = mp.Value('Q', 0)
-                self._shared_weight_lock = mp.Lock()
+    def _start_pinned_workers(self):
+        if self._pinned_procs is not None:
+            return
 
-            # Worker processes will inherit these objects (default 'fork' on Linux)
-            init_env_config = {
-                'num_agents': self.num_agents,
-                'num_lanes': self.num_lanes,
-                'use_team_reward': self.use_team_reward,
-                'max_steps': self.max_steps_per_episode,
-                'respawn_enabled': self.respawn_enabled,
-                'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
-                'ego_routes': self.ego_routes,
-            }
+        # 把 env_config 缓存在 worker 全局 cache（worker 进程 fork 后继承）
+        init_env_config = {
+            'num_agents': self.num_agents,
+            'num_lanes': self.num_lanes,
+            'use_team_reward': self.use_team_reward,
+            'max_steps': self.max_steps_per_episode,
+            'respawn_enabled': self.respawn_enabled,
+            'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
+            'ego_routes': self.ego_routes,
+        }
+        _init_worker_shared_state(
+            self._shared_weight_tensors,
+            self._shared_weight_version,
+            self._shared_weight_lock,
+            init_env_config
+        )
 
-            self._process_pool = ProcessPoolExecutor(
-                max_workers=self.max_workers,
-                initializer=_init_worker_shared_state,
-                initargs=(self._shared_weight_tensors, self._shared_weight_version, self._shared_weight_lock, init_env_config)
+        self._pinned_in_queues = [mp.Queue(maxsize=2) for _ in range(self.num_agents)]
+        self._pinned_out_queues = [mp.Queue(maxsize=2) for _ in range(self.num_agents)]
+        self._pinned_procs = []
+
+        for i in range(self.num_agents):
+            p = mp.Process(
+                target=_pinned_worker_loop,
+                args=(i, self._pinned_in_queues[i], self._pinned_out_queues[i])
             )
-        
-        # Submit searches (output disabled - only episode-level logs are shown)
-        
-        # Note: For process pool, we need to pass serializable data
-        # Networks and MCTS instances cannot be passed directly, so we'll need to
-        # recreate them in each process using the module-level wrapper function
-        # Prepare arguments for each agent (must be serializable)
-        # Broadcast latest weights to shared memory only when they've changed.
-        if (
-            getattr(self, "_weights_dirty", True)
-            and hasattr(self, "_shared_weight_tensors")
-            and self._shared_weight_tensors is not None
-        ):
-            with self._shared_weight_lock:
-                state = self.network.state_dict()
-                for src, dst in zip(state.values(), self._shared_weight_tensors):
-                    dst.copy_(src.detach().to("cpu"))
-                self._shared_weight_version.value += 1
-            self._weights_dirty = False
+            p.daemon = True
+            p.start()
+            self._pinned_procs.append(p)
 
-        search_args = []
+
+    def _broadcast_weights_if_dirty(self):
+        if not getattr(self, "_weights_dirty", True):
+            return
+        with self._shared_weight_lock:
+            state = self.network.state_dict()
+            for src, dst in zip(state.values(), self._shared_weight_tensors):
+                dst.copy_(src.detach().to("cpu"))
+            self._shared_weight_version.value += 1
+        self._weights_dirty = False
+
+
+    def _parallel_mcts_search(self, obs, env_state, episode: int = 0, step: int = 0):
+        """Pinned workers: one process per agent; no hidden_state IPC."""
+        # 1) ensure workers started
+        if self._pinned_procs is None:
+            self._start_pinned_workers()
+
+        # 2) broadcast weights only when changed
+        self._broadcast_weights_if_dirty()
+
+        # 3) per-step lightweight config
+        config = {
+            'hidden_dim': 256,
+            'lstm_hidden_dim': 128,
+            'use_lstm': self.use_lstm,
+            'sequence_length': 5,
+            'device': str(self.device),
+            'num_simulations': self.mcts_simulations,
+            'c_puct': 1.0,
+            'temperature': 1.0,
+            'rollout_depth': self.rollout_depth,
+            'num_action_samples': self.num_action_samples,
+            'base_seed': self.seed,
+            'episode': int(episode),
+            'step': int(step),
+        }
+
+        # 4) reset worker hidden state at episode start
+        if step == 0:
+            for q in self._pinned_in_queues:
+                q.put(('RESET',))
+
+        # 5) send tasks (obs only; hidden lives inside worker)
         for i in range(self.num_agents):
-            config = {
-                'hidden_dim': 256,
-                'lstm_hidden_dim': 128,
-                'use_lstm': self.use_lstm,
-                'sequence_length': 5,
-                'device': str(self.device),
-                'num_simulations': self.mcts_simulations,
-                'c_puct': 1.0,
-                'temperature': 1.0,
-                'rollout_depth': self.rollout_depth,
-                'num_action_samples': self.num_action_samples,
-                # With shared-memory broadcast, workers read weights directly; no need to send state_dict.
-                'network_state_dict': None,
-                'base_seed': self.seed,
-                'episode': int(episode),
-                'step': int(step),
-                # env_config is now provided once via the process initializer to reduce per-step pickling.
-                'env_config': None
-            }
-            
-            # Convert hidden state to CPU and numpy (only when using LSTM)
-            hidden_state_cpu = None
-            if self.use_lstm and self.hidden_states[i] is not None:
-                if isinstance(self.hidden_states[i], tuple):
-                    hidden_state_cpu = tuple(h.cpu().numpy() for h in self.hidden_states[i])
-                else:
-                    hidden_state_cpu = self.hidden_states[i].cpu().numpy()
-            
-            search_args.append((
-                i,
-                obs[i].copy(),
-                hidden_state_cpu,
-                config
-            ))
-        
-        # Submit all agent searches to process pool
-        # Use module-level function for process pool (must be picklable)
-        futures = {self._process_pool.submit(_search_agent_wrapper, args): i for i, args in enumerate(search_args)}
-        
-        # Collect results as they complete
+            # obs[i] is numpy already; send directly
+            self._pinned_in_queues[i].put(('STEP', obs[i], config))
+
+        # 6) receive results (one per agent)
         actions = [None] * self.num_agents
-        completed = 0
-        errors = []
-        start_time = datetime.now()
-        
-        try:
-            # Wait for results (output disabled - only episode-level logs are shown)
-            for future in as_completed(futures, timeout=600):  # 10 minute total timeout
-                completed += 1
-                
-                try:
-                    i, action, hidden_out = future.result(timeout=120)  # 2 minute timeout per result
-                    actions[i] = action
-                    if self.use_lstm and hidden_out is not None:
-                        self.hidden_states[i] = hidden_out
-                except Exception as e:
-                    agent_id = futures[future]
-                    error_msg = f"Error getting result for agent {agent_id}: {e}"
-                    errors.append(error_msg)
-                    self.log(error_msg)
-                    import traceback
-                    self.log(traceback.format_exc())
-                    # Use zero action as fallback
-                    actions[agent_id] = np.zeros(2)
-        except Exception as e:
-            elapsed = (datetime.now() - start_time).total_seconds()
-            self.log(f"Fatal error in as_completed after {elapsed:.1f}s: {e}")
-            import traceback
-            self.log(traceback.format_exc())
-            # Fill remaining actions with zeros
-            for i in range(self.num_agents):
-                if actions[i] is None:
-                    self.log(f"Warning: Agent {i} action is None, using zero action")
-                    actions[i] = np.zeros(2)
-        
-        # Check if all actions are collected
         for i in range(self.num_agents):
-            if actions[i] is None:
-                self.log(f"Warning: Agent {i} action is None, using zero action")
-                actions[i] = np.zeros(2)
-        
-        if errors:
-            self.log(f"Total errors during parallel MCTS: {len(errors)}")
-        
-        return np.array(actions)
+            agent_id, action = self._pinned_out_queues[i].get()
+            actions[agent_id] = action
+
+        return np.asarray(actions, dtype=np.float32)
     
     def _batched_mcts_search(self, obs, env_state):
         """
@@ -1183,7 +1042,7 @@ class MCTSTrainer:
             action, search_stats = self.mcts_instances[i].search(
                 root_state=obs[i],
                 obs_history=list(self.obs_history[i]) if self.use_lstm else None,
-                hidden_state=self.hidden_states[i] if self.use_lstm else None,
+                hidden_state=None,
                 env=self.env, # Pass env for C++ MCTS
                 env_state=env_state
             )
@@ -1201,7 +1060,7 @@ class MCTSTrainer:
                 if len(obs_seq) < 5:
                     obs_seq = np.array([obs_seq[0]] * (5 - len(obs_seq)) + list(obs_seq))
                 obs_tensor = torch.FloatTensor(obs_seq).unsqueeze(0).to(self.device)
-                _, _, _, self.hidden_states[i] = self.network(obs_tensor, self.hidden_states[i])
+                _, _, _, _ = self.network(obs_tensor, None)
             
             # Add exploration noise in early training
             if self.stats['episode'] < 1000:
