@@ -17,11 +17,12 @@ os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 import numpy as np
 import torch
 import torch.optim as optim
-torch.set_num_threads(1)
-try:
-    torch.set_num_interop_threads(1)
-except Exception:
-    pass
+
+# Thread settings:
+# - `set_num_threads` is safe and can be applied multiple times.
+# - `set_num_interop_threads` MUST be called before any parallel work starts;
+#   calling it too late can abort the process.
+torch.set_num_threads(int(os.environ.get('TORCH_NUM_THREADS', '1')))
 from datetime import datetime
 from time import time
 from collections import deque
