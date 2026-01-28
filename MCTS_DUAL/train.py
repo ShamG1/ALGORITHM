@@ -68,7 +68,8 @@ def set_global_seeds(seed: int, deterministic: bool = False) -> None:
 _WORKER_CACHE = {
     "network": None,
     "mcts": None,
-    "env": None
+    "env": None,
+    "env_config": None,
 }
 
 # Shared-memory weight broadcast (to avoid per-step pickling of state_dict)
@@ -79,11 +80,13 @@ _SHARED_STATE = {
     "lock": None       # multiprocessing.Lock
 }
 
-def _init_worker_shared_state(shared_tensors, version, lock):
-    global _SHARED_STATE
+def _init_worker_shared_state(shared_tensors, version, lock, env_config=None):
+    global _SHARED_STATE, _WORKER_CACHE
     _SHARED_STATE["tensors"] = shared_tensors
     _SHARED_STATE["version"] = version
     _SHARED_STATE["lock"] = lock
+    if env_config is not None:
+        _WORKER_CACHE["env_config"] = env_config
 
 def _search_agent_wrapper(args):
     """
@@ -190,7 +193,9 @@ def _search_agent_wrapper(args):
                     from MCTS_DUAL.train import generate_ego_routes
                     from MCTS_DUAL.env import IntersectionEnv
                     from MCTS_DUAL.utils import DEFAULT_REWARD_CONFIG
-            env_cfg = config.get('env_config', {})
+            env_cfg = config.get('env_config', None)
+            if env_cfg is None:
+                env_cfg = _WORKER_CACHE.get('env_config') or {}
             num_agents_cfg = env_cfg.get('num_agents', 1)
             num_lanes_cfg = env_cfg.get('num_lanes', 3)
             ego_routes_copy = env_cfg.get('ego_routes')
@@ -233,7 +238,10 @@ def _search_agent_wrapper(args):
             from mcts import MCTS
             
             # build shared network list
-            num_agents = config['env_config']['num_agents']
+            env_cfg_for_mcts = config.get('env_config', None)
+            if env_cfg_for_mcts is None:
+                env_cfg_for_mcts = _WORKER_CACHE.get('env_config') or {}
+            num_agents = int(env_cfg_for_mcts.get('num_agents', 1))
             shared_network_list = [_WORKER_CACHE["network"] for _ in range(num_agents)]
             
             mcts = MCTS(
@@ -263,23 +271,25 @@ def _search_agent_wrapper(args):
         # update ID (because the same Worker process may serve different Agents)
         mcts.agent_id = agent_id 
         
-        # Convert hidden state back to tensor if needed
+        # Convert hidden state back to tensor if needed (only when using LSTM)
         hidden_state_tensor = None
-        if hidden_state_data is not None:
+        if config.get('use_lstm', True) and hidden_state_data is not None:
             if isinstance(hidden_state_data, tuple):
-                hidden_state_tensor = tuple(torch.tensor(h, device=device) for h in hidden_state_data)
+                hidden_state_tensor = tuple(torch.as_tensor(h, device=device) for h in hidden_state_data)
             else:
-                hidden_state_tensor = torch.tensor(hidden_state_data, device=device)
+                hidden_state_tensor = torch.as_tensor(hidden_state_data, device=device)
         
         # Perform search
         # Use positional args to avoid keyword mismatches across different MCTS wrappers
-        action, search_stats = mcts.search(
-            obs_data,
-            _WORKER_CACHE["env"],
-            None,
-            hidden_state_tensor,
-            None
-        )
+        with torch.inference_mode():
+            action, search_stats = mcts.search(
+                obs_data,
+                _WORKER_CACHE["env"],
+                None,
+                hidden_state_tensor,
+                None
+            )
+
         
         # Ensure action is numpy array
         if not isinstance(action, np.ndarray):
@@ -289,7 +299,7 @@ def _search_agent_wrapper(args):
         # Return updated hidden state if provided by C++ LSTM-MCTS
         hidden_out = None
         try:
-            if isinstance(search_stats, dict) and ("h_next" in search_stats) and ("c_next" in search_stats):
+            if config.get('use_lstm', True) and isinstance(search_stats, dict) and ("h_next" in search_stats) and ("c_next" in search_stats):
                 hn = search_stats["h_next"]
                 cn = search_stats["c_next"]
                 # Convert to torch tensors shaped (1,1,H)
@@ -437,6 +447,7 @@ class MCTSTrainer:
         log_frequency: int = 10,
         device: str = 'cpu',
         use_team_reward: bool = True,
+        use_lstm: bool = True,
         render: bool = False,
         show_lane_ids: bool = False,
         show_lidar: bool = False,
@@ -477,6 +488,7 @@ class MCTSTrainer:
         self.log_frequency = log_frequency
         self.device = torch.device(device)
         self.use_team_reward = use_team_reward
+        self.use_lstm = use_lstm
         self.render = render
         self.show_lane_ids = show_lane_ids
         self.show_lidar = show_lidar
@@ -486,6 +498,10 @@ class MCTSTrainer:
         self.use_tqdm = use_tqdm and tqdm is not None
         self._process_pool = None  # Initialize process pool to None
         self.seed = seed
+
+        # Shared-memory weight broadcast optimization:
+        # only copy weights to shared memory when they've actually changed (after optimizer.step()).
+        self._weights_dirty = True
         self.deterministic = deterministic
         
         # Create save directory
@@ -526,7 +542,7 @@ class MCTSTrainer:
             action_dim=2,
             hidden_dim=256,
             lstm_hidden_dim=128,
-            use_lstm=True,
+            use_lstm=self.use_lstm,
             sequence_length=5
         ).to(self.device)
 
@@ -605,8 +621,8 @@ class MCTSTrainer:
         self.optimizer = optim.Adam(self.network.parameters(), lr=3e-4)
         
         # Observation history for LSTM
-        self.obs_history = [deque(maxlen=5) for _ in range(num_agents)]
-        self.hidden_states = [None for _ in range(num_agents)]
+        self.obs_history = [deque(maxlen=5) for _ in range(num_agents)] if self.use_lstm else None
+        self.hidden_states = [None for _ in range(num_agents)] if self.use_lstm else None
         # TBPTT settings (sequence training)
         self.unroll_len = 16
         
@@ -692,11 +708,12 @@ class MCTSTrainer:
                             print(f"  WARNING: Agents with overlapping positions: {overlaps}")
                 
                 # Reset observation history and hidden states
-                for i in range(self.num_agents):
-                    self.obs_history[i].clear()
-                    self.hidden_states[i] = None
-                    # Initialize history with first observation
-                    self.obs_history[i].append(obs[i])
+                if self.use_lstm:
+                    for i in range(self.num_agents):
+                        self.obs_history[i].clear()
+                        self.hidden_states[i] = None
+                        # Initialize history with first observation
+                        self.obs_history[i].append(obs[i])
                 
                 # Reset buffer at start of episode
                 if hasattr(self, 'buffer'):
@@ -766,9 +783,10 @@ class MCTSTrainer:
                             env_state['agent_states'].append(agent_state)
                     
                     # Update observation history for all agents
-                    for i in range(self.num_agents):
-                        if episode_length > 0:
-                            self.obs_history[i].append(obs[i])
+                    if self.use_lstm:
+                        for i in range(self.num_agents):
+                            if episode_length > 0:
+                                self.obs_history[i].append(obs[i])
                     
                     # Enable debug output for first episode to diagnose hanging issue
                     for i in range(self.num_agents):
@@ -792,22 +810,9 @@ class MCTSTrainer:
                             # Parallel MCTS: all agents search simultaneously
                             actions = self._parallel_mcts_search(obs, env_state, episode=episode, step=episode_length)
 
-                            # Advance per-agent LSTM hidden state so the next step's MCTS sees updated memory.
-                            # This matches the semantics used in _batched_mcts_search.
-                            with torch.no_grad():
-                                seq_len = int(getattr(self.network, 'sequence_length', 5))
-                                for i in range(self.num_agents):
-                                    obs_seq = np.array(list(self.obs_history[i]), dtype=np.float32)
-                                    if obs_seq.size == 0:
-                                        continue
-                                    if obs_seq.shape[0] < seq_len:
-                                        pad_n = seq_len - obs_seq.shape[0]
-                                        obs_seq = np.concatenate([np.repeat(obs_seq[:1], pad_n, axis=0), obs_seq], axis=0)
-                                    elif obs_seq.shape[0] > seq_len:
-                                        obs_seq = obs_seq[-seq_len:]
-
-                                    obs_tensor = torch.from_numpy(obs_seq).unsqueeze(0).to(self.device)
-                                    _, _, _, self.hidden_states[i] = self.network(obs_tensor, self.hidden_states[i])
+                            # NOTE: In parallel MCTS, worker processes return updated LSTM states via
+                            # search_stats['h_next'/'c_next'] and we already write them back in
+                            # _parallel_mcts_search(). Avoid doing an extra per-agent forward here (CPU bottleneck).
                         else:
                             # Sequential MCTS: one agent at a time (original behavior)
                             actions = self._sequential_mcts_search(obs, env_state)
@@ -1022,10 +1027,20 @@ class MCTSTrainer:
                 self._shared_weight_lock = mp.Lock()
 
             # Worker processes will inherit these objects (default 'fork' on Linux)
+            init_env_config = {
+                'num_agents': self.num_agents,
+                'num_lanes': self.num_lanes,
+                'use_team_reward': self.use_team_reward,
+                'max_steps': self.max_steps_per_episode,
+                'respawn_enabled': self.respawn_enabled,
+                'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
+                'ego_routes': self.ego_routes,
+            }
+
             self._process_pool = ProcessPoolExecutor(
                 max_workers=self.max_workers,
                 initializer=_init_worker_shared_state,
-                initargs=(self._shared_weight_tensors, self._shared_weight_version, self._shared_weight_lock)
+                initargs=(self._shared_weight_tensors, self._shared_weight_version, self._shared_weight_lock, init_env_config)
             )
         
         # Submit searches (output disabled - only episode-level logs are shown)
@@ -1034,20 +1049,25 @@ class MCTSTrainer:
         # Networks and MCTS instances cannot be passed directly, so we'll need to
         # recreate them in each process using the module-level wrapper function
         # Prepare arguments for each agent (must be serializable)
-        # Broadcast latest weights to shared memory once per step.
-        if hasattr(self, "_shared_weight_tensors") and self._shared_weight_tensors is not None:
+        # Broadcast latest weights to shared memory only when they've changed.
+        if (
+            getattr(self, "_weights_dirty", True)
+            and hasattr(self, "_shared_weight_tensors")
+            and self._shared_weight_tensors is not None
+        ):
             with self._shared_weight_lock:
                 state = self.network.state_dict()
                 for src, dst in zip(state.values(), self._shared_weight_tensors):
                     dst.copy_(src.detach().to("cpu"))
                 self._shared_weight_version.value += 1
+            self._weights_dirty = False
 
         search_args = []
         for i in range(self.num_agents):
             config = {
                 'hidden_dim': 256,
                 'lstm_hidden_dim': 128,
-                'use_lstm': True,
+                'use_lstm': self.use_lstm,
                 'sequence_length': 5,
                 'device': str(self.device),
                 'num_simulations': self.mcts_simulations,
@@ -1060,20 +1080,13 @@ class MCTSTrainer:
                 'base_seed': self.seed,
                 'episode': int(episode),
                 'step': int(step),
-                'env_config': {  # Pass config instead of factory
-                    'num_agents': self.num_agents,
-                    'num_lanes': self.num_lanes,
-                    'use_team_reward': self.use_team_reward,
-                    'max_steps': self.max_steps_per_episode,
-                    'respawn_enabled': self.respawn_enabled,
-                    'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
-                    'ego_routes': self.ego_routes
-                }
+                # env_config is now provided once via the process initializer to reduce per-step pickling.
+                'env_config': None
             }
             
-            # Convert hidden state to CPU and numpy
+            # Convert hidden state to CPU and numpy (only when using LSTM)
             hidden_state_cpu = None
-            if self.hidden_states[i] is not None:
+            if self.use_lstm and self.hidden_states[i] is not None:
                 if isinstance(self.hidden_states[i], tuple):
                     hidden_state_cpu = tuple(h.cpu().numpy() for h in self.hidden_states[i])
                 else:
@@ -1104,7 +1117,7 @@ class MCTSTrainer:
                 try:
                     i, action, hidden_out = future.result(timeout=120)  # 2 minute timeout per result
                     actions[i] = action
-                    if hidden_out is not None:
+                    if self.use_lstm and hidden_out is not None:
                         self.hidden_states[i] = hidden_out
                 except Exception as e:
                     agent_id = futures[future]
@@ -1169,8 +1182,8 @@ class MCTSTrainer:
             
             action, search_stats = self.mcts_instances[i].search(
                 root_state=obs[i],
-                obs_history=list(self.obs_history[i]),
-                hidden_state=self.hidden_states[i],
+                obs_history=list(self.obs_history[i]) if self.use_lstm else None,
+                hidden_state=self.hidden_states[i] if self.use_lstm else None,
                 env=self.env, # Pass env for C++ MCTS
                 env_state=env_state
             )
@@ -1183,11 +1196,12 @@ class MCTSTrainer:
             action = action.flatten()
             
             # Update hidden state after MCTS search
-            obs_seq = np.array(list(self.obs_history[i]))
-            if len(obs_seq) < 5:
-                obs_seq = np.array([obs_seq[0]] * (5 - len(obs_seq)) + list(obs_seq))
-            obs_tensor = torch.FloatTensor(obs_seq).unsqueeze(0).to(self.device)
-            _, _, _, self.hidden_states[i] = self.network(obs_tensor, self.hidden_states[i])
+            if self.use_lstm:
+                obs_seq = np.array(list(self.obs_history[i]))
+                if len(obs_seq) < 5:
+                    obs_seq = np.array([obs_seq[0]] * (5 - len(obs_seq)) + list(obs_seq))
+                obs_tensor = torch.FloatTensor(obs_seq).unsqueeze(0).to(self.device)
+                _, _, _, self.hidden_states[i] = self.network(obs_tensor, self.hidden_states[i])
             
             # Add exploration noise in early training
             if self.stats['episode'] < 1000:
@@ -1229,6 +1243,19 @@ class MCTSTrainer:
     
     def _batch_update_networks(self, next_obs, done):
         """Batch update networks using stored transitions."""
+        # Non-LSTM mode: the current update code path is TBPTT/LSTM-specific.
+        # For A/B speed comparisons we can safely skip updates.
+        if not getattr(self.network, 'use_lstm', False):
+            # Clear buffer
+            self.buffer = {
+                'obs': [[] for _ in range(self.num_agents)],
+                'next_obs': [[] for _ in range(self.num_agents)],
+                'actions': [[] for _ in range(self.num_agents)],
+                'rewards': [[] for _ in range(self.num_agents)],
+                'dones': [[] for _ in range(self.num_agents)],
+            }
+            return
+
         gamma = 0.99  # Discount factor
         unroll = int(getattr(self, 'unroll_len', 16))
         
@@ -1312,6 +1339,8 @@ class MCTSTrainer:
         if total_steps > 0:
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
             self.optimizer.step()
+            # Mark weights dirty so the next parallel MCTS step broadcasts updated weights.
+            self._weights_dirty = True
         
         # Clear buffer
         self.buffer = {
@@ -1402,6 +1431,7 @@ def main():
     parser.add_argument('--tqdm', action='store_true', help='Enable tqdm progress bar')
     parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility (default: None)')
     parser.add_argument('--deterministic', action='store_true', help='Enable deterministic torch algorithms (slower)')
+    parser.add_argument('--no-lstm', action='store_true', help='Disable LSTM in policy/value network and use non-recurrent C++ MCTS backend')
     
     args = parser.parse_args()
     
@@ -1432,6 +1462,7 @@ def main():
         save_frequency=args.save_frequency,
         device=device,
         use_team_reward=args.use_team_reward,
+        use_lstm=not args.no_lstm,
         render=args.render,
         show_lane_ids=args.show_lane_ids,
         show_lidar=args.show_lidar,

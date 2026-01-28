@@ -1,4 +1,4 @@
-Training started at 2026-01-28 01:29:16.843668
+Training started at 2026-01-28 10:06:32.484668
 Num agents: 6
 Num lanes: 2
 Use team reward: True

@@ -98,6 +98,17 @@ class MCTS:
                 empty = np.array([])
                 return empty, empty, empty
 
+            # Non-recurrent policy/value: ignore incoming h/c.
+            if not getattr(self.network, 'use_lstm', False):
+                obs_tensor = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
+                with torch.inference_mode():
+                    means, stds, values = self.network(obs_tensor)
+                return (
+                    means.cpu().numpy(),
+                    stds.cpu().numpy(),
+                    values.view(-1).cpu().numpy(),
+                )
+
             obs_tensor = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
 
             # h/c expected as (B,H) or flat; convert to (1,B,H) for PyTorch LSTM.
@@ -110,27 +121,17 @@ class MCTS:
             h_t = torch.as_tensor(h_np, device=self.device).view(1, obs_tensor.shape[0], -1)
             c_t = torch.as_tensor(c_np, device=self.device).view(1, obs_tensor.shape[0], -1)
 
-            means_list = []
-            stds_list = []
-            values_list = []
+            # DualNetwork supports batched forward for single-step inputs: (B, obs_dim)
+            # with LSTM hidden state shaped (1, B, H). This avoids a Python loop per node.
+            with torch.inference_mode():
+                # DualNetwork expects hidden_state for batched input shaped (1, B, H).
+                means, stds, values, _ = self.network(obs_tensor, (h_t, c_t))
 
-            with torch.no_grad():
-                # Evaluate each item with its own recurrent state (tree nodes).
-                for i in range(obs_tensor.shape[0]):
-                    x = obs_tensor[i].view(1, -1)  # (1, obs_dim)
-                    m, s, v, _ = self.network(x, (h_t, c_t))
-                    means_list.append(m.squeeze(0))
-                    stds_list.append(s.squeeze(0))
-                    values_list.append(v.view(-1)[0])
-
-            means = torch.stack(means_list, dim=0)
-            stds = torch.stack(stds_list, dim=0)
-            values = torch.stack(values_list, dim=0)
-
+            # means/stds: (B, A), values: (B, 1)
             return (
                 means.cpu().numpy(),
                 stds.cpu().numpy(),
-                values.cpu().numpy(),
+                values.view(-1).cpu().numpy(),
             )
 
         # Root hidden state (1,1,H) in training code -> flatten to (H,)
@@ -147,6 +148,10 @@ class MCTS:
             c: np.ndarray,
             action_batch: np.ndarray,
         ) -> Tuple[np.ndarray, np.ndarray]:
+            # This callback is only used by the recurrent (LSTM) C++ MCTS backend.
+            if not getattr(self.network, 'use_lstm', False):
+                raise RuntimeError("infer_next_hidden called but network.use_lstm=False")
+
             if not obs_batch:
                 empty = np.array([])
                 return empty, empty
@@ -164,14 +169,14 @@ class MCTS:
             h_t = torch.as_tensor(h_np, device=self.device).view(1, obs_tensor.shape[0], -1)
             c_t = torch.as_tensor(c_np, device=self.device).view(1, obs_tensor.shape[0], -1)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 hn, cn = self.network.next_hidden(obs_tensor, act_tensor, (h_t, c_t))
 
             # Return (B,H)
             return hn.squeeze(0).cpu().numpy(), cn.squeeze(0).cpu().numpy()
 
-        # Prefer recurrent C++ MCTS if available
-        if hasattr(cpp_backend, 'mcts_search_lstm'):
+        # Prefer recurrent C++ MCTS only when the network uses LSTM.
+        if getattr(self.network, 'use_lstm', False) and hasattr(cpp_backend, 'mcts_search_lstm'):
             action, stats = cpp_backend.mcts_search_lstm(
                 cpp_env,
                 root_state_cpp,
