@@ -1035,6 +1035,14 @@ class MCTSTrainer:
                 action = np.array([action])
             action = action.flatten()
             
+            # Update hidden state after MCTS search
+            if self.use_lstm:
+                obs_seq = np.array(list(self.obs_history[i]))
+                if len(obs_seq) < 5:
+                    obs_seq = np.array([obs_seq[0]] * (5 - len(obs_seq)) + list(obs_seq))
+                obs_tensor = torch.FloatTensor(obs_seq).unsqueeze(0).to(self.device)
+                _, _, _, _ = self.network(obs_tensor, None)
+            
             # Add exploration noise in early training
             if self.stats['episode'] < 1000:
                 noise_scale = 0.3 * (1.0 - self.stats['episode'] / 1000.0)
@@ -1247,7 +1255,7 @@ def main():
     parser.add_argument('--max-episodes', type=int, default=100000, help='Max training episodes')
     parser.add_argument('--max-steps', type=int, default=500, help='Max steps per episode')
     parser.add_argument('--mcts-simulations', type=int, default=5, help='Number of MCTS simulations per step (default: 25)')
-    parser.add_argument('--rollout-depth', type=int, default=3, help='Number of steps to rollout in environment (default: 3)')
+    parser.add_argument('--rollout-depth', type=int, default=5, help='Number of steps to rollout in environment (default: 3)')
     parser.add_argument('--num-action-samples', type=int, default=3, help='Number of actions to sample per node expansion (default: 3)')
     parser.add_argument('--save-frequency', type=int, default=100, help='Episodes before saving checkpoint')
     parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu, cuda, or auto)')
