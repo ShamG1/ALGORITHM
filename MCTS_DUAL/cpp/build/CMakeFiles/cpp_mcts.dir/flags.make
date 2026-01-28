@@ -6,5 +6,5 @@ CXX_DEFINES = -DCPP_MCTS_ENABLE_RENDER -Dcpp_mcts_EXPORTS
 
 CXX_INCLUDES = -I/home/g/algorithm/MCTS_DUAL/cpp -isystem /home/g/anaconda3/envs/g308/include/python3.8 -isystem /home/g/anaconda3/envs/g308/include
 
-CXX_FLAGS = -std=gnu++17 -fPIC -fvisibility=hidden -flto=auto -fno-fat-lto-objects
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -flto -fno-fat-lto-objects -fPIC -fvisibility=hidden
 

@@ -683,27 +683,8 @@ class MCTSTrainer:
                             pass
                     
                     # Select actions using MCTS for each agent
-                    # Prepare environment state for rollouts (shared by all agents)
-                    # Only include serializable data (no pygame objects)
-                    env_state = {
-                        'step_count': getattr(self.env, 'step_count', 0),
-                        'obs': obs.copy() if isinstance(obs, np.ndarray) else obs,  # Current observations for all agents
-                        # Extract only serializable agent data (no pygame surfaces)
-                        'agent_states': []
-                    }
-                    if hasattr(self.env, 'agents') and self.env.agents:
-                        for agent in self.env.agents:
-                            # Extract only basic attributes (no pygame objects)
-                            # Use getattr with safe defaults to avoid AttributeError
-                            agent_state = {
-                                'pos_x': getattr(agent, 'pos_x', 0.0),
-                                'pos_y': getattr(agent, 'pos_y', 0.0),
-                                'heading': getattr(agent, 'heading', 0.0),
-                                'speed': getattr(agent, 'speed', 0.0),  # Car uses 'speed', not 'velocity'
-                                'target_lane': getattr(agent, 'target_lane', None),
-                                'route': getattr(agent, 'route', None)
-                            }
-                            env_state['agent_states'].append(agent_state)
+                    # NOTE: In pinned-workers parallel mode, `env_state` is not used by workers.
+                    env_state = None
                     
                     # Update observation history for all agents
                     if self.use_lstm:
@@ -1053,14 +1034,6 @@ class MCTSTrainer:
             if action.ndim == 0:
                 action = np.array([action])
             action = action.flatten()
-            
-            # Update hidden state after MCTS search
-            if self.use_lstm:
-                obs_seq = np.array(list(self.obs_history[i]))
-                if len(obs_seq) < 5:
-                    obs_seq = np.array([obs_seq[0]] * (5 - len(obs_seq)) + list(obs_seq))
-                obs_tensor = torch.FloatTensor(obs_seq).unsqueeze(0).to(self.device)
-                _, _, _, _ = self.network(obs_tensor, None)
             
             # Add exploration noise in early training
             if self.stats['episode'] < 1000:
