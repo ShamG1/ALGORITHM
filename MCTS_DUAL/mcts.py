@@ -112,14 +112,21 @@ class MCTS:
             obs_tensor = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), device=self.device)
 
             # h/c expected as (B,H) or flat; convert to (1,B,H) for PyTorch LSTM.
-            h_np = np.asarray(h, dtype=np.float32)
-            c_np = np.asarray(c, dtype=np.float32)
-            if h_np.ndim == 1:
+            # Be robust to bad shapes coming from the C++ backend stats.
+            h_np = np.asarray(h, dtype=np.float32).reshape(-1)
+            c_np = np.asarray(c, dtype=np.float32).reshape(-1)
+
+            expected_h = int(lstm_hidden_dim)
+            if h_np.size != expected_h or c_np.size != expected_h:
+                h_np = np.zeros((expected_h,), dtype=np.float32)
+                c_np = np.zeros((expected_h,), dtype=np.float32)
+
+            # Expand to batch
                 h_np = np.tile(h_np[None, :], (obs_tensor.shape[0], 1))
                 c_np = np.tile(c_np[None, :], (obs_tensor.shape[0], 1))
 
-            h_t = torch.as_tensor(h_np, device=self.device).view(1, obs_tensor.shape[0], -1)
-            c_t = torch.as_tensor(c_np, device=self.device).view(1, obs_tensor.shape[0], -1)
+            h_t = torch.as_tensor(h_np, device=self.device).view(1, obs_tensor.shape[0], expected_h)
+            c_t = torch.as_tensor(c_np, device=self.device).view(1, obs_tensor.shape[0], expected_h)
 
             # DualNetwork supports batched forward for single-step inputs: (B, obs_dim)
             # with LSTM hidden state shaped (1, B, H). This avoids a Python loop per node.
@@ -186,6 +193,7 @@ class MCTS:
                 h0.tolist(),
                 c0.tolist(),
                 lstm_hidden_dim,
+                self.agent_id,
                 num_simulations=self.num_simulations,
                 num_action_samples=self.num_action_samples,
                 rollout_depth=self.rollout_depth,
@@ -203,6 +211,7 @@ class MCTS:
                 root_state_cpp,
                 root_obs.tolist(),
                 infer_policy_value,
+                self.agent_id,
                 num_simulations=self.num_simulations,
                 num_action_samples=self.num_action_samples,
                 rollout_depth=self.rollout_depth,

@@ -159,9 +159,10 @@ class Trainer:
         ego_routes = generate_ego_routes(num_agents, num_lanes)
         
         # Log generated routes
-        print(f"Generated {len(ego_routes)} routes for {num_agents} agents with {num_lanes} lanes:")
-        for i, route in enumerate(ego_routes):
-            print(f"  Agent {i}: {route[0]} -> {route[1]}")
+        with open(os.path.join(save_dir, 'routes.txt'), 'w') as f:
+            f.write(f"Generated {len(ego_routes)} routes for {num_agents} agents with {num_lanes} lanes:\n")
+            for i, route in enumerate(ego_routes):
+                f.write(f"  Agent {i}: {route[0]} -> {route[1]}\n")
         
         # Initialize environment
         self.env = IntersectionEnv({
@@ -225,11 +226,10 @@ class Trainer:
         self.csv_file = os.path.join(save_dir, 'episode_rewards.csv')
         with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Episode', 'Total_Reward', 'Mean_Reward', 'Episode_Length'])
+            writer.writerow(['Episode', 'Total_Reward', 'Mean_Reward', 'Episode_Length', 'Episode_Duration_Sec'])
     
     def log(self, message: str):
-        """Log message to file and console."""
-        print(message)
+        """Log message to file."""
         with open(self.log_file, 'a') as f:
             f.write(message + "\n")
     
@@ -403,12 +403,14 @@ class Trainer:
             # Write episode rewards to CSV
             total_reward = episode_reward.sum()  # Sum of all agents' rewards
             mean_reward = episode_reward.mean()
+            
+            # Write to rewards CSV
             with open(self.csv_file, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow([episode, total_reward, mean_reward, episode_length])
+                writer.writerow([episode, total_reward, mean_reward, episode_length, episode_duration])
             
-            # Print episode reward information with duration
-            print(
+            # Write episode information to log file (no console printing)
+            self.log(
                 f"Episode {episode:5d} | "
                 f"Total Reward: {total_reward:8.2f} | "
                 f"Mean Reward: {mean_reward:7.2f} | "
@@ -490,7 +492,7 @@ def main():
     parser.add_argument('--num-lanes', type=int, default=2, help='Number of lanes per direction')
     parser.add_argument('--max-episodes', type=int, default=100000, help='Max training episodes')
     parser.add_argument('--update-frequency', type=int, default=2048, help='Steps before update')
-    parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'], help='Device')
+    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'], help='Device')
     parser.add_argument('--use-team-reward', action='store_true', help='Use team reward mixing')
     parser.add_argument('--render', action='store_true', help='Render environment')
     parser.add_argument('--show-lane-ids', action='store_true', help='Show lane IDs in render')
@@ -501,13 +503,16 @@ def main():
     
     args = parser.parse_args()
     
-    # Check for CUDA
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available, using CPU")
-        args.device = 'cpu'
+    # Check device selection
+    if args.device == 'cuda':
+        if not torch.cuda.is_available():
+            print("CUDA not available, using CPU")
+            args.device = 'cpu'
+        else:
+            print("CUDA available, using CUDA")
+            print(torch.cuda.get_device_name(0))
     else:
-        print("CUDA available, using CUDA")
-        print(torch.cuda.get_device_name(0))
+        print("Using CPU")
     # Create trainer
     trainer = Trainer(
         num_agents=args.num_agents,

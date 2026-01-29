@@ -198,8 +198,20 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
 
             # Update worker's own hidden state
             if config.get('use_lstm') and isinstance(search_stats, dict) and ("h_next" in search_stats):
-                hn = torch.as_tensor(np.asarray(search_stats["h_next"], dtype=np.float32), device=device).view(1, 1, -1)
-                cn = torch.as_tensor(np.asarray(search_stats["c_next"], dtype=np.float32), device=device).view(1, 1, -1)
+                # Robustly validate LSTM hidden state shape from C++ stats.
+                # Expected: (H,) or (1,H) where H == lstm_hidden_dim.
+                lstm_hidden_dim = int(config.get('lstm_hidden_dim', 128))
+                h_np = np.asarray(search_stats.get("h_next"), dtype=np.float32).reshape(-1)
+                c_np = np.asarray(search_stats.get("c_next"), dtype=np.float32).reshape(-1)
+
+                if h_np.size != lstm_hidden_dim or c_np.size != lstm_hidden_dim:
+                    # If C++ returns a wrong shape, reset hidden state to zeros (fail-safe).
+                    hn = torch.zeros(1, 1, lstm_hidden_dim, device=device, dtype=torch.float32)
+                    cn = torch.zeros(1, 1, lstm_hidden_dim, device=device, dtype=torch.float32)
+                else:
+                    hn = torch.as_tensor(h_np, device=device).view(1, 1, lstm_hidden_dim)
+                    cn = torch.as_tensor(c_np, device=device).view(1, 1, lstm_hidden_dim)
+
                 _WORKER_CACHE["hidden"] = (hn, cn)
 
             out_q.put((agent_id, np.array(action, dtype=np.float32).flatten()))
@@ -578,11 +590,10 @@ class MCTSTrainer:
         self.csv_file = os.path.join(save_dir, 'episode_rewards.csv')
         with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Episode', 'Total_Reward', 'Mean_Reward', 'Episode_Length'])
+            writer.writerow(['Episode', 'Total_Reward', 'Mean_Reward', 'Episode_Length', 'Episode_Duration_Sec'])
     
     def log(self, message: str):
-        """Log message to file and console."""
-        print(message)
+        """Log message to file."""
         with open(self.log_file, 'a') as f:
             f.write(message + "\n")
     
@@ -644,6 +655,8 @@ class MCTSTrainer:
                     self.buffer = {
                         'obs': [[] for _ in range(self.num_agents)],
                         'next_obs': [[] for _ in range(self.num_agents)],
+                        'global_state': [[] for _ in range(self.num_agents)],
+                        'next_global_state': [[] for _ in range(self.num_agents)],
                         'actions': [[] for _ in range(self.num_agents)],
                         'rewards': [[] for _ in range(self.num_agents)],
                         'dones': [[] for _ in range(self.num_agents)],
@@ -742,6 +755,11 @@ class MCTSTrainer:
                             print(f"  WARNING: Actions out of range [-1, 1]!")
                             print(f"  Actions range: [{actions.min():.3f}, {actions.max():.3f}]")
                     
+                    # CTDE: capture global state BEFORE env.step()
+                    global_states = None
+                    if getattr(self.network, 'use_centralized_critic', False):
+                        global_states = [self.env.env.get_global_state(i, 3) for i in range(self.num_agents)]
+                    
                     # Step environment
                     try:
                         # Environment step (output disabled - only episode-level logs are shown)
@@ -752,6 +770,11 @@ class MCTSTrainer:
                         import traceback
                         traceback.print_exc()
                         break
+
+                    # CTDE: capture global state AFTER env.step()
+                    next_global_states = None
+                    if getattr(self.network, 'use_centralized_critic', False):
+                        next_global_states = [self.env.env.get_global_state(i, 3) for i in range(self.num_agents)]
                     
                     # Handle reward format
                     if isinstance(rewards, (list, np.ndarray)):
@@ -781,7 +804,7 @@ class MCTSTrainer:
                                 print(f"    Agent {i}: pos=({agent.pos_x:.1f}, {agent.pos_y:.1f}), heading={agent.heading:.2f}, speed={agent.speed:.2f}")
                     
                     # Store transitions and update in batches
-                    self._update_networks(obs, actions, rewards, next_obs, done)
+                    self._update_networks(obs, actions, rewards, next_obs, done, global_states, next_global_states)
                     
                     episode_reward += rewards
                     episode_length += 1
@@ -819,7 +842,7 @@ class MCTSTrainer:
                 
                 # Final update if buffer has remaining data
                 if hasattr(self, 'buffer') and len(self.buffer['obs'][0]) > 0:
-                    self._batch_update_networks(obs, done)
+                    self._batch_update_networks()
                 
                 # Update statistics
                 self.stats['total_steps'] = step_count
@@ -844,14 +867,14 @@ class MCTSTrainer:
                 # Calculate episode duration
                 episode_duration = time() - episode_start_time
                 
-                # Print episode summary with duration
+                # Write episode summary with duration to log file (no console printing)
                 status_str = ""
                 if has_success:
                     status_str = " [SUCCESS]"
                 elif has_crash:
                     status_str = " [CRASH]"
                 
-                print(
+                self.log(
                     f"Episode {episode:5d} | "
                     f"Reward: {mean_reward:7.2f} (Total: {total_reward:7.2f}) | "
                     f"Length: {episode_length:5d} | "
@@ -861,7 +884,7 @@ class MCTSTrainer:
                 # Write episode rewards to CSV
                 with open(self.csv_file, 'a', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow([episode, total_reward, mean_reward, episode_length])
+                    writer.writerow([episode, total_reward, mean_reward, episode_length, episode_duration])
                 
                 # Update success/crash counters
                 if has_success:
@@ -1054,7 +1077,7 @@ class MCTSTrainer:
         
         return np.array(actions)
     
-    def _update_networks(self, obs, actions, rewards, next_obs, done):
+    def _update_networks(self, obs, actions, rewards, next_obs, done, global_states=None, next_global_states=None):
         """
         Update networks using experience buffer.
         Store transitions and update in batches for stability.
@@ -1066,6 +1089,8 @@ class MCTSTrainer:
                 self.buffer = {
                     'obs': [[] for _ in range(self.num_agents)],
                     'next_obs': [[] for _ in range(self.num_agents)],
+                    'global_state': [[] for _ in range(self.num_agents)],
+                    'next_global_state': [[] for _ in range(self.num_agents)],
                     'actions': [[] for _ in range(self.num_agents)],
                     'rewards': [[] for _ in range(self.num_agents)],
                     'dones': [[] for _ in range(self.num_agents)],
@@ -1073,16 +1098,29 @@ class MCTSTrainer:
 
             self.buffer['obs'][i].append(np.asarray(obs[i], dtype=np.float32))
             self.buffer['next_obs'][i].append(np.asarray(next_obs[i], dtype=np.float32))
-            self.buffer['actions'][i].append(actions[i])
-            self.buffer['rewards'][i].append(rewards[i])
-            self.buffer['dones'][i].append(done)
+            self.buffer['actions'][i].append(np.asarray(actions[i], dtype=np.float32))
+            self.buffer['rewards'][i].append(float(rewards[i]))
+            self.buffer['dones'][i].append(float(done))
+
+            if getattr(self.network, 'use_centralized_critic', False):
+                # CTDE: store pre-step and post-step centralized state provided by train() loop.
+                if global_states is None or next_global_states is None:
+                    raise RuntimeError(
+                        "CTDE enabled but global_states/next_global_states not provided. "
+                        "Ensure env backend exposes env.env.get_global_state() and train() passes them into _update_networks()."
+                    )
+
+                self.buffer['global_state'][i].append(np.asarray(global_states[i], dtype=np.float32))
+                self.buffer['next_global_state'][i].append(np.asarray(next_global_states[i], dtype=np.float32))
         
-        # Update networks when buffer reaches threshold 
+        # Update networks when buffer reaches threshold
+        # For CPU training, larger batch updates reduce Python overhead.
         buffer_size = len(self.buffer['obs'][0])
-        if buffer_size >= 64:  # Update every 64 steps
-            self._batch_update_networks(next_obs, done)
+        update_every = int(getattr(self, 'update_every', 256))
+        if buffer_size >= update_every:
+            self._batch_update_networks()
     
-    def _batch_update_networks(self, next_obs, done):
+    def _batch_update_networks(self):
         """Batch update networks using stored transitions."""
         # Non-LSTM mode: the current update code path is TBPTT/LSTM-specific.
         # For A/B speed comparisons we can safely skip updates.
@@ -1091,6 +1129,8 @@ class MCTSTrainer:
             self.buffer = {
                 'obs': [[] for _ in range(self.num_agents)],
                 'next_obs': [[] for _ in range(self.num_agents)],
+                'global_state': [[] for _ in range(self.num_agents)],
+                'next_global_state': [[] for _ in range(self.num_agents)],
                 'actions': [[] for _ in range(self.num_agents)],
                 'rewards': [[] for _ in range(self.num_agents)],
                 'dones': [[] for _ in range(self.num_agents)],
@@ -1119,6 +1159,17 @@ class MCTSTrainer:
             rew_arr = np.asarray(self.buffer['rewards'][i], dtype=np.float32)    # (T,)
             done_arr = np.asarray(self.buffer['dones'][i], dtype=np.float32)     # (T,)
 
+            use_ctde = bool(getattr(self.network, 'use_centralized_critic', False))
+            global_arr = None
+            next_global_arr = None
+            if use_ctde:
+                if ('global_state' not in self.buffer) or ('next_global_state' not in self.buffer):
+                    raise RuntimeError("CTDE enabled but buffer missing global_state fields")
+                global_arr = np.asarray(self.buffer['global_state'][i], dtype=np.float32)
+                next_global_arr = np.asarray(self.buffer['next_global_state'][i], dtype=np.float32)
+                if len(global_arr) != T or len(next_global_arr) != T:
+                    raise RuntimeError("CTDE global_state length mismatch with obs trajectory")
+
             h = None
             # iterate chunks
             for start in range(0, T, unroll):
@@ -1132,17 +1183,33 @@ class MCTSTrainer:
                 rew_chunk = torch.from_numpy(rew_arr[start:end]).to(self.device)                   # (L,)
                 done_chunk = torch.from_numpy(done_arr[start:end]).to(self.device)                 # (L,)
 
-                # Forward over sequence
-                mean, std, value, h_out = self.network(obs_chunk, h, return_sequence=True)
-                # mean/std: (1,L,A), value: (1,L,1)
+                # Actor and local value forward pass
+                mean, std, local_value, h_out = self.network(obs_chunk, h, return_sequence=True)
+                
+                # If using CTDE, overwrite value with the output from the centralized critic
+                if use_ctde:
+                    if global_arr is None:
+                        raise RuntimeError("CTDE enabled but global_state not available")
+                    # global_chunk needs to be (L, G) for forward_value_global
+                    global_chunk = torch.from_numpy(global_arr[start:end]).to(self.device)
+                    value = self.network.forward_value_global(global_chunk).view(-1) # Ensure shape is (L,)
+                else:
+                    value = local_value.squeeze(0).squeeze(-1) # Use local value, shape (L,)
+
+                # mean/std: (1,L,A), value: (1,L,1) or (L,)
                 mean = mean.squeeze(0)
                 std = std.squeeze(0)
-                value = value.squeeze(0).squeeze(-1)  # (L,)
 
-                # Bootstrap for returns from next_obs of last step (no recurrent state for bootstrap to keep it simple)
+                # Bootstrap for returns from next state of last step (no recurrent state for bootstrap to keep it simple)
                 with torch.no_grad():
                     next_obs_last = torch.from_numpy(next_obs_arr[end - 1]).view(1, 1, -1).to(self.device)
-                    _, _, v_next, _ = self.network(next_obs_last, None, return_sequence=False)
+                    if use_ctde:
+                        if next_global_arr is None:
+                            raise RuntimeError("CTDE enabled but next_global_state not available")
+                        next_global_last = torch.from_numpy(next_global_arr[end - 1]).view(1, 1, -1).to(self.device)
+                        v_next = self.network.forward_value_global(next_global_last.squeeze(0)).view(-1)[0]
+                    else:
+                        _, _, v_next, _ = self.network(next_obs_last, None, return_sequence=False)
                     v_next = v_next.view(-1)[0]
 
                 returns = torch.zeros_like(rew_chunk)
@@ -1160,7 +1227,16 @@ class MCTSTrainer:
                 policy_loss = -(logp * adv).mean()
                 value_loss = torch.nn.functional.mse_loss(value, returns)
 
-                (value_loss + 0.5 * policy_loss).backward()
+                # Auxiliary: also train local critic so evaluation-time MCTS can use local_value reliably
+                aux_local_value_loss = None
+                if use_ctde:
+                    local_value_flat = local_value.squeeze(0).squeeze(-1)
+                    aux_local_value_loss = torch.nn.functional.mse_loss(local_value_flat, returns)
+                    total_loss = value_loss + 0.5 * policy_loss + 0.2 * aux_local_value_loss
+                else:
+                    total_loss = value_loss + 0.5 * policy_loss
+
+                total_loss.backward()
 
                 total_policy_loss += float(policy_loss.detach().cpu())
                 total_value_loss += float(value_loss.detach().cpu())
@@ -1187,6 +1263,8 @@ class MCTSTrainer:
         self.buffer = {
             'obs': [[] for _ in range(self.num_agents)],
             'next_obs': [[] for _ in range(self.num_agents)],
+            'global_state': [[] for _ in range(self.num_agents)],
+            'next_global_state': [[] for _ in range(self.num_agents)],
             'actions': [[] for _ in range(self.num_agents)],
             'rewards': [[] for _ in range(self.num_agents)],
             'dones': [[] for _ in range(self.num_agents)],

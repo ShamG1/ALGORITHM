@@ -157,23 +157,152 @@ static float puct_score_basic(int total_N, float prior, int N, float W, float c_
     return Q + U;
 }
 
-static std::vector<float> step_env_with_action(IntersectionEnv& env,
+static std::vector<float> step_env_with_joint_action(
+    IntersectionEnv& env,
                                                const EnvState& base_state,
-                                               const std::array<float,2>& action,
+    int agent_index,
+    const std::array<float,2>& agent_action,
+    const py::function& infer_policy_value,
+    const py::function* infer_next_hidden,  // optional (nullptr for non-LSTM)
+    const std::vector<float>* agent_h,      // optional (nullptr for non-LSTM)
+    const std::vector<float>* agent_c,      // optional (nullptr for non-LSTM)
+    int lstm_hidden_dim,
                                                int rollout_depth,
                                                float gamma,
                                                bool& done_out,
-                                               EnvState& next_state_out) {
+    EnvState& next_state_out,
+    float& total_return_out,
+    std::vector<float>* h_out,              // optional: next hidden for agent after rollout
+    std::vector<float>* c_out               // optional
+) {
     EnvState saved = env.get_state();
     env.set_state(base_state);
+
+    // Determine how many ego agents exist in this EnvState.
+    const int n_agents = (int)base_state.cars.size();
 
     float total_reward = 0.0f;
     float discount = 1.0f;
     bool terminated = false;
 
+    // Track agent recurrent state across rollout if available.
+    std::vector<float> h_cur;
+    std::vector<float> c_cur;
+    if (infer_next_hidden && agent_h && agent_c && lstm_hidden_dim > 0) {
+        h_cur = *agent_h;
+        c_cur = *agent_c;
+        if ((int)h_cur.size() != lstm_hidden_dim) h_cur.assign((size_t)lstm_hidden_dim, 0.0f);
+        if ((int)c_cur.size() != lstm_hidden_dim) c_cur.assign((size_t)lstm_hidden_dim, 0.0f);
+    }
+
     for (int t = 0; t < rollout_depth; ++t) {
-        auto res = env.step({action[0]}, {action[1]});
-        if (!res.rewards.empty()) total_reward += discount * res.rewards[0];
+        // 1) build joint action: controlled agent uses agent_action; others follow current network mean (deterministic).
+        std::vector<float> throttles((size_t)n_agents, 0.0f);
+        std::vector<float> steerings((size_t)n_agents, 0.0f);
+
+        // Fetch current observations to generate actions for other agents.
+        auto all_obs = env.get_observations();
+
+        // Batch all other-agent observations into a single Python callback to reduce overhead.
+        py::list obs_batch;
+        std::vector<int> batch_to_agent;
+        batch_to_agent.reserve((size_t)std::max(0, n_agents - 1));
+
+        for (int j = 0; j < n_agents; ++j) {
+            if (j == agent_index) continue;
+            if (j >= (int)all_obs.size()) continue;
+
+            py::list row;
+            for (float v : all_obs[(size_t)j]) row.append(v);
+            obs_batch.append(row);
+            batch_to_agent.push_back(j);
+        }
+
+        if (!batch_to_agent.empty()) {
+            const int B = (int)batch_to_agent.size();
+            py::array_t<float> h_arr({B, 1});
+            py::array_t<float> c_arr({B, 1});
+            // Fill with zeros; infer_policy_value will ignore h/c when policy is non-recurrent.
+            {
+                auto hm = h_arr.mutable_unchecked<2>();
+                auto cm = c_arr.mutable_unchecked<2>();
+                for (int b = 0; b < B; ++b) {
+                    hm(b, 0) = 0.0f;
+                    cm(b, 0) = 0.0f;
+                }
+            }
+
+            py::tuple pv = infer_policy_value(obs_batch, h_arr, c_arr).cast<py::tuple>();
+            if (pv.size() < 2) throw std::runtime_error("infer_policy_value must return (mean,std,value)");
+
+            std::vector<std::array<float,2>> means, stds;
+            std::vector<float> values;
+            parse_infer_out(pv, means, stds, values);
+
+            for (int b = 0; b < B; ++b) {
+                const int j = batch_to_agent[(size_t)b];
+                throttles[(size_t)j] = clampf(means[(size_t)b][0], -1.0f, 1.0f);
+                steerings[(size_t)j] = clampf(means[(size_t)b][1], -1.0f, 1.0f);
+            }
+        }
+
+        // Controlled agent.
+        if (agent_index >= 0 && agent_index < n_agents) {
+            throttles[(size_t)agent_index] = agent_action[0];
+            steerings[(size_t)agent_index] = agent_action[1];
+        }
+
+        // 2) step env with joint action
+        auto res = env.step(throttles, steerings);
+
+        // Reward from the controlled agent's perspective.
+        if ((int)res.rewards.size() > agent_index && agent_index >= 0) {
+            total_reward += discount * res.rewards[(size_t)agent_index];
+        }
+
+        // 3) update recurrent hidden for controlled agent (optional)
+        if (infer_next_hidden && h_cur.size() == (size_t)lstm_hidden_dim && c_cur.size() == (size_t)lstm_hidden_dim) {
+            // compute next hidden using next observation of controlled agent + chosen action
+            // Reuse `res.obs` instead of an extra env.get_observations() call.
+            if (agent_index >= 0 && agent_index < (int)res.obs.size()) {
+                py::list obs_b;
+                {
+                    py::list row;
+                    for (float v : res.obs[(size_t)agent_index]) row.append(v);
+                    obs_b.append(row);
+                }
+
+                py::array_t<float> h_rep({1, lstm_hidden_dim});
+                py::array_t<float> c_rep({1, lstm_hidden_dim});
+                {
+                    auto hm = h_rep.mutable_unchecked<2>();
+                    auto cm = c_rep.mutable_unchecked<2>();
+                    for (int i = 0; i < lstm_hidden_dim; ++i) {
+                        hm(0, i) = h_cur[(size_t)i];
+                        cm(0, i) = c_cur[(size_t)i];
+                    }
+                }
+
+                py::array_t<float> act_arr({1, 2});
+                {
+                    auto am = act_arr.mutable_unchecked<2>();
+                    am(0, 0) = agent_action[0];
+                    am(0, 1) = agent_action[1];
+                }
+
+                py::tuple hc = (*infer_next_hidden)(obs_b, h_rep, c_rep, act_arr).cast<py::tuple>();
+                if (hc.size() >= 2) {
+                    std::vector<std::vector<float>> h_next_b, c_next_b;
+                    parse_hc_batch(hc[0], lstm_hidden_dim, h_next_b);
+                    parse_hc_batch(hc[1], lstm_hidden_dim, c_next_b);
+                    if (!h_next_b.empty() && !c_next_b.empty()) {
+                        h_cur = std::move(h_next_b[0]);
+                        c_cur = std::move(c_next_b[0]);
+                    }
+                }
+            }
+        }
+
         discount *= gamma;
         if (res.terminated || res.truncated) { terminated = true; break; }
     }
@@ -182,12 +311,18 @@ static std::vector<float> step_env_with_action(IntersectionEnv& env,
 
     auto obs = env.get_observations();
     std::vector<float> ego_obs;
-    if (!obs.empty()) ego_obs = obs[0];
+    if (agent_index >= 0 && agent_index < (int)obs.size()) ego_obs = obs[(size_t)agent_index];
 
     env.set_state(saved);
 
     done_out = terminated;
-    (void)total_reward;
+    total_return_out = total_reward;
+
+    if (h_out && c_out && !h_cur.empty() && !c_cur.empty()) {
+        *h_out = std::move(h_cur);
+        *c_out = std::move(c_cur);
+    }
+
     return ego_obs;
 }
 
@@ -220,6 +355,7 @@ std::pair<std::vector<float>, py::dict> mcts_search(
     const EnvState& root_state,
     const std::vector<float>& root_obs,
     const py::function& infer_fn,
+    int agent_index,
     int num_simulations,
     int num_action_samples,
     int rollout_depth,
@@ -329,7 +465,25 @@ std::pair<std::vector<float>, py::dict> mcts_search(
             if (e.child < 0) {
                 bool done = false;
                 EnvState next_state;
-                auto next_obs = step_env_with_action(env, n.state, e.action, rollout_depth, gamma, done, next_state);
+                float rollout_return = 0.0f;
+                auto next_obs = step_env_with_joint_action(
+                    env,
+                    n.state,
+                    agent_index,
+                    e.action,
+                    infer_fn,
+                    /*infer_next_hidden=*/nullptr,
+                    /*agent_h=*/nullptr,
+                    /*agent_c=*/nullptr,
+                    /*lstm_hidden_dim=*/0,
+                    rollout_depth,
+                    gamma,
+                    done,
+                    next_state,
+                    rollout_return,
+                    /*h_out=*/nullptr,
+                    /*c_out=*/nullptr
+                );
 
                 Node child;
                 child.state = std::move(next_state);
@@ -340,8 +494,10 @@ std::pair<std::vector<float>, py::dict> mcts_search(
 
                 expand_node(nodes[(size_t)child_idx], next_obs, false);
 
+                // B2: backup uses rollout return + discounted leaf value.
                 float leaf_value = nodes[(size_t)child_idx].V;
-                backup_basic(path, nodes, leaf_value);
+                float leaf_backup = rollout_return + std::pow(gamma, float(rollout_depth)) * leaf_value;
+                backup_basic(path, nodes, leaf_backup);
                 break;
             }
 
@@ -397,6 +553,7 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
     const std::vector<float>& root_h,
     const std::vector<float>& root_c,
     int lstm_hidden_dim,
+    int agent_index,
     int num_simulations,
     int num_action_samples,
     int rollout_depth,
@@ -552,12 +709,32 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
             if (e.child < 0) {
                 bool done = false;
                 EnvState next_state;
-                auto next_obs = step_env_with_action(env, n.state, e.action, rollout_depth, gamma, done, next_state);
+                float rollout_return = 0.0f;
+                std::vector<float> h_after_rollout, c_after_rollout;
+
+                auto next_obs = step_env_with_joint_action(
+                    env,
+                    n.state,
+                    agent_index,
+                    e.action,
+                    infer_policy_value,
+                    &infer_next_hidden,
+                    &n.h,
+                    &n.c,
+                    lstm_hidden_dim,
+                    rollout_depth,
+                    gamma,
+                    done,
+                    next_state,
+                    rollout_return,
+                    &h_after_rollout,
+                    &c_after_rollout
+                );
 
                 LSTMNode child;
                 child.state = std::move(next_state);
-                child.h = e.h_next;
-                child.c = e.c_next;
+                child.h = std::move(h_after_rollout);
+                child.c = std::move(c_after_rollout);
 
                 int child_idx = (int)nodes.size();
                 nodes.push_back(std::move(child));
@@ -565,8 +742,10 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
 
                 expand_node(nodes[(size_t)child_idx], next_obs, false);
 
+                // B2: backup uses rollout return + discounted leaf value.
                 float leaf_value = nodes[(size_t)child_idx].V;
-                backup_lstm(path, nodes, leaf_value);
+                float leaf_backup = rollout_return + std::pow(gamma, float(rollout_depth)) * leaf_value;
+                backup_lstm(path, nodes, leaf_backup);
                 break;
             }
 

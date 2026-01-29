@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <vector>
 
 static constexpr float PI_F = 3.14159265358979323846f;
 
@@ -415,6 +416,63 @@ void IntersectionEnv::set_state(const EnvState& s) {
     lidars.resize(cars.size());
     traffic_lidars.clear();
     traffic_lidars.resize(traffic_cars.size());
+}
+
+std::vector<float> IntersectionEnv::get_global_state(int agent_index, int k_nearest) const {
+    // Fixed-size CTDE state: ego + nearest-K egos (no NPCs).
+    // Each vehicle state = [x_norm, y_norm, v_norm, heading_norm, intention, alive]
+    // Output length = 6 * (1 + k_nearest)
+
+    const int feat = 6;
+    if (k_nearest < 0) k_nearest = 0;
+    const int out_dim = feat * (1 + k_nearest);
+    std::vector<float> out((size_t)out_dim, 0.0f);
+
+    const int n = (int)cars.size();
+    if (agent_index < 0 || agent_index >= n) return out;
+
+    auto fill_state = [&](int slot, const Car& c) {
+        const size_t base = (size_t)(slot * feat);
+        if (!c.alive) {
+            // keep zeros, but set alive flag explicitly
+            out[base + 5] = 0.0f;
+            return;
+        }
+        out[base + 0] = c.state.x / float(WIDTH);
+        out[base + 1] = c.state.y / float(HEIGHT);
+        out[base + 2] = c.state.v / PHYSICS_MAX_SPEED;
+        out[base + 3] = c.state.heading / PI_F;
+        out[base + 4] = float(c.intention);
+        out[base + 5] = 1.0f;
+    };
+
+    // ego at slot 0
+    fill_state(0, cars[(size_t)agent_index]);
+
+    // compute distances to other egos
+    struct Neighbor { float d2; int idx; };
+    std::vector<Neighbor> neigh;
+    neigh.reserve((size_t)std::max(0, n - 1));
+
+    const float x0 = cars[(size_t)agent_index].state.x;
+    const float y0 = cars[(size_t)agent_index].state.y;
+
+    for (int j = 0; j < n; ++j) {
+        if (j == agent_index) continue;
+        const float dx = cars[(size_t)j].state.x - x0;
+        const float dy = cars[(size_t)j].state.y - y0;
+        neigh.push_back({dx * dx + dy * dy, j});
+    }
+
+    std::sort(neigh.begin(), neigh.end(), [](const Neighbor& a, const Neighbor& b) { return a.d2 < b.d2; });
+
+    const int take = std::min(k_nearest, (int)neigh.size());
+    for (int k = 0; k < take; ++k) {
+        const int j = neigh[(size_t)k].idx;
+        fill_state(1 + k, cars[(size_t)j]);
+    }
+
+    return out;
 }
 
 std::vector<std::vector<float>> IntersectionEnv::get_observations() const {

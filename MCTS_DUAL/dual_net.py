@@ -17,6 +17,11 @@ class DualNetwork(nn.Module):
     """
     Dual Network combining policy and value networks with shared LSTM backbone.
     Similar to AlphaZero architecture.
+
+    CTDE extension:
+    - Actor (policy) remains decentralized: input is local obs.
+    - Centralized critic (optional): input is fixed-size global_state.
+      This critic is intended for training only.
     """
     
     def __init__(
@@ -26,13 +31,17 @@ class DualNetwork(nn.Module):
         hidden_dim=256,
         lstm_hidden_dim=128,
         use_lstm=True,
-        sequence_length=5
+        sequence_length=5,
+        global_state_dim: int = 24,
+        use_centralized_critic: bool = True,
     ):
         super(DualNetwork, self).__init__()
         
         self.use_lstm = use_lstm
         self.sequence_length = sequence_length
         self.action_dim = action_dim
+        self.global_state_dim = int(global_state_dim)
+        self.use_centralized_critic = bool(use_centralized_critic)
         
         # Shared input projection (+norm for stability)
         self.fc_input = nn.Linear(obs_dim, hidden_dim)
@@ -62,10 +71,18 @@ class DualNetwork(nn.Module):
         # Predict log_std and clamp for numerical stability
         self.policy_log_std = nn.Linear(hidden_dim, action_dim)
         
-        # Value head (outputs state value)
+        # Local value head (outputs state value from local features)
         self.value_fc = nn.Linear(hidden_dim, hidden_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
         
+        # Centralized critic head (optional): value from global state
+        if self.use_centralized_critic:
+            self.global_fc1 = nn.Linear(self.global_state_dim, hidden_dim)
+            self.global_ln1 = nn.LayerNorm(hidden_dim)
+            self.global_fc2 = nn.Linear(hidden_dim, hidden_dim)
+            self.global_ln2 = nn.LayerNorm(hidden_dim)
+            self.global_value_head = nn.Linear(hidden_dim, 1)
+
         # Initialize weights
         self._initialize_weights()
     
@@ -88,33 +105,16 @@ class DualNetwork(nn.Module):
                         start, end = n // 4, n // 2
                         param.data[start:end].fill_(1)
     
-    def forward(self, obs, hidden_state=None, return_sequence: bool = False):
-        """
-        Forward pass through dual network.
-        
-        Args:
-            obs: Observation tensor
-                - If use_lstm=False: (batch_size, obs_dim)
-                - If use_lstm=True: (batch_size, sequence_length, obs_dim) or (batch_size, obs_dim) for single step
-            hidden_state: LSTM hidden state tuple (h, c) if use_lstm=True
-        
-        Returns:
-            policy_mean: Action mean (batch_size, action_dim)
-            policy_std: Action std (batch_size, action_dim)
-            value: State value (batch_size, 1)
-            hidden_state: Updated LSTM hidden state (if use_lstm=True)
-        """
+    def _encode_obs(self, obs, hidden_state=None, return_sequence: bool = False):
+        """Encode local observation(s) into a hidden feature representation."""
         if self.use_lstm:
             # Handle both sequence and single step inputs
             if len(obs.shape) == 2:
                 # Single step: (batch_size, obs_dim) -> (batch_size, 1, obs_dim)
                 obs = obs.unsqueeze(1)
             
-            batch_size = obs.shape[0]
-            seq_len = obs.shape[1]
-            
             # Project input
-            x = self.fc_input(obs)  # (batch_size, seq_len, hidden_dim)
+            x = self.fc_input(obs)  # (B, T, hidden_dim)
             x = self.ln_input(x)
             x = F.relu(x)
             
@@ -132,78 +132,85 @@ class DualNetwork(nn.Module):
                 x = self.fc_shared2(x)
                 x = self.ln_shared2(x)
                 x = F.relu(x)  # (B, T, hidden_dim)
-            else:
-                # Use last timestep output (inference / compatibility path)
-                x = lstm_out[:, -1, :]  # (batch_size, lstm_hidden_dim)
-                x = self.fc_shared(x)
-                x = self.ln_shared(x)
-                x = F.relu(x)
-                x = self.fc_shared2(x)
-                x = self.ln_shared2(x)
-                x = F.relu(x)
-        else:
-            # Standard MLP
-            x = self.fc_input(obs)
-            x = self.ln_input(x)
-            x = F.relu(x)
+                return x, new_hidden
+
+            # Use last timestep output (inference / compatibility path)
+            x = lstm_out[:, -1, :]  # (B, H_lstm)
             x = self.fc_shared(x)
             x = self.ln_shared(x)
             x = F.relu(x)
             x = self.fc_shared2(x)
             x = self.ln_shared2(x)
             x = F.relu(x)
-            new_hidden = None
-        
-        # Policy head
+            return x, new_hidden
+
+        # Standard MLP
+        x = self.fc_input(obs)
+        x = self.ln_input(x)
+        x = F.relu(x)
+        x = self.fc_shared(x)
+        x = self.ln_shared(x)
+        x = F.relu(x)
+        x = self.fc_shared2(x)
+        x = self.ln_shared2(x)
+        x = F.relu(x)
+        return x, None
+
+    def forward_actor(self, obs, hidden_state=None, return_sequence: bool = False):
+        """Actor forward: returns policy (mean,std) and optional hidden state."""
+        x, new_hidden = self._encode_obs(obs, hidden_state, return_sequence=return_sequence)
+
         policy_x = F.relu(self.policy_fc(x))
-        policy_mean = torch.tanh(self.policy_mean(policy_x))  # Mean in [-1, 1]
-        # log_std clamp for stability
+        policy_mean = torch.tanh(self.policy_mean(policy_x))
         log_std = self.policy_log_std(policy_x)
-        log_std = torch.clamp(log_std, min=-5.0, max=1.0)  # std in ~[0.0067, 2.718]
+        log_std = torch.clamp(log_std, min=-5.0, max=1.0)
         policy_std = torch.exp(log_std)
         
-        # Value head
+        return policy_mean, policy_std, new_hidden
+
+    def forward_value_local(self, obs, hidden_state=None, return_sequence: bool = False):
+        """Local value head: value from local obs features (kept for MCTS / execution path)."""
+        x, new_hidden = self._encode_obs(obs, hidden_state, return_sequence=return_sequence)
         value_x = F.relu(self.value_fc(x))
         value = self.value_head(value_x)
-        
+        return value, new_hidden
+
+    def forward_value_global(self, global_state: torch.Tensor):
+        """Centralized critic: value from fixed-size global_state (training only)."""
+        if not self.use_centralized_critic:
+            raise RuntimeError("forward_value_global called but use_centralized_critic=False")
+
+        # Expect (B, global_state_dim)
+        x = self.global_fc1(global_state)
+        x = self.global_ln1(x)
+        x = F.relu(x)
+        x = self.global_fc2(x)
+        x = self.global_ln2(x)
+        x = F.relu(x)
+        v = self.global_value_head(x)
+        return v
+
+    def forward(self, obs, hidden_state=None, return_sequence: bool = False):
+        """Backward-compatible forward: returns (mean, std, local_value, hidden)."""
+        mean, std, new_hidden = self.forward_actor(obs, hidden_state, return_sequence=return_sequence)
+        value, _ = self.forward_value_local(obs, hidden_state, return_sequence=return_sequence)
         if self.use_lstm:
-            return policy_mean, policy_std, value, new_hidden
-        else:
-            return policy_mean, policy_std, value
+            return mean, std, value, new_hidden
+        return mean, std, value
     
     def get_policy(self, obs, hidden_state=None):
         """Get policy distribution (mean and std)."""
-        if self.use_lstm:
-            policy_mean, policy_std, _, new_hidden = self.forward(obs, hidden_state)
-            return policy_mean, policy_std, new_hidden
-        else:
-            policy_mean, policy_std, _ = self.forward(obs)
-            return policy_mean, policy_std
+        mean, std, new_hidden = self.forward_actor(obs, hidden_state, return_sequence=False)
+        return mean, std, new_hidden
     
     def get_value(self, obs, hidden_state=None):
-        """Get state value estimate."""
-        if self.use_lstm:
-            _, _, value, new_hidden = self.forward(obs, hidden_state)
-            return value, new_hidden
-        else:
-            _, _, value = self.forward(obs)
-            return value
+        """Get state value estimate (local value head)."""
+        value, new_hidden = self.forward_value_local(obs, hidden_state, return_sequence=False)
+        return value, new_hidden
     
     def sample_action(self, obs, hidden_state=None, deterministic=False):
-        """
-        Sample action from policy distribution.
-        
-        Returns:
-            action: Sampled action (batch_size, action_dim)
-            log_prob: Log probability of action (batch_size, 1)
-            hidden_state: Updated LSTM hidden state (if use_lstm=True)
-        """
-        if self.use_lstm:
-            policy_mean, policy_std, _, new_hidden = self.forward(obs, hidden_state)
-        else:
-            policy_mean, policy_std, _ = self.forward(obs)
-            new_hidden = None
-        
+        """Sample action from policy distribution."""
+        policy_mean, policy_std, new_hidden = self.forward_actor(obs, hidden_state, return_sequence=False)
         
         if deterministic:
             action = policy_mean
@@ -212,27 +219,14 @@ class DualNetwork(nn.Module):
             dist = torch.distributions.Normal(policy_mean, policy_std)
             action = dist.sample()
             log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
-            # Clip action to [-1, 1]
             action = torch.clamp(action, -1.0, 1.0)
         
         if self.use_lstm:
             return action, log_prob, new_hidden
-        else:
             return action, log_prob
 
     def next_hidden(self, obs, action, hidden_state=None):
-        """Compute action-conditioned next LSTM hidden state.
-
-        This is used by C++ LSTM-MCTS to propagate per-branch (h,c).
-
-        Args:
-            obs: (B, obs_dim) or (B, 1, obs_dim). Only the last step is used.
-            action: (B, action_dim) in [-1,1]
-            hidden_state: tuple (h, c) in LSTM format (1,B,H) or (B,H)
-
-        Returns:
-            new_hidden: tuple (h_next, c_next) in shape (1,B,H)
-        """
+        """Compute action-conditioned next LSTM hidden state."""
         if not self.use_lstm:
             raise RuntimeError("next_hidden() requires use_lstm=True")
 
@@ -258,7 +252,6 @@ class DualNetwork(nn.Module):
             c0 = torch.zeros(B, H, device=x.device, dtype=x.dtype)
         else:
             h, c = hidden_state
-            # Accept (1,B,H) or (B,H)
             if h.dim() == 3:
                 h0 = h[0]
                 c0 = c[0]

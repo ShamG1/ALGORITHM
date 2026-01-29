@@ -76,6 +76,7 @@ PYBIND11_MODULE(cpp_mcts, m) {
         .def("add_car_with_route", &IntersectionEnv::add_car_with_route, py::arg("start_id"), py::arg("end_id"))
         .def("step", &IntersectionEnv::step, py::arg("throttles"), py::arg("steerings"), py::arg("dt") = 1.0/60.0)
         .def("get_observations", &IntersectionEnv::get_observations)
+        .def("get_global_state", &IntersectionEnv::get_global_state, py::arg("agent_index"), py::arg("k_nearest") = 3)
         .def("get_state", &IntersectionEnv::get_state)
         .def("set_state", &IntersectionEnv::set_state, py::arg("state"))
         .def("render", &IntersectionEnv::render, py::arg("show_lane_ids") = false, py::arg("show_lidar") = false)
@@ -98,6 +99,7 @@ PYBIND11_MODULE(cpp_mcts, m) {
         py::arg("root_state"),
         py::arg("root_obs"),
         py::arg("infer_fn"),
+        py::arg("agent_index"),
         py::arg("num_simulations"),
         py::arg("num_action_samples"),
         py::arg("rollout_depth"),
@@ -118,6 +120,7 @@ PYBIND11_MODULE(cpp_mcts, m) {
         py::arg("root_h"),
         py::arg("root_c"),
         py::arg("lstm_hidden_dim"),
+        py::arg("agent_index"),
         py::arg("num_simulations"),
         py::arg("num_action_samples"),
         py::arg("rollout_depth"),

@@ -85,6 +85,12 @@ public:
 
     std::vector<std::vector<float>> get_observations() const;
 
+    // CTDE: fixed-size centralized state for a given agent (ego + nearest-K egos).
+    // Encoding uses ONLY ego agents (no NPCs).
+    // Format: [ego_state(6), neigh1_state(6), neigh2_state(6), neigh3_state(6)]
+    // where each state = [x_norm, y_norm, v_norm, heading_norm, intention, alive]
+    std::vector<float> get_global_state(int agent_index, int k_nearest = 3) const;
+
     // Snapshot API for fast MCTS rollbacks
     EnvState get_state() const;
     void set_state(const EnvState& s);
