@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from typing import Dict, List, Tuple, Optional, Callable
 import math
+import os
 
 # When running as a package (python -m C_MCTS.train) we can use relative import.
 # When running as a script (python C_MCTS/train.py) relative import fails, so fallback to absolute.
@@ -38,7 +39,8 @@ class MCTS:
         all_networks: Optional[List] = None,  # Kept for API compatibility
         agent_id: int = 0,
         num_action_samples: int = 5,
-        use_cpp_mcts: bool = True  # Kept for API compatibility
+        use_cpp_mcts: bool = True,  # Kept for API compatibility
+        ts_model_path: Optional[str] = None
     ):
         if not HAS_CPP_MCTS:
             raise RuntimeError("C++ MCTS backend is not available. Please build it first.")
@@ -51,6 +53,7 @@ class MCTS:
         self.rollout_depth = rollout_depth
         self.agent_id = agent_id  # Still needed for context
         self.num_action_samples = num_action_samples
+        self.ts_model_path = ts_model_path
 
         # Compatibility stats for training script
         self._rollout_stats = {
@@ -88,6 +91,10 @@ class MCTS:
         root_state_cpp = cpp_env.get_state()
 
         lstm_hidden_dim = int(getattr(self.network, 'lstm_hidden_dim', 128))
+
+        # One-time debug: help verify which C++ path is taken and what stats are returned.
+        # Controlled via env var to avoid noisy logs.
+        debug_cpp = os.environ.get("MCTS_DEBUG_CPP", "0") == "1"
 
         def infer_policy_value(
             obs_batch: List[List[float]],
@@ -182,8 +189,67 @@ class MCTS:
             # Return (B,H)
             return hn.squeeze(0).cpu().numpy(), cn.squeeze(0).cpu().numpy()
 
-        # Prefer recurrent C++ MCTS only when the network uses LSTM.
-        if getattr(self.network, 'use_lstm', False) and hasattr(cpp_backend, 'mcts_search_lstm'):
+        # Prefer TorchScript recurrent C++ MCTS when available.
+        use_lstm = bool(getattr(self.network, 'use_lstm', False))
+        ts_path = self.ts_model_path
+        has_ts = bool(ts_path) and isinstance(ts_path, str) and os.path.isfile(ts_path)
+
+        if debug_cpp and not getattr(self, "_printed_cpp_debug", False):
+            try:
+                print(
+                    "[MCTS_DEBUG_CPP] use_lstm=", use_lstm,
+                    "has_ts=", has_ts,
+                    "ts_path=", ts_path,
+                    "has_mcts_search_lstm_torchscript=", hasattr(cpp_backend, 'mcts_search_lstm_torchscript'),
+                    "has_mcts_search_lstm=", hasattr(cpp_backend, 'mcts_search_lstm'),
+                    "has_mcts_search=", hasattr(cpp_backend, 'mcts_search'),
+                    flush=True,
+                )
+            except Exception:
+                pass
+            self._printed_cpp_debug = True
+
+        if use_lstm and has_ts and hasattr(cpp_backend, 'mcts_search_lstm_torchscript'):
+            if obs_history is None or len(obs_history) == 0:
+                raise RuntimeError("TorchScript MCTS requires obs_history (sequence) but got None/empty")
+
+            seq_len = int(getattr(self.network, 'sequence_length', 5))
+            obs_dim = int(root_obs.size)
+
+            # Build flattened (T*obs_dim) sequence. Pad left with first frame if history is short.
+            hist = [np.asarray(x, dtype=np.float32).reshape(-1) for x in obs_history]
+            if len(hist) < seq_len:
+                pad = [hist[0]] * (seq_len - len(hist))
+                hist = pad + hist
+            else:
+                hist = hist[-seq_len:]
+
+            root_obs_seq = np.concatenate(hist, axis=0).astype(np.float32)
+
+            action, stats = cpp_backend.mcts_search_lstm_torchscript(
+                cpp_env,
+                root_state_cpp,
+                root_obs_seq.tolist(),
+                seq_len,
+                obs_dim,
+                ts_path,
+                h0.tolist(),
+                c0.tolist(),
+                lstm_hidden_dim,
+                self.agent_id,
+                num_simulations=self.num_simulations,
+                num_action_samples=self.num_action_samples,
+                rollout_depth=self.rollout_depth,
+                c_puct=self.c_puct,
+                temperature=self.temperature,
+                gamma=0.99,
+                dirichlet_alpha=0.3,
+                dirichlet_eps=0.25,
+                seed=int(np.random.randint(0, 2**31 - 1, dtype=np.int64))
+            )
+
+        elif use_lstm and hasattr(cpp_backend, 'mcts_search_lstm'):
+            # Legacy callback-based recurrent search
             action, stats = cpp_backend.mcts_search_lstm(
                 cpp_env,
                 root_state_cpp,
@@ -226,5 +292,15 @@ class MCTS:
         # Rough compatibility counters: 1 search == 1 rollout batch.
         self._rollout_stats['total_rollouts'] += 1
         # We don't know success rate/env steps from C++ side yet.
+
+        if debug_cpp and not getattr(self, "_printed_cpp_debug_stats", False):
+            try:
+                keys = list(stats.keys()) if isinstance(stats, dict) else None
+                print("[MCTS_DEBUG_CPP] returned_stats_keys=", keys, flush=True)
+                if isinstance(stats, dict) and ("profile" in stats):
+                    print("[MCTS_DEBUG_CPP] profile=", stats.get("profile"), flush=True)
+            except Exception:
+                pass
+            self._printed_cpp_debug_stats = True
 
         return np.array(action, dtype=np.float32), stats

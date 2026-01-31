@@ -24,6 +24,16 @@ for d in candidate_dirs:
     if d.exists() and str(d) not in sys.path:
         sys.path.insert(0, str(d))
 
+# Fallback: allow running from repo root where extension is at MCTS_DUAL/cpp/build
+# without requiring users to set PYTHONPATH manually.
+try:
+    _repo_root = root.parent
+    _alt_build = _repo_root / "MCTS_DUAL" / "cpp" / "build"
+    if _alt_build.exists() and str(_alt_build) not in sys.path:
+        sys.path.insert(0, str(_alt_build))
+except Exception:
+    pass
+
 _cpp_mod = None
 
 
@@ -73,3 +83,7 @@ def mcts_search(*args, **kwargs):
 
 def mcts_search_lstm(*args, **kwargs):
     return _require().mcts_search_lstm(*args, **kwargs)
+
+
+def mcts_search_lstm_torchscript(*args, **kwargs):
+    return _require().mcts_search_lstm_torchscript(*args, **kwargs)

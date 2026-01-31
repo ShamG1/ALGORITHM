@@ -1,0 +1,18 @@
+Training started at 2026-01-30 23:58:15.477198
+Num agents: 6
+Num lanes: 2
+Use team reward: True
+Respawn enabled: True
+MCTS simulations: 5
+Use shared memory: True
+Generated routes:
+  Agent 0: IN_1 -> OUT_3
+  Agent 1: IN_2 -> OUT_6
+  Agent 2: IN_3 -> OUT_5
+  Agent 3: IN_4 -> OUT_8
+  Agent 4: IN_6 -> OUT_2
+  Agent 5: IN_7 -> OUT_1
+================================================================================
+================================================================================
+Starting Multi-Agent MCTS Training
+================================================================================

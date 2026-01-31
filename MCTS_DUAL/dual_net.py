@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from typing import Optional, Tuple
 
 # Handle both relative and absolute imports
 try:
@@ -105,7 +106,12 @@ class DualNetwork(nn.Module):
                         start, end = n // 4, n // 2
                         param.data[start:end].fill_(1)
     
-    def _encode_obs(self, obs, hidden_state=None, return_sequence: bool = False):
+    def _encode_obs(
+        self,
+        obs: torch.Tensor,
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_sequence: bool = False,
+    ):
         """Encode local observation(s) into a hidden feature representation."""
         if self.use_lstm:
             # Handle both sequence and single step inputs
@@ -156,7 +162,12 @@ class DualNetwork(nn.Module):
         x = F.relu(x)
         return x, None
 
-    def forward_actor(self, obs, hidden_state=None, return_sequence: bool = False):
+    def forward_actor(
+        self,
+        obs: torch.Tensor,
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_sequence: bool = False,
+    ):
         """Actor forward: returns policy (mean,std) and optional hidden state."""
         x, new_hidden = self._encode_obs(obs, hidden_state, return_sequence=return_sequence)
 
@@ -168,7 +179,12 @@ class DualNetwork(nn.Module):
         
         return policy_mean, policy_std, new_hidden
 
-    def forward_value_local(self, obs, hidden_state=None, return_sequence: bool = False):
+    def forward_value_local(
+        self,
+        obs: torch.Tensor,
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_sequence: bool = False,
+    ):
         """Local value head: value from local obs features (kept for MCTS / execution path)."""
         x, new_hidden = self._encode_obs(obs, hidden_state, return_sequence=return_sequence)
         value_x = F.relu(self.value_fc(x))
@@ -190,13 +206,18 @@ class DualNetwork(nn.Module):
         v = self.global_value_head(x)
         return v
 
-    def forward(self, obs, hidden_state=None, return_sequence: bool = False):
+    def forward(
+        self,
+        obs: torch.Tensor,
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_sequence: bool = False,
+    ):
         """Backward-compatible forward: returns (mean, std, local_value, hidden)."""
         mean, std, new_hidden = self.forward_actor(obs, hidden_state, return_sequence=return_sequence)
         value, _ = self.forward_value_local(obs, hidden_state, return_sequence=return_sequence)
         if self.use_lstm:
             return mean, std, value, new_hidden
-        return mean, std, value
+        return mean, std, value, None
     
     def get_policy(self, obs, hidden_state=None):
         """Get policy distribution (mean and std)."""
@@ -225,7 +246,12 @@ class DualNetwork(nn.Module):
             return action, log_prob, new_hidden
             return action, log_prob
 
-    def next_hidden(self, obs, action, hidden_state=None):
+    def next_hidden(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         """Compute action-conditioned next LSTM hidden state."""
         if not self.use_lstm:
             raise RuntimeError("next_hidden() requires use_lstm=True")
@@ -261,3 +287,41 @@ class DualNetwork(nn.Module):
 
         h1, c1 = self.lstm_step(x, (h0, c0))
         return (h1.unsqueeze(0), c1.unsqueeze(0))
+
+
+class MCTSInferWrapper(nn.Module):
+    def __init__(self, net: DualNetwork):
+        super().__init__()
+        self.net = net
+
+    @torch.jit.export
+    def infer_policy_value(self, obs_seq: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
+        # obs_seq: (B,T,obs_dim)
+        # h/c: (B,H) or (1,B,H)
+        if h.dim() == 2:
+            h_in = h.unsqueeze(0)
+            c_in = c.unsqueeze(0)
+        else:
+            h_in = h
+            c_in = c
+        hidden = (h_in, c_in)
+        mean, std, _ = self.net.forward_actor(obs_seq, hidden, return_sequence=False)
+        v, _ = self.net.forward_value_local(obs_seq, hidden, return_sequence=False)
+        return mean, std, v
+
+    @torch.jit.export
+    def infer_next_hidden(self, obs_seq: torch.Tensor, h: torch.Tensor, c: torch.Tensor, action: torch.Tensor):
+        # obs_seq: (B,T,obs_dim)
+        # h/c: (B,H) or (1,B,H)
+        if h.dim() == 2:
+            h_in = h.unsqueeze(0)
+            c_in = c.unsqueeze(0)
+        else:
+            h_in = h
+            c_in = c
+        hidden = (h_in, c_in)
+        hn, cn = self.net.next_hidden(obs_seq, action, hidden)
+        return hn, cn
+
+    def forward(self, obs_seq: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
+        return self.infer_policy_value(obs_seq, h, c)
