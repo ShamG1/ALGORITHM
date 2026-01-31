@@ -293,13 +293,17 @@ class DualNetwork(nn.Module):
         return (h1.unsqueeze(0), c1.unsqueeze(0))
 
 
-class MCTSInferWrapper(torch.jit.ScriptModule):
+class MCTSInferWrapper(nn.Module):
     """
     TorchScript-compatible wrapper for MCTS inference.
     
-    IMPORTANT: This class inherits from torch.jit.ScriptModule and uses
-    @torch.jit.script_method to ensure methods are correctly serialized
-    and available after save/load.
+    Uses nn.Module + @torch.jit.export (modern API) so that
+    torch.jit.script() correctly exports infer_policy_value and
+    infer_next_hidden as callable methods after save/load.
+    
+    NOTE: The old torch.jit.ScriptModule + @torch.jit.script_method API
+    conflicts with torch.jit.script() called in train.py, causing exported
+    methods to be silently dropped. This version uses the modern API.
     
     All network layers are copied directly (not held as sub-module reference)
     to ensure TorchScript can properly trace all operations.
@@ -359,7 +363,6 @@ class MCTSInferWrapper(torch.jit.ScriptModule):
         self.lstm_step = nn.LSTMCell(net.lstm_step.input_size, net.lstm_step.hidden_size)
         self.lstm_step.load_state_dict(net.lstm_step.state_dict())
 
-    @torch.jit.script_method
     def _encode_obs(
         self,
         obs: torch.Tensor,
@@ -391,7 +394,7 @@ class MCTSInferWrapper(torch.jit.ScriptModule):
         
         return x, new_hidden
 
-    @torch.jit.script_method
+    @torch.jit.export
     def infer_policy_value(
         self, 
         obs_seq: torch.Tensor, 
@@ -435,7 +438,7 @@ class MCTSInferWrapper(torch.jit.ScriptModule):
         
         return mean, std, value
 
-    @torch.jit.script_method
+    @torch.jit.export
     def infer_next_hidden(
         self, 
         obs_seq: torch.Tensor, 
@@ -491,8 +494,124 @@ class MCTSInferWrapper(torch.jit.ScriptModule):
         
         # Return as (1, B, H)
         return h1.unsqueeze(0), c1.unsqueeze(0)
+    
+    @torch.jit.export
+    def infer_expand(
+        self,
+        obs_seq: torch.Tensor,
+        h: torch.Tensor,
+        c: torch.Tensor,
+        actions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Fused inference for MCTS node expansion: policy/value + next hidden states.
+        
+        This method combines infer_policy_value and infer_next_hidden into a single
+        call, reducing the run_method dispatch overhead in the C++ backend.
+        
+        Use case: In MCTS expand_node, we need both:
+        1. Policy distribution (mean, std) and value for the current node
+        2. Next hidden states for each sampled action (to store in edges)
+        
+        Args:
+            obs_seq: (B, T, obs_dim) observation sequence
+                     Note: For expand_node, B = num_action_samples, and all B rows
+                     contain the same obs_seq (replicated for batched next_hidden)
+            h: (1, B, H) LSTM hidden state (same h replicated B times)
+            c: (1, B, H) LSTM cell state (same c replicated B times)
+            actions: (B, 2) sampled actions for computing next hidden states
+            
+        Returns:
+            mean: (1, 2) policy mean (only first sample needed, all identical)
+            std: (1, 2) policy std
+            value: (1, 1) state value
+            h_next: (B, H) next hidden states for each action
+            c_next: (B, H) next cell states for each action
+        """
+        # Normalize h/c to (1, B, H)
+        if h.dim() == 2:
+            h_in = h.unsqueeze(0)
+            c_in = c.unsqueeze(0)
+        else:
+            h_in = h
+            c_in = c
+        
+        B = obs_seq.size(0)
+        
+        # ========== Part 1: Policy and Value (only need first sample) ==========
+        # Take first sample for policy/value (all obs_seq rows are identical)
+        obs_first = obs_seq[0:1]  # (1, T, obs_dim)
+        h_first = h_in[:, 0:1, :]  # (1, 1, H)
+        c_first = c_in[:, 0:1, :]  # (1, 1, H)
+        
+        hidden_first = (h_first, c_first)
+        x, _ = self._encode_obs(obs_first, hidden_first)
+        
+        # Policy head
+        policy_x = F.relu(self.policy_fc(x))
+        mean = torch.tanh(self.policy_mean(policy_x))  # (1, 2)
+        log_std = self.policy_log_std(policy_x)
+        log_std = torch.clamp(log_std, -5.0, 1.0)
+        std = torch.exp(log_std)  # (1, 2)
+        
+        # Value head
+        value_x = F.relu(self.value_fc(x))
+        value = self.value_head(value_x)  # (1, 1)
+        
+        # ========== Part 2: Next Hidden States (batched for all actions) ==========
+        # Take last observation for all samples
+        if obs_seq.dim() == 3:
+            obs_step = obs_seq[:, -1, :]  # (B, obs_dim)
+        else:
+            obs_step = obs_seq  # (B, obs_dim)
+        
+        # Encode observations
+        x_obs = self.fc_input(obs_step)
+        x_obs = self.ln_input(x_obs)
+        x_obs = F.relu(x_obs)  # (B, embed_dim)
+        
+        # Encode actions
+        x_act = self.action_embed(actions)
+        x_act = F.relu(x_act)  # (B, embed_dim)
+        
+        # Concatenate
+        x_combined = torch.cat([x_obs, x_act], dim=-1)  # (B, embed_dim * 2)
+        
+        # Get (B, H) from (1, B, H)
+        h0 = h_in[0]  # (B, H)
+        c0 = c_in[0]  # (B, H)
+        
+        # LSTMCell step (batched)
+        h_next, c_next = self.lstm_step(x_combined, (h0, c0))  # both (B, H)
+        
+        return mean, std, value, h_next, c_next
 
-    @torch.jit.script_method
+    @torch.jit.export
+    def infer_batch_policy_value(
+        self,
+        obs_seq_batch: torch.Tensor,
+        h_batch: torch.Tensor,
+        c_batch: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Batched policy/value inference for multiple agents.
+        
+        This is a thin wrapper around infer_policy_value that makes the batching
+        semantics explicit. Useful for rollout where we want to infer for all
+        agents in a single call.
+        
+        Args:
+            obs_seq_batch: (B, T, obs_dim) stacked observation sequences
+            h_batch: (1, B, H) stacked hidden states (or zeros for non-ego)
+            c_batch: (1, B, H) stacked cell states
+            
+        Returns:
+            mean: (B, 2) policy means for all agents
+            std: (B, 2) policy stds
+            value: (B, 1) state values
+        """
+        return self.infer_policy_value(obs_seq_batch, h_batch, c_batch)
+    
     def forward(
         self, 
         obs_seq: torch.Tensor, 

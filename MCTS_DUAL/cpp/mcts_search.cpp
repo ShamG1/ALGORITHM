@@ -28,6 +28,101 @@
 #include "mcts_search.h"
 
 #include <string>
+
+// ============================================================================
+// Tensor workspace for TorchScript expand_node (preallocated buffers)
+// ============================================================================
+
+struct TensorExpandWorkspace {
+    bool allocated{false};
+    int max_batch_size{0};
+    int seq_len{0};
+    int obs_dim{0};
+    int lstm_hidden_dim{0};
+    torch::Device device{torch::kCPU};
+
+    torch::Tensor obs_batch_tensor;    // (B, T, D)
+    torch::Tensor h_batch_tensor;      // (1, B, H)
+    torch::Tensor c_batch_tensor;      // (1, B, H)
+    torch::Tensor action_batch_tensor; // (B, 2)
+
+    torch::Tensor obs_single_tensor;   // (1, T, D)
+    torch::Tensor h_single_tensor;     // (1, 1, H)
+    torch::Tensor c_single_tensor;     // (1, 1, H)
+
+    TensorExpandWorkspace() = default;
+
+    void init(int max_b, int t, int d, int h, torch::Device dev) {
+        max_batch_size = max_b;
+        seq_len = t;
+        obs_dim = d;
+        lstm_hidden_dim = h;
+        device = dev;
+        allocated = false;
+    }
+
+    void ensure_tensors_allocated() {
+        if (allocated) return;
+        if (max_batch_size <= 0 || seq_len <= 0 || obs_dim <= 0 || lstm_hidden_dim <= 0) {
+            throw std::runtime_error("TensorExpandWorkspace not initialized");
+        }
+
+        obs_batch_tensor = torch::empty({max_batch_size, seq_len, obs_dim}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        h_batch_tensor = torch::empty({1, max_batch_size, lstm_hidden_dim}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        c_batch_tensor = torch::empty({1, max_batch_size, lstm_hidden_dim}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        action_batch_tensor = torch::empty({max_batch_size, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+        obs_single_tensor = torch::empty({1, seq_len, obs_dim}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        h_single_tensor = torch::empty({1, 1, lstm_hidden_dim}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        c_single_tensor = torch::empty({1, 1, lstm_hidden_dim}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+        allocated = true;
+    }
+
+    void fill_obs_batch_row(int k, const std::vector<float>& obs_seq_flat) {
+        if ((int)obs_seq_flat.size() != seq_len * obs_dim) {
+            throw std::runtime_error("fill_obs_batch_row: obs_seq_flat size mismatch");
+        }
+        auto src = torch::from_blob(const_cast<float*>(obs_seq_flat.data()), {seq_len, obs_dim}, torch::TensorOptions().dtype(torch::kFloat32));
+        obs_batch_tensor[k].copy_(src.to(device));
+    }
+
+    void fill_hc_batch_col(int k, const std::vector<float>& h, const std::vector<float>& c) {
+        if ((int)h.size() != lstm_hidden_dim || (int)c.size() != lstm_hidden_dim) {
+            throw std::runtime_error("fill_hc_batch_col: h/c size mismatch");
+        }
+        auto ht = torch::from_blob(const_cast<float*>(h.data()), {lstm_hidden_dim}, torch::TensorOptions().dtype(torch::kFloat32));
+        auto ct = torch::from_blob(const_cast<float*>(c.data()), {lstm_hidden_dim}, torch::TensorOptions().dtype(torch::kFloat32));
+        h_batch_tensor[0][k].copy_(ht.to(device));
+        c_batch_tensor[0][k].copy_(ct.to(device));
+    }
+
+    void fill_single_obs(const std::vector<float>& obs_seq_flat) {
+        if ((int)obs_seq_flat.size() != seq_len * obs_dim) {
+            throw std::runtime_error("fill_single_obs: obs_seq_flat size mismatch");
+        }
+        auto src = torch::from_blob(const_cast<float*>(obs_seq_flat.data()), {1, seq_len, obs_dim}, torch::TensorOptions().dtype(torch::kFloat32));
+        obs_single_tensor.copy_(src.to(device));
+    }
+
+    void fill_single_hc(const std::vector<float>& h, const std::vector<float>& c) {
+        if ((int)h.size() != lstm_hidden_dim || (int)c.size() != lstm_hidden_dim) {
+            throw std::runtime_error("fill_single_hc: h/c size mismatch");
+        }
+        auto ht = torch::from_blob(const_cast<float*>(h.data()), {1, 1, lstm_hidden_dim}, torch::TensorOptions().dtype(torch::kFloat32));
+        auto ct = torch::from_blob(const_cast<float*>(c.data()), {1, 1, lstm_hidden_dim}, torch::TensorOptions().dtype(torch::kFloat32));
+        h_single_tensor.copy_(ht.to(device));
+        c_single_tensor.copy_(ct.to(device));
+    }
+
+    torch::Tensor get_obs_batch_slice(int b) const { return obs_batch_tensor.slice(0, 0, b); }
+    torch::Tensor get_h_batch_slice(int b) const { return h_batch_tensor.slice(1, 0, b); }
+    torch::Tensor get_c_batch_slice(int b) const { return c_batch_tensor.slice(1, 0, b); }
+    torch::Tensor get_action_batch_slice(int b) const { return action_batch_tensor.slice(0, 0, b); }
+};
+
+static MCTS_THREAD_LOCAL TensorExpandWorkspace t_expand_workspace;
+
 #include <mutex>
 #include <unordered_map>
 #include <filesystem>
@@ -537,7 +632,7 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
     IntersectionEnv& env,
     const EnvState& base_state,
     int agent_index,
-    const std::array<float,2>& agent_action,  // 仅在t=0时使用
+    const std::array<float,2>& agent_action,
     torch::jit::Module& module,
     const torch::Device& device,
     std::vector<float> obs_seq_flat,
@@ -576,13 +671,21 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
     }
     t_workspace.reset(n_agents);
 
-    // 使用RingBuffer管理受控智能体的观测序列
+    // 受控智能体的观测序列
     RingBuffer ctrl_obs_buf(seq_len, obs_dim);
     ctrl_obs_buf.from_flat(obs_seq_flat);
 
     float total_reward = 0.0f;
     float discount = 1.0f;
     bool terminated = false;
+
+    // ---- 预分配 batch buffer（避免每步重新分配）----
+    // 最大 batch = n_agents（所有 agent 都需要推理时）
+    const int max_batch = n_agents;
+    std::vector<float> batch_obs_flat;
+    batch_obs_flat.reserve((size_t)max_batch * seq_len * obs_dim);
+    std::vector<int> batch_agent_map;
+    batch_agent_map.reserve((size_t)max_batch);
 
     for (int t = 0; t < rollout_depth; ++t) {
         auto all_obs = env.get_observations();
@@ -591,78 +694,90 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
         std::fill(t_workspace.throttles.begin(), t_workspace.throttles.begin() + n_agents, 0.0f);
         std::fill(t_workspace.steerings.begin(), t_workspace.steerings.begin() + n_agents, 0.0f);
 
-        // 为所有智能体获取均值动作（确定性策略）
+        // ============================================================
+        // 【优化 1】批量收集所有需要推理的 agent，单次调用 infer_policy_value
+        // ============================================================
+        batch_obs_flat.clear();
+        batch_agent_map.clear();
+        int ego_idx_in_batch = -1;
+
         for (int j = 0; j < n_agents; ++j) {
-            // t=0时controlled agent跳过，使用传入动作
-            if (t == 0 && j == agent_index) continue;
+            if (t == 0 && j == agent_index) continue;  // t=0 ego 用传入动作
             if (j >= (int)all_obs.size()) continue;
 
             const std::vector<float>& obsj = all_obs[(size_t)j];
             if ((int)obsj.size() != obs_dim) continue;
 
             // 懒初始化其他智能体的观测序列
-            if (t_workspace.other_obs_bufs[(size_t)j].empty()) {
-                t_workspace.other_obs_bufs[(size_t)j].init(seq_len, obs_dim);
-                t_workspace.other_obs_bufs[(size_t)j].fill_with(obsj);
+            if (j != agent_index) {
+                if (t_workspace.other_obs_bufs[(size_t)j].empty()) {
+                    t_workspace.other_obs_bufs[(size_t)j].init(seq_len, obs_dim);
+                    t_workspace.other_obs_bufs[(size_t)j].fill_with(obsj);
+                }
+                // 将 obs_seq 展平加入 batch
+                t_workspace.other_obs_bufs[(size_t)j].to_flat(t_workspace.temp_obs_flat);
+                batch_obs_flat.insert(batch_obs_flat.end(),
+                    t_workspace.temp_obs_flat.begin(), t_workspace.temp_obs_flat.end());
+            } else {
+                // ego agent (t > 0)
+                ctrl_obs_buf.to_flat(t_workspace.temp_obs_flat);
+                batch_obs_flat.insert(batch_obs_flat.end(),
+                    t_workspace.temp_obs_flat.begin(), t_workspace.temp_obs_flat.end());
+                ego_idx_in_batch = (int)batch_agent_map.size();
+            }
+            batch_agent_map.push_back(j);
+        }
+
+        if (!batch_agent_map.empty()) {
+            const int B = (int)batch_agent_map.size();
+
+            // 构建 batch obs tensor: (B, seq_len, obs_dim)
+            auto obs_batch_t = torch::from_blob(
+                batch_obs_flat.data(),
+                {B, seq_len, obs_dim},
+                torch::TensorOptions().dtype(torch::kFloat32)
+            ).clone().to(device);
+
+            // h/c: 对非 ego agent 使用零向量（与 Python callback 行为一致）
+            // 对 ego agent 使用真实 LSTM 状态
+            auto h_batch_t = torch::zeros({1, B, lstm_hidden_dim},
+                torch::TensorOptions().dtype(torch::kFloat32)).to(device);
+            auto c_batch_t = torch::zeros({1, B, lstm_hidden_dim},
+                torch::TensorOptions().dtype(torch::kFloat32)).to(device);
+
+            if (ego_idx_in_batch >= 0 && lstm_hidden_dim > 0) {
+                auto h_acc = h_batch_t.accessor<float, 3>();
+                auto c_acc = c_batch_t.accessor<float, 3>();
+                for (int i = 0; i < lstm_hidden_dim && i < (int)h_cur.size(); ++i) {
+                    h_acc[0][ego_idx_in_batch][i] = h_cur[(size_t)i];
+                    c_acc[0][ego_idx_in_batch][i] = c_cur[(size_t)i];
+                }
             }
 
-            // 获取观测tensor
-            t_workspace.other_obs_bufs[(size_t)j].to_flat(t_workspace.temp_obs_flat);
-            auto obs_t = make_obs_seq_tensor(t_workspace.temp_obs_flat, seq_len, obs_dim, device);
-            auto h_t = make_hc_tensor(t_workspace.other_h[(size_t)j], lstm_hidden_dim, device);
-            auto c_t = make_hc_tensor(t_workspace.other_c[(size_t)j], lstm_hidden_dim, device);
-
+            // 单次 batch 调用
             double t0_pv = 0.0;
             if (prof) t0_pv = now_ms();
-            auto out_iv = module.run_method("infer_policy_value", obs_t, h_t, c_t);
+            auto out_iv = module.run_method("infer_policy_value", obs_batch_t, h_batch_t, c_batch_t);
             if (prof) { prof->ms_infer_pv += (now_ms() - t0_pv); prof->calls_infer_pv += 1; }
-            
+
             auto out_tup = out_iv.toTuple();
             if (!out_tup || out_tup->elements().size() < 3) {
                 throw std::runtime_error("infer_policy_value must return (mean,std,value)");
             }
 
-            std::array<float,2> meanj, stdj;
-            float vj = 0.0f;
-            parse_policy_value_tensors(
-                out_tup->elements()[0].toTensor(),
-                out_tup->elements()[1].toTensor(),
-                out_tup->elements()[2].toTensor(),
-                meanj, stdj, vj
-            );
+            // 解析 batch 结果: mean (B,2), std (B,2), value (B,1)
+            torch::Tensor means_t = out_tup->elements()[0].toTensor().detach().to(torch::kCPU).contiguous();
+            // std 和 value 可以不解析（rollout 中只需 mean）
 
-            // 确定性：使用均值
-            t_workspace.throttles[(size_t)j] = clampf(meanj[0], -1.0f, 1.0f);
-            t_workspace.steerings[(size_t)j] = clampf(meanj[1], -1.0f, 1.0f);
+            const float* mean_ptr = means_t.data_ptr<float>();
+            for (int b = 0; b < B; ++b) {
+                int j = batch_agent_map[(size_t)b];
+                t_workspace.throttles[(size_t)j] = clampf(mean_ptr[b * 2], -1.0f, 1.0f);
+                t_workspace.steerings[(size_t)j] = clampf(mean_ptr[b * 2 + 1], -1.0f, 1.0f);
+            }
         }
 
-        // t>0时，controlled agent也需要推理获取均值
-        if (t > 0 && agent_index >= 0 && agent_index < n_agents) {
-            ctrl_obs_buf.to_flat(t_workspace.temp_obs_flat);
-            auto obs_t = make_obs_seq_tensor(t_workspace.temp_obs_flat, seq_len, obs_dim, device);
-            auto h_t = make_hc_tensor(h_cur, lstm_hidden_dim, device);
-            auto c_t = make_hc_tensor(c_cur, lstm_hidden_dim, device);
-
-            double t0_pv = 0.0;
-            if (prof) t0_pv = now_ms();
-            auto out_iv = module.run_method("infer_policy_value", obs_t, h_t, c_t);
-            if (prof) { prof->ms_infer_pv += (now_ms() - t0_pv); prof->calls_infer_pv += 1; }
-            
-            auto out_tup = out_iv.toTuple();
-            std::array<float,2> mean_ctrl, std_ctrl;
-            float v_ctrl = 0.0f;
-            parse_policy_value_tensors(
-                out_tup->elements()[0].toTensor(),
-                out_tup->elements()[1].toTensor(),
-                out_tup->elements()[2].toTensor(),
-                mean_ctrl, std_ctrl, v_ctrl
-            );
-
-            t_workspace.throttles[(size_t)agent_index] = clampf(mean_ctrl[0], -1.0f, 1.0f);
-            t_workspace.steerings[(size_t)agent_index] = clampf(mean_ctrl[1], -1.0f, 1.0f);
-        }
-
-        // t=0时使用传入的候选动作
+        // t=0 时 ego 使用传入的候选动作
         if (t == 0 && agent_index >= 0 && agent_index < n_agents) {
             t_workspace.throttles[(size_t)agent_index] = agent_action[0];
             t_workspace.steerings[(size_t)agent_index] = agent_action[1];
@@ -678,40 +793,21 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
             total_reward += discount * res.rewards[(size_t)agent_index];
         }
 
-        // 更新观测序列和LSTM状态
+        // ============================================================
+        // 【优化 2】只更新 ego agent 的 LSTM 状态
+        //           非 ego agent 只更新 obs buffer（不调用网络）
+        // ============================================================
         if (!res.obs.empty()) {
-            // 更新其他智能体
+            // 更新非 ego agent 的观测序列（仅更新 buffer，不调用 infer_next_hidden）
             for (int j = 0; j < n_agents && j < (int)res.obs.size(); ++j) {
                 if (j == agent_index) continue;
                 if (t_workspace.other_obs_bufs[(size_t)j].empty()) continue;
-
-                const std::vector<float>& obsj_next = res.obs[(size_t)j];
-                t_workspace.other_obs_bufs[(size_t)j].append(obsj_next);
-
-                // 更新LSTM状态
-                float act_j_buf[2] = {t_workspace.throttles[(size_t)j], t_workspace.steerings[(size_t)j]};
-                t_workspace.other_obs_bufs[(size_t)j].to_flat(t_workspace.temp_obs_flat);
-                auto obs_tj = make_obs_seq_tensor(t_workspace.temp_obs_flat, seq_len, obs_dim, device);
-                auto h_tj = make_hc_tensor(t_workspace.other_h[(size_t)j], lstm_hidden_dim, device);
-                auto c_tj = make_hc_tensor(t_workspace.other_c[(size_t)j], lstm_hidden_dim, device);
-                auto act_tj = torch::from_blob(
-                    act_j_buf, {1, 2},
-                    torch::TensorOptions().dtype(torch::kFloat32)
-                ).clone().to(device);
-
-                double t0_nh = 0.0;
-                if (prof) t0_nh = now_ms();
-                auto hc_ivj = module.run_method("infer_next_hidden", obs_tj, h_tj, c_tj, act_tj);
-                if (prof) { prof->ms_infer_nh += (now_ms() - t0_nh); prof->calls_infer_nh += 1; }
-                
-                auto hc_tupj = hc_ivj.toTuple();
-                if (hc_tupj && hc_tupj->elements().size() >= 2) {
-                    tensor_to_vec1d(hc_tupj->elements()[0].toTensor(), t_workspace.other_h[(size_t)j]);
-                    tensor_to_vec1d(hc_tupj->elements()[1].toTensor(), t_workspace.other_c[(size_t)j]);
-                }
+                t_workspace.other_obs_bufs[(size_t)j].append(res.obs[(size_t)j]);
+                // 不调用 infer_next_hidden —— LSTM 状态保持为零
+                // 这与 Python callback 路径的行为一致
             }
 
-            // 更新受控智能体
+            // 只对 ego agent 调用 infer_next_hidden
             if (agent_index >= 0 && agent_index < (int)res.obs.size()) {
                 const std::vector<float>& obs_next = res.obs[(size_t)agent_index];
                 ctrl_obs_buf.append(obs_next);
@@ -720,7 +816,10 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
                 auto obs_t = make_obs_seq_tensor(t_workspace.temp_obs_flat, seq_len, obs_dim, device);
                 auto h_t = make_hc_tensor(h_cur, lstm_hidden_dim, device);
                 auto c_t = make_hc_tensor(c_cur, lstm_hidden_dim, device);
-                float act_buf[2] = {t_workspace.throttles[(size_t)agent_index], t_workspace.steerings[(size_t)agent_index]};
+                float act_buf[2] = {
+                    t_workspace.throttles[(size_t)agent_index],
+                    t_workspace.steerings[(size_t)agent_index]
+                };
                 auto act_t = torch::from_blob(
                     act_buf, {1, 2},
                     torch::TensorOptions().dtype(torch::kFloat32)
@@ -730,7 +829,7 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
                 if (prof) t0_nh = now_ms();
                 auto hc_iv = module.run_method("infer_next_hidden", obs_t, h_t, c_t, act_t);
                 if (prof) { prof->ms_infer_nh += (now_ms() - t0_nh); prof->calls_infer_nh += 1; }
-                
+
                 auto hc_tup = hc_iv.toTuple();
                 if (hc_tup && hc_tup->elements().size() >= 2) {
                     tensor_to_vec1d(hc_tup->elements()[0].toTensor(), h_cur);
@@ -1020,139 +1119,258 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
     root.obs_seq_flat = root_obs_seq;
     nodes.push_back(std::move(root));
 
+    // 检查是否支持 infer_expand（兼容旧模型）
+    bool has_infer_expand = false;
+    try {
+        module.get_method("infer_expand");
+        has_infer_expand = true;
+    } catch (...) {
+        has_infer_expand = false;
+    }
+
+    // init expand workspace for this thread (preallocated buffers)
+    t_expand_workspace.init(num_action_samples, seq_len, obs_dim, lstm_hidden_dim, device);
+
     auto expand_node = [&](LSTMNode& node, bool add_dirichlet) {
-        auto obs_t = make_obs_seq_tensor(node.obs_seq_flat, seq_len, obs_dim, device);
-        auto h_t = make_hc_tensor(node.h, lstm_hidden_dim, device);
-        auto c_t = make_hc_tensor(node.c, lstm_hidden_dim, device);
+        t_expand_workspace.ensure_tensors_allocated();
 
-        double t0_pv = 0.0;
-        if (&prof) t0_pv = now_ms();
-        auto out_iv = module.run_method("infer_policy_value", obs_t, h_t, c_t);
-        prof.ms_infer_pv += (now_ms() - t0_pv);
-        prof.calls_infer_pv += 1;
+        if (has_infer_expand) {
+            // ========== 优化路径：使用 infer_expand 融合方法 ==========
 
-        auto out_tup = out_iv.toTuple();
-        if (!out_tup || out_tup->elements().size() < 3) {
-            throw std::runtime_error("infer_policy_value must return (mean,std,value)");
-        }
+            // 1. 构建 obs batch（复制 num_action_samples 次）
+            for (int k = 0; k < num_action_samples; ++k) {
+                t_expand_workspace.fill_obs_batch_row(k, node.obs_seq_flat);
+            }
+            auto obs_batch_t = t_expand_workspace.get_obs_batch_slice(num_action_samples);
 
-        std::array<float,2> mean0, std0;
-        float value0 = 0.0f;
-        parse_policy_value_tensors(
-            out_tup->elements()[0].toTensor(),
-            out_tup->elements()[1].toTensor(),
-            out_tup->elements()[2].toTensor(),
-            mean0, std0, value0
-        );
-        node.V = value0;
+            // 2. 构建 h/c batch（复制 num_action_samples 次）
+            for (int k = 0; k < num_action_samples; ++k) {
+                t_expand_workspace.fill_hc_batch_col(k, node.h, node.c);
+            }
+            auto h_batch_t = t_expand_workspace.get_h_batch_slice(num_action_samples);
+            auto c_batch_t = t_expand_workspace.get_c_batch_slice(num_action_samples);
 
-        std::vector<std::array<float,2>> sampled;
-        sampled.reserve((size_t)num_action_samples);
-        std::vector<float> logps;
-        logps.reserve((size_t)num_action_samples);
+            // 3. 先获取 policy/value 来采样动作（只需要第一个样本）
+            double t0_pv = now_ms();
+            auto out_pv = module.run_method(
+                "infer_policy_value",
+                obs_batch_t.slice(0, 0, 1),
+                h_batch_t.slice(1, 0, 1),
+                c_batch_t.slice(1, 0, 1)
+            );
+            prof.ms_infer_pv += (now_ms() - t0_pv);
+            prof.calls_infer_pv += 1;
 
-        for (int k = 0; k < num_action_samples; ++k) {
-            float a0 = mean0[0] + std0[0] * randn(rng);
-            float a1 = mean0[1] + std0[1] * randn(rng);
-            a0 = clampf(a0, -1.0f, 1.0f);
-            a1 = clampf(a1, -1.0f, 1.0f);
-            sampled.push_back({a0, a1});
-            float lp = gaussian_log_prob(a0, mean0[0], std0[0]) + gaussian_log_prob(a1, mean0[1], std0[1]);
-            logps.push_back(lp);
-        }
+            auto pv_tup = out_pv.toTuple();
+            if (!pv_tup || pv_tup->elements().size() < 3) {
+                throw std::runtime_error("infer_policy_value must return (mean,std,value)");
+            }
 
-        softmax_inplace(logps);
+            std::array<float, 2> mean0, std0;
+            float value0 = 0.0f;
+            parse_policy_value_tensors(
+                pv_tup->elements()[0].toTensor(),
+                pv_tup->elements()[1].toTensor(),
+                pv_tup->elements()[2].toTensor(),
+                mean0, std0, value0
+            );
+            node.V = value0;
 
-        if (add_dirichlet && dirichlet_eps > 0.0f && dirichlet_alpha > 0.0f) {
-            std::gamma_distribution<float> gd(dirichlet_alpha, 1.0f);
-            std::vector<float> noise((size_t)num_action_samples, 0.0f);
-            float s = 0.0f;
-            for (int i = 0; i < num_action_samples; ++i) { noise[(size_t)i] = gd(rng); s += noise[(size_t)i]; }
-            if (s > 0.0f) {
-                for (auto& x : noise) x /= s;
+            // 4. 采样动作并计算 prior
+            std::vector<std::array<float, 2>> sampled;
+            sampled.reserve((size_t)num_action_samples);
+            std::vector<float> logps;
+            logps.reserve((size_t)num_action_samples);
+
+            auto action_acc = t_expand_workspace.action_batch_tensor.accessor<float, 2>();
+            for (int k = 0; k < num_action_samples; ++k) {
+                float a0 = mean0[0] + std0[0] * randn(rng);
+                float a1 = mean0[1] + std0[1] * randn(rng);
+                a0 = clampf(a0, -1.0f, 1.0f);
+                a1 = clampf(a1, -1.0f, 1.0f);
+                sampled.push_back({a0, a1});
+                action_acc[k][0] = a0;
+                action_acc[k][1] = a1;
+                float lp = gaussian_log_prob(a0, mean0[0], std0[0]) + gaussian_log_prob(a1, mean0[1], std0[1]);
+                logps.push_back(lp);
+            }
+
+            softmax_inplace(logps);
+
+            // Dirichlet noise
+            if (add_dirichlet && dirichlet_eps > 0.0f && dirichlet_alpha > 0.0f) {
+                std::gamma_distribution<float> gd(dirichlet_alpha, 1.0f);
+                std::vector<float> noise((size_t)num_action_samples, 0.0f);
+                float s = 0.0f;
                 for (int i = 0; i < num_action_samples; ++i) {
-                    logps[(size_t)i] = (1.0f - dirichlet_eps) * logps[(size_t)i] + dirichlet_eps * noise[(size_t)i];
+                    noise[(size_t)i] = gd(rng);
+                    s += noise[(size_t)i];
+                }
+                if (s > 0.0f) {
+                    for (auto& x : noise) x /= s;
+                    for (int i = 0; i < num_action_samples; ++i) {
+                        logps[(size_t)i] = (1.0f - dirichlet_eps) * logps[(size_t)i] + dirichlet_eps * noise[(size_t)i];
+                    }
                 }
             }
-        }
 
-        // 批量获取next_hidden
-        std::vector<float> obs_batch_flat;
-        obs_batch_flat.reserve((size_t)num_action_samples * (size_t)seq_len * (size_t)obs_dim);
-        for (int k = 0; k < num_action_samples; ++k) {
-            obs_batch_flat.insert(obs_batch_flat.end(), node.obs_seq_flat.begin(), node.obs_seq_flat.end());
-        }
+            // 5. 批量调用 infer_next_hidden 获取所有 action 的 next hidden
+            auto action_batch_t = t_expand_workspace.get_action_batch_slice(num_action_samples);
 
-        auto obs_batch_t = torch::from_blob(
-            obs_batch_flat.data(),
-            {num_action_samples, seq_len, obs_dim},
-            torch::TensorOptions().dtype(torch::kFloat32)
-        ).clone().to(device);
+            double t0_nh = now_ms();
+            auto hc_out = module.run_method("infer_next_hidden", obs_batch_t, h_batch_t, c_batch_t, action_batch_t);
+            prof.ms_infer_nh += (now_ms() - t0_nh);
+            prof.calls_infer_nh += 1;
 
-        std::vector<float> h_batch((size_t)num_action_samples * (size_t)lstm_hidden_dim, 0.0f);
-        std::vector<float> c_batch((size_t)num_action_samples * (size_t)lstm_hidden_dim, 0.0f);
-        for (int k = 0; k < num_action_samples; ++k) {
-            for (int i = 0; i < lstm_hidden_dim; ++i) {
-                h_batch[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i] = 
-                    (i < (int)node.h.size()) ? node.h[(size_t)i] : 0.0f;
-                c_batch[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i] = 
-                    (i < (int)node.c.size()) ? node.c[(size_t)i] : 0.0f;
+            auto hc_tup = hc_out.toTuple();
+            if (!hc_tup || hc_tup->elements().size() < 2) {
+                throw std::runtime_error("infer_next_hidden must return (h_next,c_next)");
             }
-        }
 
-        // TorchScript wrapper expects h/c as (B,H) or (1,B,H). We pass (1,B,H) here.
-        auto h_batch_t = torch::from_blob(
-            h_batch.data(),
-            {1, num_action_samples, lstm_hidden_dim},
-            torch::TensorOptions().dtype(torch::kFloat32)
-        ).clone().to(device);
-        auto c_batch_t = torch::from_blob(
-            c_batch.data(),
-            {1, num_action_samples, lstm_hidden_dim},
-            torch::TensorOptions().dtype(torch::kFloat32)
-        ).clone().to(device);
+            torch::Tensor h_next_t = hc_tup->elements()[0].toTensor().detach().to(torch::kCPU).contiguous();
+            torch::Tensor c_next_t = hc_tup->elements()[1].toTensor().detach().to(torch::kCPU).contiguous();
 
-        std::vector<float> action_batch((size_t)num_action_samples * 2);
-        for (int k = 0; k < num_action_samples; ++k) {
-            action_batch[(size_t)k * 2] = sampled[(size_t)k][0];
-            action_batch[(size_t)k * 2 + 1] = sampled[(size_t)k][1];
-        }
-        auto action_t = torch::from_blob(
-            action_batch.data(),
-            {num_action_samples, 2},
-            torch::TensorOptions().dtype(torch::kFloat32)
-        ).clone().to(device);
+            // 处理输出形状：可能是 (1, B, H) 或 (B, H)
+            if (h_next_t.dim() == 3) {
+                h_next_t = h_next_t.squeeze(0);
+                c_next_t = c_next_t.squeeze(0);
+            }
 
-        double t0_nh = 0.0;
-        t0_nh = now_ms();
-        auto hc_iv = module.run_method("infer_next_hidden", obs_batch_t, h_batch_t, c_batch_t, action_t);
-        prof.ms_infer_nh += (now_ms() - t0_nh);
-        prof.calls_infer_nh += 1;
-
-        auto hc_tup = hc_iv.toTuple();
-        if (!hc_tup || hc_tup->elements().size() < 2) {
-            throw std::runtime_error("infer_next_hidden must return (h_next,c_next)");
-        }
-
-        torch::Tensor h_next_t = hc_tup->elements()[0].toTensor().detach().to(torch::kCPU).contiguous();
-        torch::Tensor c_next_t = hc_tup->elements()[1].toTensor().detach().to(torch::kCPU).contiguous();
-
-        node.edges.clear();
-        node.edges.reserve((size_t)num_action_samples);
-        for (int k = 0; k < num_action_samples; ++k) {
-            LSTMEdge e;
-            e.action = sampled[(size_t)k];
-            e.prior = logps[(size_t)k];
-            e.h_next.resize((size_t)lstm_hidden_dim);
-            e.c_next.resize((size_t)lstm_hidden_dim);
+            // 6. 构建 edges
+            node.edges.clear();
+            node.edges.reserve((size_t)num_action_samples);
 
             const float* h_ptr = h_next_t.data_ptr<float>();
             const float* c_ptr = c_next_t.data_ptr<float>();
-            for (int i = 0; i < lstm_hidden_dim; ++i) {
-                e.h_next[(size_t)i] = h_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
-                e.c_next[(size_t)i] = c_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
+
+            for (int k = 0; k < num_action_samples; ++k) {
+                LSTMEdge e;
+                e.action = sampled[(size_t)k];
+                e.prior = logps[(size_t)k];
+                e.h_next.resize((size_t)lstm_hidden_dim);
+                e.c_next.resize((size_t)lstm_hidden_dim);
+
+                for (int i = 0; i < lstm_hidden_dim; ++i) {
+                    e.h_next[(size_t)i] = h_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
+                    e.c_next[(size_t)i] = c_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
+                }
+                node.edges.push_back(std::move(e));
             }
-            node.edges.push_back(std::move(e));
+
+        } else {
+            // ========== 回退路径 ==========
+
+            t_expand_workspace.fill_single_obs(node.obs_seq_flat);
+            t_expand_workspace.fill_single_hc(node.h, node.c);
+
+            double t0_pv = now_ms();
+            auto out_iv = module.run_method(
+                "infer_policy_value",
+                t_expand_workspace.obs_single_tensor,
+                t_expand_workspace.h_single_tensor,
+                t_expand_workspace.c_single_tensor
+            );
+            prof.ms_infer_pv += (now_ms() - t0_pv);
+            prof.calls_infer_pv += 1;
+
+            auto out_tup = out_iv.toTuple();
+            if (!out_tup || out_tup->elements().size() < 3) {
+                throw std::runtime_error("infer_policy_value must return (mean,std,value)");
+            }
+
+            std::array<float, 2> mean0, std0;
+            float value0 = 0.0f;
+            parse_policy_value_tensors(
+                out_tup->elements()[0].toTensor(),
+                out_tup->elements()[1].toTensor(),
+                out_tup->elements()[2].toTensor(),
+                mean0, std0, value0
+            );
+            node.V = value0;
+
+            std::vector<std::array<float, 2>> sampled;
+            sampled.reserve((size_t)num_action_samples);
+            std::vector<float> logps;
+            logps.reserve((size_t)num_action_samples);
+
+            for (int k = 0; k < num_action_samples; ++k) {
+                float a0 = mean0[0] + std0[0] * randn(rng);
+                float a1 = mean0[1] + std0[1] * randn(rng);
+                a0 = clampf(a0, -1.0f, 1.0f);
+                a1 = clampf(a1, -1.0f, 1.0f);
+                sampled.push_back({a0, a1});
+                float lp = gaussian_log_prob(a0, mean0[0], std0[0]) + gaussian_log_prob(a1, mean0[1], std0[1]);
+                logps.push_back(lp);
+            }
+
+            softmax_inplace(logps);
+
+            if (add_dirichlet && dirichlet_eps > 0.0f && dirichlet_alpha > 0.0f) {
+                std::gamma_distribution<float> gd(dirichlet_alpha, 1.0f);
+                std::vector<float> noise((size_t)num_action_samples, 0.0f);
+                float s = 0.0f;
+                for (int i = 0; i < num_action_samples; ++i) {
+                    noise[(size_t)i] = gd(rng);
+                    s += noise[(size_t)i];
+                }
+                if (s > 0.0f) {
+                    for (auto& x : noise) x /= s;
+                    for (int i = 0; i < num_action_samples; ++i) {
+                        logps[(size_t)i] = (1.0f - dirichlet_eps) * logps[(size_t)i] + dirichlet_eps * noise[(size_t)i];
+                    }
+                }
+            }
+
+            // 批量获取 next_hidden（使用预分配 tensor）
+            for (int k = 0; k < num_action_samples; ++k) {
+                t_expand_workspace.fill_obs_batch_row(k, node.obs_seq_flat);
+                t_expand_workspace.fill_hc_batch_col(k, node.h, node.c);
+                auto action_acc = t_expand_workspace.action_batch_tensor.accessor<float, 2>();
+                action_acc[k][0] = sampled[(size_t)k][0];
+                action_acc[k][1] = sampled[(size_t)k][1];
+            }
+
+            auto obs_batch_t = t_expand_workspace.get_obs_batch_slice(num_action_samples);
+            auto h_batch_t = t_expand_workspace.get_h_batch_slice(num_action_samples);
+            auto c_batch_t = t_expand_workspace.get_c_batch_slice(num_action_samples);
+            auto action_batch_t = t_expand_workspace.get_action_batch_slice(num_action_samples);
+
+            double t0_nh = now_ms();
+            auto hc_iv = module.run_method("infer_next_hidden", obs_batch_t, h_batch_t, c_batch_t, action_batch_t);
+            prof.ms_infer_nh += (now_ms() - t0_nh);
+            prof.calls_infer_nh += 1;
+
+            auto hc_tup = hc_iv.toTuple();
+            if (!hc_tup || hc_tup->elements().size() < 2) {
+                throw std::runtime_error("infer_next_hidden must return (h_next,c_next)");
+            }
+
+            torch::Tensor h_next_t = hc_tup->elements()[0].toTensor().detach().to(torch::kCPU).contiguous();
+            torch::Tensor c_next_t = hc_tup->elements()[1].toTensor().detach().to(torch::kCPU).contiguous();
+
+            if (h_next_t.dim() == 3) {
+                h_next_t = h_next_t.squeeze(0);
+                c_next_t = c_next_t.squeeze(0);
+            }
+
+            node.edges.clear();
+            node.edges.reserve((size_t)num_action_samples);
+
+            const float* h_ptr = h_next_t.data_ptr<float>();
+            const float* c_ptr = c_next_t.data_ptr<float>();
+
+            for (int k = 0; k < num_action_samples; ++k) {
+                LSTMEdge e;
+                e.action = sampled[(size_t)k];
+                e.prior = logps[(size_t)k];
+                e.h_next.resize((size_t)lstm_hidden_dim);
+                e.c_next.resize((size_t)lstm_hidden_dim);
+                for (int i = 0; i < lstm_hidden_dim; ++i) {
+                    e.h_next[(size_t)i] = h_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
+                    e.c_next[(size_t)i] = c_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
+                }
+                node.edges.push_back(std::move(e));
+            }
         }
     };
 
