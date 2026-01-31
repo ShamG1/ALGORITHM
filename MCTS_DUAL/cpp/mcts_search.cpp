@@ -1129,7 +1129,10 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
     }
 
     // init expand workspace for this thread (preallocated buffers)
-    t_expand_workspace.init(num_action_samples, seq_len, obs_dim, lstm_hidden_dim, device);
+    // NOTE: if batch-expanding multiple nodes, we need a larger workspace than num_action_samples.
+    const int batch_expand_nodes = int(std::max(1, std::atoi(std::getenv("MCTS_TS_BATCH_EXPAND_NODES") ? std::getenv("MCTS_TS_BATCH_EXPAND_NODES") : "1")));
+    const int expand_workspace_max_b = std::max(num_action_samples, batch_expand_nodes * num_action_samples);
+    t_expand_workspace.init(expand_workspace_max_b, seq_len, obs_dim, lstm_hidden_dim, device);
 
     auto expand_node = [&](LSTMNode& node, bool add_dirichlet) {
         t_expand_workspace.ensure_tensors_allocated();
@@ -1250,10 +1253,16 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
                 e.h_next.resize((size_t)lstm_hidden_dim);
                 e.c_next.resize((size_t)lstm_hidden_dim);
 
-                for (int i = 0; i < lstm_hidden_dim; ++i) {
-                    e.h_next[(size_t)i] = h_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
-                    e.c_next[(size_t)i] = c_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
-                }
+                std::memcpy(
+                    e.h_next.data(),
+                    h_ptr + (size_t)k * (size_t)lstm_hidden_dim,
+                    sizeof(float) * (size_t)lstm_hidden_dim
+                );
+                std::memcpy(
+                    e.c_next.data(),
+                    c_ptr + (size_t)k * (size_t)lstm_hidden_dim,
+                    sizeof(float) * (size_t)lstm_hidden_dim
+                );
                 node.edges.push_back(std::move(e));
             }
 
@@ -1365,10 +1374,16 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
                 e.prior = logps[(size_t)k];
                 e.h_next.resize((size_t)lstm_hidden_dim);
                 e.c_next.resize((size_t)lstm_hidden_dim);
-                for (int i = 0; i < lstm_hidden_dim; ++i) {
-                    e.h_next[(size_t)i] = h_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
-                    e.c_next[(size_t)i] = c_ptr[(size_t)k * (size_t)lstm_hidden_dim + (size_t)i];
-                }
+                std::memcpy(
+                    e.h_next.data(),
+                    h_ptr + (size_t)k * (size_t)lstm_hidden_dim,
+                    sizeof(float) * (size_t)lstm_hidden_dim
+                );
+                std::memcpy(
+                    e.c_next.data(),
+                    c_ptr + (size_t)k * (size_t)lstm_hidden_dim,
+                    sizeof(float) * (size_t)lstm_hidden_dim
+                );
                 node.edges.push_back(std::move(e));
             }
         }
@@ -1441,7 +1456,18 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
             nodes.push_back(std::move(child));
             e.child = child_idx;
 
-            expand_node(nodes[(size_t)child_idx], false);
+            // Batch-expand newly created children to reduce TorchScript call overhead.
+            // Controlled by env var MCTS_TS_BATCH_EXPAND_NODES (default 1 = disabled).
+            static thread_local std::vector<int> pending_expand;
+            pending_expand.push_back(child_idx);
+
+            const int batch_n = batch_expand_nodes;
+            if ((int)pending_expand.size() >= batch_n) {
+                for (int idx : pending_expand) {
+                    expand_node(nodes[(size_t)idx], false);
+                }
+                pending_expand.clear();
+            }
 
             float leaf_value = nodes[(size_t)child_idx].V;
             float leaf_backup = rollout_return + std::pow(gamma, float(rollout_depth)) * leaf_value;

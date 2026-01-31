@@ -1,4 +1,4 @@
-Training started at 2026-01-31 14:56:48.913912
+Training started at 2026-01-31 20:35:18.866487
 Num agents: 6
 Num lanes: 2
 Use team reward: True
@@ -21,7 +21,8 @@ Removed old TorchScript model.
   infer_policy_value test (3D h/c): mean=torch.Size([1, 2]), std=torch.Size([1, 2]), value=torch.Size([1, 1])
   infer_next_hidden test (3D h/c): hn=torch.Size([1, 1, 128]), cn=torch.Size([1, 1, 128])
 Direct TorchScript export successful (no freeze/optimize).
-TorchScript model created successfully (3205326 bytes).
+TorchScript model created successfully (3207566 bytes).
 ================================================================================
 Starting Multi-Agent MCTS Training (Optimized)
 ================================================================================
+Episode     1 | Reward:  -32.79 (Total: -196.73) | Length:   500 | Time: 15.9s
