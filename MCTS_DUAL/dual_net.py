@@ -1,5 +1,6 @@
 # --- networks.py ---
 # Dual Network (Policy + Value) with LSTM for MCTS
+# Optimized version with bug fixes and performance improvements.
 
 import torch
 import torch.nn as nn
@@ -38,9 +39,11 @@ class DualNetwork(nn.Module):
     ):
         super(DualNetwork, self).__init__()
         
+        self.obs_dim = obs_dim  # Store for external access
         self.use_lstm = use_lstm
         self.sequence_length = sequence_length
         self.action_dim = action_dim
+        self.lstm_hidden_dim = lstm_hidden_dim  # Store for external access
         self.global_state_dim = int(global_state_dim)
         self.use_centralized_critic = bool(use_centralized_critic)
         
@@ -235,16 +238,17 @@ class DualNetwork(nn.Module):
         
         if deterministic:
             action = policy_mean
-            log_prob = torch.zeros(policy_mean.shape[0], 1).to(policy_mean.device)
+            log_prob = torch.zeros(policy_mean.shape[0], 1, device=policy_mean.device)
         else:
             dist = torch.distributions.Normal(policy_mean, policy_std)
             action = dist.sample()
             log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
             action = torch.clamp(action, -1.0, 1.0)
         
+        # FIXED: Proper return statement structure
         if self.use_lstm:
             return action, log_prob, new_hidden
-            return action, log_prob
+        return action, log_prob
 
     def next_hidden(
         self,
@@ -290,6 +294,8 @@ class DualNetwork(nn.Module):
 
 
 class MCTSInferWrapper(nn.Module):
+    """TorchScript-compatible wrapper for MCTS inference."""
+    
     def __init__(self, net: DualNetwork):
         super().__init__()
         self.net = net

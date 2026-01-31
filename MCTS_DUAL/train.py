@@ -1,11 +1,16 @@
 # --- train.py ---
-# Multi-Agent MCTS Training Script (Optimized Version)
-# 优化：共享内存通信、减少序列化开销
+# Multi-Agent MCTS Training Script (Heavily Optimized Version)
+# Optimizations:
+# - Event-based synchronization instead of busy-wait polling
+# - Weight sync only at episode boundaries
+# - Pre-allocated tensor buffers
+# - Workers use CPU for inference (faster for small networks)
 
 import os
 import sys
 import time
 import struct
+import queue
 
 # Suppress pygame messages in worker processes (set before any pygame imports)
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
@@ -21,6 +26,10 @@ import numpy as np
 import torch
 import torch.optim as optim
 
+# Suppress torch.compile errors in forked processes
+if hasattr(torch, '_dynamo'):
+    torch._dynamo.config.suppress_errors = True
+
 # Thread settings:
 # - `set_num_threads` is safe and can be applied multiple times.
 # - `set_num_interop_threads` MUST be called before any parallel work starts;
@@ -32,7 +41,7 @@ from collections import deque
 import csv
 import multiprocessing as mp
 from multiprocessing import shared_memory
-from typing import Optional
+from typing import Optional, Dict, List, Any
 try:
     from tqdm import tqdm
 except ImportError:
@@ -51,73 +60,81 @@ except ImportError:
 
 
 # ============================================================================
-# 共享内存缓冲区类（优化进程间通信）
+# Optimized Shared Memory Buffer with Event-Based Synchronization
 # ============================================================================
 
 class SharedMemoryBuffer:
     """
-    用于进程间通信的共享内存缓冲区
-    避免Queue的序列化/反序列化开销
+    Optimized shared memory buffer with Event-based synchronization.
+    Eliminates busy-wait polling for significant performance improvement.
     """
     def __init__(self, num_agents: int, obs_dim: int, action_dim: int = 2):
         self.num_agents = num_agents
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         
-        # 计算缓冲区大小
+        # Calculate buffer size
         self.obs_size = num_agents * obs_dim * 4  # float32
         self.action_size = num_agents * action_dim * 4
-        self.flags_size = num_agents * 4 * 2  # ready_flags + done_flags
         
-        self.total_size = self.obs_size + self.action_size + self.flags_size
+        self.total_size = self.obs_size + self.action_size
         
-        # 创建共享内存
+        # Create shared memory
         self._shm = shared_memory.SharedMemory(create=True, size=self.total_size)
         
-        # 计算偏移量
+        # Calculate offsets
         self._obs_offset = 0
         self._action_offset = self.obs_size
-        self._ready_offset = self.obs_size + self.action_size
-        self._done_offset = self._ready_offset + num_agents * 4
         
-        self._clear_flags()
+        # Event-based synchronization (replaces busy-wait polling)
+        self._ready_events = [mp.Event() for _ in range(num_agents)]
+        self._done_events = [mp.Event() for _ in range(num_agents)]
+        self._all_done_event = mp.Event()
+        
+        # Pre-allocate numpy arrays for faster read/write
+        self._obs_array = np.zeros((num_agents, obs_dim), dtype=np.float32)
+        self._action_array = np.zeros((num_agents, action_dim), dtype=np.float32)
     
     @property
     def name(self):
         return self._shm.name
     
-    def _clear_flags(self):
-        buf = self._shm.buf
-        for i in range(self.num_agents):
-            struct.pack_into('i', buf, self._ready_offset + i * 4, 0)
-            struct.pack_into('i', buf, self._done_offset + i * 4, 0)
+    @property
+    def ready_events(self):
+        return self._ready_events
+    
+    @property
+    def done_events(self):
+        return self._done_events
     
     def write_all_observations(self, obs_array: np.ndarray):
+        """Write all observations to shared memory."""
         buf = self._shm.buf
-        obs_bytes = obs_array.astype(np.float32).tobytes()
+        obs_bytes = np.ascontiguousarray(obs_array, dtype=np.float32).tobytes()
         buf[self._obs_offset:self._obs_offset + len(obs_bytes)] = obs_bytes
     
     def read_all_actions(self) -> np.ndarray:
+        """Read all actions from shared memory."""
         buf = self._shm.buf
         action_bytes = bytes(buf[self._action_offset:self._action_offset + self.action_size])
         return np.frombuffer(action_bytes, dtype=np.float32).reshape(self.num_agents, self.action_dim).copy()
     
-    def set_all_ready(self):
-        buf = self._shm.buf
-        for i in range(self.num_agents):
-            struct.pack_into('i', buf, self._ready_offset + i * 4, 1)
+    def signal_all_ready(self):
+        """Signal all workers to start processing."""
+        self._all_done_event.clear()
+        for e in self._done_events:
+            e.clear()
+        for e in self._ready_events:
+            e.set()
     
-    def all_done(self) -> bool:
-        buf = self._shm.buf
-        for i in range(self.num_agents):
-            if struct.unpack_from('i', buf, self._done_offset + i * 4)[0] == 0:
-                return False
-        return True
+    def wait_all_done(self, timeout: float = 60.0) -> bool:
+        """Wait for all workers to complete. Returns True if successful."""
+        return self._all_done_event.wait(timeout)
     
-    def clear_all_done(self):
-        buf = self._shm.buf
-        for i in range(self.num_agents):
-            struct.pack_into('i', buf, self._done_offset + i * 4, 0)
+    def check_and_signal_all_done(self):
+        """Check if all workers are done and signal the main event."""
+        if all(e.is_set() for e in self._done_events):
+            self._all_done_event.set()
     
     def close(self):
         try:
@@ -128,8 +145,11 @@ class SharedMemoryBuffer:
 
 
 class SharedMemoryBufferClient:
-    """共享内存缓冲区客户端（用于worker进程）"""
-    def __init__(self, shm_name: str, num_agents: int, obs_dim: int, action_dim: int = 2):
+    """Optimized shared memory buffer client for worker processes."""
+    
+    def __init__(self, shm_name: str, num_agents: int, obs_dim: int, action_dim: int = 2,
+                 ready_event: mp.Event = None, done_event: mp.Event = None,
+                 all_done_event: mp.Event = None, done_events_list: List[mp.Event] = None):
         self.num_agents = num_agents
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -139,34 +159,46 @@ class SharedMemoryBufferClient:
         
         self._obs_offset = 0
         self._action_offset = self.obs_size
-        self._ready_offset = self.obs_size + self.action_size
-        self._done_offset = self._ready_offset + num_agents * 4
         
         self._shm = shared_memory.SharedMemory(name=shm_name)
+        
+        # Event references
+        self._ready_event = ready_event
+        self._done_event = done_event
+        self._all_done_event = all_done_event
+        self._done_events_list = done_events_list
     
     def read_observation(self, agent_id: int) -> np.ndarray:
+        """Read observation for a specific agent."""
         buf = self._shm.buf
         offset = self._obs_offset + agent_id * self.obs_dim * 4
         obs_bytes = bytes(buf[offset:offset + self.obs_dim * 4])
         return np.frombuffer(obs_bytes, dtype=np.float32).copy()
     
     def write_action(self, agent_id: int, action: np.ndarray):
+        """Write action for a specific agent."""
         buf = self._shm.buf
         offset = self._action_offset + agent_id * self.action_dim * 4
-        action_bytes = action.astype(np.float32).tobytes()
+        action_bytes = np.ascontiguousarray(action, dtype=np.float32).tobytes()
         buf[offset:offset + len(action_bytes)] = action_bytes
     
-    def is_ready(self, agent_id: int) -> bool:
-        buf = self._shm.buf
-        return struct.unpack_from('i', buf, self._ready_offset + agent_id * 4)[0] != 0
+    def wait_ready(self, timeout: float = 1.0) -> bool:
+        """Wait for ready signal."""
+        if self._ready_event is None:
+            return False
+        result = self._ready_event.wait(timeout)
+        if result:
+            self._ready_event.clear()
+        return result
     
-    def clear_ready(self, agent_id: int):
-        buf = self._shm.buf
-        struct.pack_into('i', buf, self._ready_offset + agent_id * 4, 0)
-    
-    def set_done(self, agent_id: int):
-        buf = self._shm.buf
-        struct.pack_into('i', buf, self._done_offset + agent_id * 4, 1)
+    def signal_done(self):
+        """Signal that this worker is done."""
+        if self._done_event is not None:
+            self._done_event.set()
+        # Check if all workers are done
+        if self._done_events_list is not None and self._all_done_event is not None:
+            if all(e.is_set() for e in self._done_events_list):
+                self._all_done_event.set()
     
     def close(self):
         try:
@@ -176,7 +208,50 @@ class SharedMemoryBufferClient:
 
 
 # ============================================================================
-# 全局配置和工具函数
+# Worker Tensor Cache for Reduced Allocations
+# ============================================================================
+
+class WorkerTensorCache:
+    """Pre-allocated tensor cache for worker processes."""
+    
+    def __init__(self, obs_dim: int, seq_len: int, hidden_dim: int, device: str):
+        self.device = torch.device(device)
+        self.obs_dim = obs_dim
+        self.seq_len = seq_len
+        self.hidden_dim = hidden_dim
+        
+        # Pre-allocate buffers
+        self.obs_buffer = torch.zeros(1, seq_len, obs_dim, dtype=torch.float32)
+        self.h_buffer = torch.zeros(1, 1, hidden_dim, dtype=torch.float32)
+        self.c_buffer = torch.zeros(1, 1, hidden_dim, dtype=torch.float32)
+        
+        # Pin memory for faster CPU->GPU transfer
+        if device != 'cpu':
+            self.obs_buffer = self.obs_buffer.pin_memory()
+            self.h_buffer = self.h_buffer.pin_memory()
+            self.c_buffer = self.c_buffer.pin_memory()
+    
+    def prepare_obs_sequence(self, obs_history: deque) -> torch.Tensor:
+        """Prepare observation sequence tensor from history."""
+        hist_list = list(obs_history)
+        seq_len = self.seq_len
+        
+        # Pad if necessary
+        if len(hist_list) < seq_len:
+            pad = [hist_list[0]] * (seq_len - len(hist_list))
+            hist_list = pad + hist_list
+        else:
+            hist_list = hist_list[-seq_len:]
+        
+        # Copy into buffer
+        for i, obs in enumerate(hist_list):
+            self.obs_buffer[0, i] = torch.from_numpy(np.asarray(obs, dtype=np.float32))
+        
+        return self.obs_buffer.to(self.device, non_blocking=True)
+
+
+# ============================================================================
+# Global Configuration and Utility Functions
 # ============================================================================
 
 def set_global_seeds(seed: int, deterministic: bool = False) -> None:
@@ -196,16 +271,17 @@ def set_global_seeds(seed: int, deterministic: bool = False) -> None:
             pass
 
 
-# Worker进程全局缓存
-_WORKER_CACHE = {
+# Worker process global cache
+_WORKER_CACHE: Dict[str, Any] = {
     "network": None,
     "mcts": None,
     "env": None,
     "env_config": None,
+    "tensor_cache": None,
 }
 
-# 共享权重状态（进程间共享）
-_SHARED_STATE = {
+# Shared weight state (inter-process shared)
+_SHARED_STATE: Dict[str, Any] = {
     "tensors": None,
     "version": None,
     "lock": None
@@ -222,64 +298,92 @@ def _init_worker_shared_state(shared_tensors, version, lock, env_config=None):
 
 
 # ============================================================================
-# 优化版Worker循环（使用共享内存）
+# Optimized Worker Loop with Event-Based Synchronization
 # ============================================================================
 
-def _pinned_worker_loop_shm(agent_id: int, shm_name: str, num_agents: int, obs_dim: int,
-                            control_queue: mp.Queue, stop_event):
+def _pinned_worker_loop_shm_optimized(
+    agent_id: int, 
+    shm_name: str, 
+    num_agents: int, 
+    obs_dim: int,
+    control_queue: mp.Queue, 
+    stop_event: mp.Event,
+    ready_event: mp.Event,
+    done_event: mp.Event,
+    all_done_event: mp.Event,
+    done_events_list: List[mp.Event]
+):
     """
-    优化版pinned worker: 使用共享内存通信
+    Optimized pinned worker with Event-based synchronization.
+    Eliminates busy-wait polling for better performance.
+    
+    NOTE: Workers ALWAYS use CPU to avoid CUDA fork issues.
+    For small FC+LSTM networks, CPU inference is often faster than GPU
+    due to kernel launch overhead for single-sample inference.
     """
-    import time as time_module
     os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
     torch.set_num_threads(1)
+    
+    # Disable torch.compile in workers (incompatible with fork + CUDA)
+    if hasattr(torch, '_dynamo'):
+        torch._dynamo.config.suppress_errors = True
     
     global _WORKER_CACHE, _SHARED_STATE
     _WORKER_CACHE["agent_id"] = agent_id
     _WORKER_CACHE["hidden"] = None
     _WORKER_CACHE["obs_history"] = None
     
-    # 连接共享内存
-    shm_client = SharedMemoryBufferClient(shm_name, num_agents, obs_dim)
+    # Connect to shared memory with event references
+    shm_client = SharedMemoryBufferClient(
+        shm_name, num_agents, obs_dim,
+        ready_event=ready_event,
+        done_event=done_event,
+        all_done_event=all_done_event,
+        done_events_list=done_events_list
+    )
     
     config = None
+    tensor_cache = None
     
     while not stop_event.is_set():
-        # 检查控制命令
+        # Check control commands (non-blocking)
         try:
-            while not control_queue.empty():
-                msg = control_queue.get_nowait()
-                if msg[0] == 'CLOSE':
-                    shm_client.close()
-                    return
-                elif msg[0] == 'RESET':
-                    _WORKER_CACHE["hidden"] = None
-                    oh = _WORKER_CACHE.get("obs_history")
-                    if oh is not None:
-                        try:
-                            oh.clear()
-                        except Exception:
-                            _WORKER_CACHE["obs_history"] = None
-                elif msg[0] == 'CONFIG':
-                    config = msg[1]
+            while True:
+                try:
+                    msg = control_queue.get_nowait()
+                    if msg[0] == 'CLOSE':
+                        shm_client.close()
+                        return
+                    elif msg[0] == 'RESET':
+                        _WORKER_CACHE["hidden"] = None
+                        oh = _WORKER_CACHE.get("obs_history")
+                        if oh is not None:
+                            try:
+                                oh.clear()
+                            except Exception:
+                                _WORKER_CACHE["obs_history"] = None
+                    elif msg[0] == 'CONFIG':
+                        config = msg[1]
+                    elif msg[0] == 'SYNC_WEIGHTS':
+                        # Force weight sync
+                        _WORKER_CACHE["_last_weight_version"] = -1
+                except queue.Empty:
+                    break
         except Exception:
             pass
         
-        # 等待ready标志
-        if not shm_client.is_ready(agent_id):
-            time_module.sleep(0.0001)
+        # Wait for ready signal (blocking with timeout)
+        if not shm_client.wait_ready(timeout=0.5):
             continue
         
-        shm_client.clear_ready(agent_id)
-        
         if config is None:
-            shm_client.set_done(agent_id)
+            shm_client.signal_done()
             continue
         
         try:
             obs_data = shm_client.read_observation(agent_id)
             
-            # 维护观测历史
+            # Maintain observation history
             seq_len = int(config.get('sequence_length', 5))
             if _WORKER_CACHE.get("obs_history") is None:
                 _WORKER_CACHE["obs_history"] = deque(maxlen=seq_len)
@@ -292,8 +396,10 @@ def _pinned_worker_loop_shm(agent_id: int, shm_name: str, num_agents: int, obs_d
             
             _WORKER_CACHE["obs_history"].append(obs_data)
             
-            # 懒初始化
-            device = torch.device(config['device'])
+            # CRITICAL: Workers ALWAYS use CPU to avoid CUDA fork issues
+            # For small networks (FC+LSTM), CPU is often faster for single-sample inference
+            worker_device = torch.device('cpu')
+            
             if _WORKER_CACHE.get("network") is None:
                 try:
                     from .dual_net import DualNetwork
@@ -308,9 +414,24 @@ def _pinned_worker_loop_shm(agent_id: int, shm_name: str, num_agents: int, obs_d
                     lstm_hidden_dim=config['lstm_hidden_dim'],
                     use_lstm=config['use_lstm'],
                     sequence_length=config['sequence_length']
-                ).to(device)
+                ).to(worker_device)
                 net.eval()
+                
+                # NOTE: Do NOT use torch.compile in workers
+                # 1. Incompatible with fork-based multiprocessing + CUDA
+                # 2. For small networks, compilation overhead > benefit
+                
                 _WORKER_CACHE["network"] = net
+                _WORKER_CACHE["worker_device"] = worker_device
+                
+                # Initialize tensor cache
+                tensor_cache = WorkerTensorCache(
+                    obs_dim=_OBS_DIM,
+                    seq_len=config['sequence_length'],
+                    hidden_dim=config['lstm_hidden_dim'],
+                    device='cpu'
+                )
+                _WORKER_CACHE["tensor_cache"] = tensor_cache
             
             if _WORKER_CACHE.get("env") is None:
                 try:
@@ -345,7 +466,7 @@ def _pinned_worker_loop_shm(agent_id: int, shm_name: str, num_agents: int, obs_d
                     num_simulations=config['num_simulations'],
                     c_puct=config['c_puct'],
                     temperature=config['temperature'],
-                    device=device,
+                    device='cpu',  # Workers always use CPU
                     rollout_depth=config['rollout_depth'],
                     env_factory=None,
                     all_networks=[_WORKER_CACHE["network"]] * _num_agents,
@@ -357,7 +478,7 @@ def _pinned_worker_loop_shm(agent_id: int, shm_name: str, num_agents: int, obs_d
                 mcts.env_factory = lambda: None
                 _WORKER_CACHE["mcts"] = mcts
             
-            # 同步权重
+            # Sync weights only when version changes
             if _SHARED_STATE.get("version") is not None:
                 last_ver = _WORKER_CACHE.get("_last_weight_version", -1)
                 cur_ver = int(_SHARED_STATE["version"].value)
@@ -382,22 +503,22 @@ def _pinned_worker_loop_shm(agent_id: int, shm_name: str, num_agents: int, obs_d
                     None
                 )
             
-            # 更新隐藏状态
+            # Update hidden state (on CPU)
             if config.get('use_lstm') and isinstance(search_stats, dict) and ("h_next" in search_stats):
                 lstm_hidden_dim = int(config.get('lstm_hidden_dim', 128))
                 h_np = np.asarray(search_stats.get("h_next"), dtype=np.float32).reshape(-1)
                 c_np = np.asarray(search_stats.get("c_next"), dtype=np.float32).reshape(-1)
                 
                 if h_np.size != lstm_hidden_dim or c_np.size != lstm_hidden_dim:
-                    hn = torch.zeros(1, 1, lstm_hidden_dim, device=device, dtype=torch.float32)
-                    cn = torch.zeros(1, 1, lstm_hidden_dim, device=device, dtype=torch.float32)
+                    hn = torch.zeros(1, 1, lstm_hidden_dim, dtype=torch.float32)
+                    cn = torch.zeros(1, 1, lstm_hidden_dim, dtype=torch.float32)
                 else:
-                    hn = torch.as_tensor(h_np, device=device).view(1, 1, lstm_hidden_dim)
-                    cn = torch.as_tensor(c_np, device=device).view(1, 1, lstm_hidden_dim)
+                    hn = torch.as_tensor(h_np).view(1, 1, lstm_hidden_dim)
+                    cn = torch.as_tensor(c_np).view(1, 1, lstm_hidden_dim)
                 
                 _WORKER_CACHE["hidden"] = (hn, cn)
             
-            action_array = np.array(action, dtype=np.float32).flatten()
+            action_array = np.asarray(action, dtype=np.float32).flatten()
             shm_client.write_action(agent_id, action_array)
             
         except Exception as e:
@@ -406,20 +527,18 @@ def _pinned_worker_loop_shm(agent_id: int, shm_name: str, num_agents: int, obs_d
             sys.stdout.flush()
             shm_client.write_action(agent_id, np.zeros(2, dtype=np.float32))
         
-        shm_client.set_done(agent_id)
+        shm_client.signal_done()
     
     shm_client.close()
 
 
 # ============================================================================
-# 原版Worker循环（保留作为后备）
+# Legacy Worker Loop (kept for backwards compatibility)
 # ============================================================================
 
 def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
     """
-    Pinned worker: one process per agent, holding its own recurrent state.
-    Receives messages: ('RESET',), ('STEP', obs, config), ('CLOSE',)
-    Sends: (agent_id, action_array)
+    Legacy pinned worker using Queue (kept for backwards compatibility).
     """
     os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
     torch.set_num_threads(1)
@@ -432,7 +551,8 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
     while True:
         try:
             msg = in_q.get()
-            if not msg: continue
+            if not msg: 
+                continue
             mtype = msg[0]
 
             if mtype == 'CLOSE':
@@ -502,8 +622,10 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
                 })
 
             if _WORKER_CACHE.get("mcts") is None:
-                try: from .mcts import MCTS
-                except ImportError: from mcts import MCTS
+                try: 
+                    from .mcts import MCTS
+                except ImportError: 
+                    from mcts import MCTS
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
                 num_agents = int(env_cfg.get('num_agents', 1))
                 mcts = MCTS(
@@ -542,18 +664,6 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
                     hidden_state_tensor,
                     None
                 )
-
-            try:
-                if agent_id == 0 and int(config.get('episode', 0)) == 1 and int(config.get('step', 0)) == 0:
-                    if not _WORKER_CACHE.get('_printed_profile', False):
-                        prof = None
-                        if isinstance(search_stats, dict):
-                            prof = search_stats.get('profile')
-                        sys.stdout.write(f"[C++Profile] {prof}\n")
-                        sys.stdout.flush()
-                        _WORKER_CACHE['_printed_profile'] = True
-            except Exception:
-                pass
 
             if config.get('use_lstm') and isinstance(search_stats, dict) and ("h_next" in search_stats):
                 lstm_hidden_dim = int(config.get('lstm_hidden_dim', 128))
@@ -652,19 +762,19 @@ def generate_ego_routes(num_agents: int, num_lanes: int):
 
 
 # ============================================================================
-# MCTSTrainer类
+# MCTSTrainer Class (Heavily Optimized)
 # ============================================================================
 
 class MCTSTrainer:
-    """Multi-Agent MCTS Trainer with shared memory optimization."""
+    """Multi-Agent MCTS Trainer with heavy performance optimizations."""
     
     def close(self):
         """Release resources including shared memory."""
-        # 设置停止事件
+        # Set stop event
         if hasattr(self, '_stop_event') and self._stop_event is not None:
             self._stop_event.set()
         
-        # 发送关闭命令（优化版）
+        # Send close commands (optimized version)
         if hasattr(self, '_control_queues') and self._control_queues is not None:
             for q in self._control_queues:
                 try:
@@ -672,7 +782,7 @@ class MCTSTrainer:
                 except Exception:
                     pass
         
-        # 发送关闭命令（原版）
+        # Send close commands (legacy version)
         if hasattr(self, '_pinned_in_queues') and self._pinned_in_queues is not None:
             for q in self._pinned_in_queues:
                 try:
@@ -680,7 +790,7 @@ class MCTSTrainer:
                 except Exception:
                     pass
         
-        # 等待worker进程结束
+        # Wait for worker processes to end
         if hasattr(self, '_pinned_procs') and self._pinned_procs is not None:
             for p in self._pinned_procs:
                 try:
@@ -690,7 +800,7 @@ class MCTSTrainer:
                 except Exception:
                     pass
         
-        # 清理共享内存
+        # Clean up shared memory
         if hasattr(self, '_shm_buffer') and self._shm_buffer is not None:
             try:
                 self._shm_buffer.close()
@@ -698,7 +808,7 @@ class MCTSTrainer:
                 pass
             self._shm_buffer = None
         
-        # 清理环境
+        # Clean up environment
         try:
             if hasattr(self, 'env') and hasattr(self.env, 'close'):
                 self.env.close()
@@ -741,7 +851,7 @@ class MCTSTrainer:
         use_tqdm: bool = False,
         seed: Optional[int] = None,
         deterministic: bool = False,
-        use_shm: bool = True  # 新增：是否使用共享内存优化
+        use_shm: bool = True
     ):
         self.num_agents = num_agents
         self.num_lanes = num_lanes
@@ -762,9 +872,9 @@ class MCTSTrainer:
         self.parallel_mcts = parallel_mcts
         self.max_workers = max_workers if max_workers is not None else num_agents
         self.use_tqdm = use_tqdm and tqdm is not None
-        self.use_shm = use_shm  # 是否使用共享内存
+        self.use_shm = use_shm
         
-        # Worker资源
+        # Worker resources
         self._pinned_in_queues = None
         self._pinned_out_queues = None
         self._pinned_procs = None
@@ -811,6 +921,11 @@ class MCTSTrainer:
             sequence_length=5
         ).to(self.device)
         
+        # NOTE: torch.compile is disabled because:
+        # 1. It's incompatible with fork-based multiprocessing + CUDA
+        # 2. For small FC+LSTM networks, compilation overhead > benefit
+        # 3. Workers use CPU anyway for better single-sample inference speed
+        
         self.networks = [self.network] * num_agents
         
         def create_env_copy():
@@ -846,7 +961,7 @@ class MCTSTrainer:
         self.enable_rollout_debug = False
         self.enable_debug = False
 
-        # 共享权重
+        # Shared weights
         if not hasattr(self, "_shared_weight_tensors"):
             self._shared_weight_tensors = []
 
@@ -884,6 +999,7 @@ class MCTSTrainer:
             f.write(f"Respawn enabled: {respawn_enabled}\n")
             f.write(f"MCTS simulations: {mcts_simulations}\n")
             f.write(f"Use shared memory: {use_shm}\n")
+            f.write(f"Main device: {device} (workers use CPU)\n")
             f.write("Generated routes:\n")
             for i, route in enumerate(ego_routes):
                 f.write(f"  Agent {i}: {route[0]} -> {route[1]}\n")
@@ -893,13 +1009,16 @@ class MCTSTrainer:
         with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['Episode', 'Total_Reward', 'Mean_Reward', 'Episode_Length', 'Episode_Duration_Sec'])
+        
+        # Generate TorchScript model immediately for optimized MCTS inference
+        self._ensure_torchscript_model()
     
     def log(self, message: str):
         with open(self.log_file, 'a') as f:
             f.write(message + "\n")
     
     def _start_pinned_workers_shm(self):
-        """使用共享内存启动worker进程"""
+        """Start worker processes with optimized Event-based synchronization."""
         if self._pinned_procs is not None:
             return
         
@@ -927,16 +1046,26 @@ class MCTSTrainer:
         
         for i in range(self.num_agents):
             p = mp.Process(
-                target=_pinned_worker_loop_shm,
-                args=(i, self._shm_buffer.name, self.num_agents, OBS_DIM,
-                      self._control_queues[i], self._stop_event)
+                target=_pinned_worker_loop_shm_optimized,
+                args=(
+                    i, 
+                    self._shm_buffer.name, 
+                    self.num_agents, 
+                    OBS_DIM,
+                    self._control_queues[i], 
+                    self._stop_event,
+                    self._shm_buffer.ready_events[i],
+                    self._shm_buffer.done_events[i],
+                    self._shm_buffer._all_done_event,
+                    self._shm_buffer.done_events  # Pass all done events for checking
+                )
             )
             p.daemon = True
             p.start()
             self._pinned_procs.append(p)
 
     def _start_pinned_workers(self):
-        """原版worker启动（使用Queue）"""
+        """Legacy worker startup using Queue."""
         if self._pinned_procs is not None:
             return
 
@@ -970,28 +1099,36 @@ class MCTSTrainer:
             self._pinned_procs.append(p)
 
     def _broadcast_weights_if_dirty(self):
+        """Broadcast weights to shared memory only if changed."""
         if not getattr(self, "_weights_dirty", True):
             return
+        
         with self._shared_weight_lock:
             state = self.network.state_dict()
             for src, dst in zip(state.values(), self._shared_weight_tensors):
-                dst.copy_(src.detach().to("cpu"))
+                dst.copy_(src.detach().cpu(), non_blocking=True)
+            # Ensure copy is complete
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             self._shared_weight_version.value += 1
+        
         self._weights_dirty = False
 
     def _parallel_mcts_search_shm(self, obs, env_state, episode: int = 0, step: int = 0):
-        """优化版并行MCTS搜索：使用共享内存通信"""
+        """Optimized parallel MCTS search with Event-based synchronization."""
         if self._pinned_procs is None:
             self._start_pinned_workers_shm()
         
-        self._broadcast_weights_if_dirty()
+        # OPTIMIZATION: Only sync weights at episode start
+        if step == 0:
+            self._broadcast_weights_if_dirty()
         
         config = {
             'hidden_dim': 256,
             'lstm_hidden_dim': 128,
             'use_lstm': self.use_lstm,
             'sequence_length': 5,
-            'device': str(self.device),
+            'device': str(self.device),  # Main process device (workers ignore this, use CPU)
             'num_simulations': self.mcts_simulations,
             'c_puct': 1.0,
             'temperature': 1.0,
@@ -1003,37 +1140,32 @@ class MCTSTrainer:
             'ts_model_path': os.path.join(self.save_dir, 'mcts_infer.pt'),
         }
         
+        # Send config and reset only at episode start
         if step == 0:
             for q in self._control_queues:
                 q.put(('RESET',))
                 q.put(('CONFIG', config))
         
+        # Write observations
         obs_array = np.asarray(obs, dtype=np.float32)
         self._shm_buffer.write_all_observations(obs_array)
         
-        self._shm_buffer.clear_all_done()
-        self._shm_buffer.set_all_ready()
+        # Signal workers and wait for completion (Event-based, no polling!)
+        self._shm_buffer.signal_all_ready()
         
-        max_wait_iterations = 1000000
-        wait_count = 0
-        while not self._shm_buffer.all_done():
-            wait_count += 1
-            if wait_count > max_wait_iterations:
-                self.log(f"[WARNING] MCTS search timeout at episode {episode}, step {step}")
-                break
-            if wait_count % 1000 == 0:
-                import time as time_module
-                time_module.sleep(0.0001)
+        if not self._shm_buffer.wait_all_done(timeout=60.0):
+            self.log(f"[WARNING] MCTS search timeout at episode {episode}, step {step}")
         
-        actions = self._shm_buffer.read_all_actions()
-        return actions
+        return self._shm_buffer.read_all_actions()
 
     def _parallel_mcts_search(self, obs, env_state, episode: int = 0, step: int = 0):
-        """原版并行MCTS搜索：使用Queue"""
+        """Legacy parallel MCTS search using Queue."""
         if self._pinned_procs is None:
             self._start_pinned_workers()
 
-        self._broadcast_weights_if_dirty()
+        # OPTIMIZATION: Only sync weights at episode start
+        if step == 0:
+            self._broadcast_weights_if_dirty()
 
         config = {
             'hidden_dim': 256,
@@ -1066,21 +1198,28 @@ class MCTSTrainer:
 
         return np.asarray(actions, dtype=np.float32)
     
+    def _ensure_torchscript_model(self):
+        """Generate TorchScript model for optimized MCTS inference."""
+        ts_model_path = os.path.join(self.save_dir, 'mcts_infer.pt')
+        
+        # Always regenerate to ensure compatibility
+        self.log(f"Generating TorchScript model at {ts_model_path}...")
+        try:
+            # Delete old file if exists (may be incompatible format)
+            if os.path.exists(ts_model_path):
+                os.remove(ts_model_path)
+            bootstrap_path = os.path.join(self.save_dir, '_bootstrap.pth')
+            self.save_checkpoint(bootstrap_path, episode=0)
+            self.log(f"TorchScript model created successfully.")
+        except Exception as e:
+            self.log(f"[WARNING] Failed to create TorchScript model: {e}")
+            self.log(f"Will use Python callbacks (slower).")
+    
     def train(self):
         """Main training loop."""
         self.log("=" * 80)
-        self.log("Starting Multi-Agent MCTS Training")
+        self.log("Starting Multi-Agent MCTS Training (Optimized)")
         self.log("=" * 80)
-
-        ts_model_path = os.path.join(self.save_dir, 'mcts_infer.pt')
-        if self.use_lstm and not os.path.exists(ts_model_path):
-            self.log(f"TorchScript model not found at {ts_model_path}, creating bootstrap version...")
-            try:
-                bootstrap_path = os.path.join(self.save_dir, '_bootstrap.pth')
-                self.save_checkpoint(bootstrap_path, episode=0)
-                self.log(f"Bootstrap TorchScript model created.")
-            except Exception as e:
-                self.log(f"[ERROR] Failed to create bootstrap TorchScript model: {e}")
 
         try:
             if self.seed is not None:
@@ -1183,7 +1322,6 @@ class MCTSTrainer:
                     
                     try:
                         if self.parallel_mcts and self.num_agents > 1:
-                            # 根据配置选择共享内存或Queue版本
                             if self.use_shm:
                                 actions = self._parallel_mcts_search_shm(obs, env_state, episode=episode, step=episode_length)
                             else:
@@ -1391,18 +1529,18 @@ class MCTSTrainer:
     
     def _update_networks(self, obs, actions, rewards, next_obs, done, global_states=None, next_global_states=None):
         """Update networks using experience buffer."""
-        for i in range(self.num_agents):
-            if not hasattr(self, 'buffer'):
-                self.buffer = {
-                    'obs': [[] for _ in range(self.num_agents)],
-                    'next_obs': [[] for _ in range(self.num_agents)],
-                    'global_state': [[] for _ in range(self.num_agents)],
-                    'next_global_state': [[] for _ in range(self.num_agents)],
-                    'actions': [[] for _ in range(self.num_agents)],
-                    'rewards': [[] for _ in range(self.num_agents)],
-                    'dones': [[] for _ in range(self.num_agents)],
-                }
+        if not hasattr(self, 'buffer'):
+            self.buffer = {
+                'obs': [[] for _ in range(self.num_agents)],
+                'next_obs': [[] for _ in range(self.num_agents)],
+                'global_state': [[] for _ in range(self.num_agents)],
+                'next_global_state': [[] for _ in range(self.num_agents)],
+                'actions': [[] for _ in range(self.num_agents)],
+                'rewards': [[] for _ in range(self.num_agents)],
+                'dones': [[] for _ in range(self.num_agents)],
+            }
 
+        for i in range(self.num_agents):
             self.buffer['obs'][i].append(np.asarray(obs[i], dtype=np.float32))
             self.buffer['next_obs'][i].append(np.asarray(next_obs[i], dtype=np.float32))
             self.buffer['actions'][i].append(np.asarray(actions[i], dtype=np.float32))
@@ -1558,7 +1696,7 @@ class MCTSTrainer:
         }
     
     def save_checkpoint(self, path: str, episode: int):
-        """Save training checkpoint and export TorchScript model."""
+        """Save training checkpoint and export optimized TorchScript model."""
         checkpoint = {
             'episode': episode,
             'shared': True,
@@ -1588,14 +1726,32 @@ class MCTSTrainer:
             torchscript_path = os.path.join(os.path.dirname(path), 'policy_net_jit.pt')
             traced.save(torchscript_path)
 
-            wrapper = MCTSInferWrapper(self.network)
+            # Export optimized MCTSInferWrapper
+            wrapper = MCTSInferWrapper(self.network.cpu())
             wrapper.eval()
             scripted = torch.jit.script(wrapper)
+            
+            # Apply optimizations for faster inference
+            try:
+                scripted = torch.jit.freeze(scripted)
+            except Exception:
+                pass
+            try:
+                scripted = torch.jit.optimize_for_inference(scripted)
+            except Exception:
+                pass
+            
             scripted = scripted.to(torch.device('cpu'))
             mcts_infer_path = os.path.join(os.path.dirname(path), 'mcts_infer.pt')
             scripted.save(mcts_infer_path)
+            
+            # Move network back to original device
+            self.network.to(self.device)
+            
         except Exception as e:
             self.log(f"[TorchScript export] Warning: {e}")
+            # Ensure network is back on correct device even if export fails
+            self.network.to(self.device)
     
     def load_checkpoint(self, path: str):
         """Load training checkpoint."""
@@ -1611,6 +1767,7 @@ class MCTSTrainer:
                 self.optimizer.load_state_dict(checkpoint['optimizers_state_dict'][0])
         
         self.stats = checkpoint['stats']
+        self._weights_dirty = True  # Mark weights as dirty after loading
         self.log(f"Checkpoint loaded: {path}")
 
 
@@ -1618,7 +1775,7 @@ def main():
     """Main training function."""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Multi-Agent MCTS Training')
+    parser = argparse.ArgumentParser(description='Multi-Agent MCTS Training (Optimized)')
     parser.add_argument('--num-agents', type=int, default=6, help='Number of agents')
     parser.add_argument('--num-lanes', type=int, default=2, help='Number of lanes per direction')
     parser.add_argument('--max-episodes', type=int, default=100000, help='Max training episodes')
@@ -1627,7 +1784,7 @@ def main():
     parser.add_argument('--rollout-depth', type=int, default=5, help='Number of steps to rollout in environment')
     parser.add_argument('--num-action-samples', type=int, default=3, help='Number of actions to sample per node expansion')
     parser.add_argument('--save-frequency', type=int, default=100, help='Episodes before saving checkpoint')
-    parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu, cuda, or auto)')
+    parser.add_argument('--device', type=str, default='cpu', help='Device for training (cpu or cuda). Workers always use CPU.')
     parser.add_argument('--no-team-reward', action='store_false', dest='use_team_reward', default=True, help='Disable team reward')
     parser.add_argument('--render', action='store_true', help='Render environment')
     parser.add_argument('--show-lane-ids', action='store_true', help='Show lane IDs in render')
@@ -1648,12 +1805,15 @@ def main():
     if args.device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         if device == 'cuda':
-            print(f"CUDA available, using CUDA")
+            print(f"CUDA available, using CUDA for training")
             print(f"{torch.cuda.get_device_name(0)}")
         else:
             print("Using CPU")
     else:
         device = args.device
+    
+    print(f"[INFO] Training device: {device}")
+    print(f"[INFO] Worker inference device: CPU (optimal for small networks)")
 
     if args.seed is not None:
         set_global_seeds(args.seed, deterministic=args.deterministic)
@@ -1680,7 +1840,7 @@ def main():
         use_tqdm=args.tqdm,
         seed=args.seed,
         deterministic=args.deterministic,
-        use_shm=not args.no_shm  # 共享内存优化开关
+        use_shm=not args.no_shm
     )
     
     if args.load_checkpoint:
