@@ -1199,21 +1199,117 @@ class MCTSTrainer:
         return np.asarray(actions, dtype=np.float32)
     
     def _ensure_torchscript_model(self):
-        """Generate TorchScript model for optimized MCTS inference."""
+        """Generate TorchScript model for optimized MCTS inference.
+        
+        This method creates the mcts_infer.pt file BEFORE training starts,
+        ensuring that C++ MCTS can use the pure TorchScript path instead of
+        falling back to slower Python callbacks.
+        """
         ts_model_path = os.path.join(self.save_dir, 'mcts_infer.pt')
         
         # Always regenerate to ensure compatibility
         self.log(f"Generating TorchScript model at {ts_model_path}...")
+        print(f"[INIT] Generating TorchScript model for optimized C++ MCTS...")
+        
         try:
             # Delete old file if exists (may be incompatible format)
             if os.path.exists(ts_model_path):
                 os.remove(ts_model_path)
-            bootstrap_path = os.path.join(self.save_dir, '_bootstrap.pth')
-            self.save_checkpoint(bootstrap_path, episode=0)
-            self.log(f"TorchScript model created successfully.")
+                self.log(f"Removed old TorchScript model.")
+            
+            # Method 1: Try direct TorchScript export (faster, no checkpoint overhead)
+            try:
+                self._export_torchscript_model_direct(ts_model_path)
+            except Exception as direct_err:
+                self.log(f"Direct export failed ({direct_err}), trying via checkpoint...")
+                # Method 2: Fallback to checkpoint-based export
+                bootstrap_path = os.path.join(self.save_dir, '_bootstrap.pth')
+                self.save_checkpoint(bootstrap_path, episode=0)
+            
+            # Verify the file was actually created
+            if os.path.exists(ts_model_path):
+                file_size = os.path.getsize(ts_model_path)
+                self.log(f"TorchScript model created successfully ({file_size} bytes).")
+                print(f"[INIT] TorchScript model ready: {ts_model_path} ({file_size} bytes)")
+                print(f"[INIT] C++ MCTS will use optimized TorchScript path.")
+            else:
+                self.log(f"[ERROR] TorchScript model file was NOT created!")
+                self.log(f"[ERROR] C++ MCTS will fallback to Python callbacks (slower).")
+                print(f"[WARNING] TorchScript model NOT created - will use Python callbacks (slower)")
+                
         except Exception as e:
+            import traceback
             self.log(f"[WARNING] Failed to create TorchScript model: {e}")
+            self.log(f"Traceback: {traceback.format_exc()}")
             self.log(f"Will use Python callbacks (slower).")
+            print(f"[WARNING] TorchScript export failed: {e}")
+            print(f"[WARNING] C++ MCTS will fallback to Python callbacks (slower)")
+    
+    def _export_torchscript_model_direct(self, output_path: str):
+        """Directly export TorchScript model without full checkpoint save.
+        
+        This is faster than save_checkpoint() for initial model generation.
+        
+        NOTE: Do NOT use torch.jit.freeze() or optimize_for_inference()
+        These optimizations can strip @torch.jit.export methods that the C++ backend requires.
+        """
+        try:
+            from .dual_net import MCTSInferWrapper
+        except ImportError:
+            from dual_net import MCTSInferWrapper
+        
+        original_device = next(self.network.parameters()).device
+        original_training = self.network.training
+        
+        try:
+            self.network.eval()
+            self.network.cpu()
+            
+            # Create and script the MCTS inference wrapper
+            wrapper = MCTSInferWrapper(self.network)
+            wrapper.eval()
+            scripted = torch.jit.script(wrapper)
+            
+            # Verify exported methods exist (C++ backend requires these)
+            required_methods = ['infer_policy_value', 'infer_next_hidden']
+            for method_name in required_methods:
+                if not hasattr(scripted, method_name):
+                    raise RuntimeError(f"TorchScript model missing required method: {method_name}")
+            
+            # Test the methods work correctly before saving
+            # IMPORTANT: Use shapes that match C++ backend exactly
+            # C++ passes h/c as (1, 1, H) via make_hc_tensor()
+            seq_len = getattr(self.network, 'sequence_length', 5)
+            hidden_dim = getattr(self.network, 'lstm_hidden_dim', 128)
+            batch_size = 1
+            
+            # Test with BOTH 2D and 3D h/c shapes to ensure compatibility
+            test_obs = torch.zeros(batch_size, seq_len, OBS_DIM)
+            test_action = torch.zeros(batch_size, 2)
+            
+            # Test 1: 2D h/c shape (B, H) - Python callback style
+            test_h_2d = torch.zeros(batch_size, hidden_dim)
+            test_c_2d = torch.zeros(batch_size, hidden_dim)
+            mean, std, value = scripted.infer_policy_value(test_obs, test_h_2d, test_c_2d)
+            self.log(f"  infer_policy_value test (2D h/c): mean={mean.shape}, std={std.shape}, value={value.shape}")
+            hn, cn = scripted.infer_next_hidden(test_obs, test_h_2d, test_c_2d, test_action)
+            self.log(f"  infer_next_hidden test (2D h/c): hn={hn.shape}, cn={cn.shape}")
+            
+            # Test 2: 3D h/c shape (1, B, H) - C++ TorchScript style
+            test_h_3d = torch.zeros(1, batch_size, hidden_dim)
+            test_c_3d = torch.zeros(1, batch_size, hidden_dim)
+            mean, std, value = scripted.infer_policy_value(test_obs, test_h_3d, test_c_3d)
+            self.log(f"  infer_policy_value test (3D h/c): mean={mean.shape}, std={std.shape}, value={value.shape}")
+            hn, cn = scripted.infer_next_hidden(test_obs, test_h_3d, test_c_3d, test_action)
+            self.log(f"  infer_next_hidden test (3D h/c): hn={hn.shape}, cn={cn.shape}")
+            
+            scripted.save(output_path)
+            self.log(f"Direct TorchScript export successful (no freeze/optimize).")
+            
+        finally:
+            # Restore network to original device and training mode
+            self.network.to(original_device)
+            self.network.train(original_training)
     
     def train(self):
         """Main training loop."""
@@ -1726,22 +1822,30 @@ class MCTSTrainer:
             torchscript_path = os.path.join(os.path.dirname(path), 'policy_net_jit.pt')
             traced.save(torchscript_path)
 
-            # Export optimized MCTSInferWrapper
+            # Export MCTSInferWrapper for C++ MCTS
+            # NOTE: Do NOT use torch.jit.freeze() or optimize_for_inference()
+            # These optimizations can strip @torch.jit.export methods that C++ needs
             wrapper = MCTSInferWrapper(self.network.cpu())
             wrapper.eval()
             scripted = torch.jit.script(wrapper)
             
-            # Apply optimizations for faster inference
-            try:
-                scripted = torch.jit.freeze(scripted)
-            except Exception:
-                pass
-            try:
-                scripted = torch.jit.optimize_for_inference(scripted)
-            except Exception:
-                pass
+            # Verify exported methods exist (C++ backend requires these)
+            required_methods = ['infer_policy_value', 'infer_next_hidden']
+            for method_name in required_methods:
+                if not hasattr(scripted, method_name):
+                    raise RuntimeError(f"TorchScript model missing required method: {method_name}")
             
-            scripted = scripted.to(torch.device('cpu'))
+            # Test the methods work correctly
+            test_obs = torch.zeros(1, seq_len, OBS_DIM)
+            test_h = torch.zeros(1, hidden_dim)
+            test_c = torch.zeros(1, hidden_dim)
+            test_action = torch.zeros(1, 2)
+            
+            # Test infer_policy_value
+            _ = scripted.infer_policy_value(test_obs, test_h, test_c)
+            # Test infer_next_hidden
+            _ = scripted.infer_next_hidden(test_obs, test_h, test_c, test_action)
+            
             mcts_infer_path = os.path.join(os.path.dirname(path), 'mcts_infer.pt')
             scripted.save(mcts_infer_path)
             

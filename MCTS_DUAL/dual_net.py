@@ -293,41 +293,211 @@ class DualNetwork(nn.Module):
         return (h1.unsqueeze(0), c1.unsqueeze(0))
 
 
-class MCTSInferWrapper(nn.Module):
-    """TorchScript-compatible wrapper for MCTS inference."""
+class MCTSInferWrapper(torch.jit.ScriptModule):
+    """
+    TorchScript-compatible wrapper for MCTS inference.
+    
+    IMPORTANT: This class inherits from torch.jit.ScriptModule and uses
+    @torch.jit.script_method to ensure methods are correctly serialized
+    and available after save/load.
+    
+    All network layers are copied directly (not held as sub-module reference)
+    to ensure TorchScript can properly trace all operations.
+    """
+    
+    __constants__ = ['obs_dim', 'lstm_hidden_dim', 'use_lstm']
     
     def __init__(self, net: DualNetwork):
         super().__init__()
-        self.net = net
+        
+        # Store constants
+        self.obs_dim: int = net.obs_dim
+        self.lstm_hidden_dim: int = net.lstm_hidden_dim
+        self.use_lstm: bool = net.use_lstm
+        
+        # Copy all layers directly (creates new modules with same weights)
+        # This is crucial - referencing net.xxx would cause TorchScript issues
+        self.fc_input = nn.Linear(net.fc_input.in_features, net.fc_input.out_features)
+        self.fc_input.load_state_dict(net.fc_input.state_dict())
+        
+        self.ln_input = nn.LayerNorm(net.ln_input.normalized_shape)
+        self.ln_input.load_state_dict(net.ln_input.state_dict())
+        
+        self.lstm = nn.LSTM(net.lstm.input_size, net.lstm.hidden_size, batch_first=True)
+        self.lstm.load_state_dict(net.lstm.state_dict())
+        
+        self.fc_shared = nn.Linear(net.fc_shared.in_features, net.fc_shared.out_features)
+        self.fc_shared.load_state_dict(net.fc_shared.state_dict())
+        
+        self.ln_shared = nn.LayerNorm(net.ln_shared.normalized_shape)
+        self.ln_shared.load_state_dict(net.ln_shared.state_dict())
+        
+        self.fc_shared2 = nn.Linear(net.fc_shared2.in_features, net.fc_shared2.out_features)
+        self.fc_shared2.load_state_dict(net.fc_shared2.state_dict())
+        
+        self.ln_shared2 = nn.LayerNorm(net.ln_shared2.normalized_shape)
+        self.ln_shared2.load_state_dict(net.ln_shared2.state_dict())
+        
+        self.policy_fc = nn.Linear(net.policy_fc.in_features, net.policy_fc.out_features)
+        self.policy_fc.load_state_dict(net.policy_fc.state_dict())
+        
+        self.policy_mean = nn.Linear(net.policy_mean.in_features, net.policy_mean.out_features)
+        self.policy_mean.load_state_dict(net.policy_mean.state_dict())
+        
+        self.policy_log_std = nn.Linear(net.policy_log_std.in_features, net.policy_log_std.out_features)
+        self.policy_log_std.load_state_dict(net.policy_log_std.state_dict())
+        
+        self.value_fc = nn.Linear(net.value_fc.in_features, net.value_fc.out_features)
+        self.value_fc.load_state_dict(net.value_fc.state_dict())
+        
+        self.value_head = nn.Linear(net.value_head.in_features, net.value_head.out_features)
+        self.value_head.load_state_dict(net.value_head.state_dict())
+        
+        self.action_embed = nn.Linear(net.action_embed.in_features, net.action_embed.out_features)
+        self.action_embed.load_state_dict(net.action_embed.state_dict())
+        
+        self.lstm_step = nn.LSTMCell(net.lstm_step.input_size, net.lstm_step.hidden_size)
+        self.lstm_step.load_state_dict(net.lstm_step.state_dict())
 
-    @torch.jit.export
-    def infer_policy_value(self, obs_seq: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
-        # obs_seq: (B,T,obs_dim)
-        # h/c: (B,H) or (1,B,H)
+    @torch.jit.script_method
+    def _encode_obs(
+        self,
+        obs: torch.Tensor,
+        hidden_state: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Encode observation sequence and return features + new hidden state."""
+        # Ensure 3D: (B, T, obs_dim)
+        if obs.dim() == 2:
+            obs = obs.unsqueeze(1)
+        
+        # Input projection
+        x = self.fc_input(obs)
+        x = self.ln_input(x)
+        x = F.relu(x)
+        
+        # LSTM
+        lstm_out, new_hidden = self.lstm(x, hidden_state)
+        
+        # Take last timestep
+        x = lstm_out[:, -1, :]
+        
+        # Shared layers
+        x = self.fc_shared(x)
+        x = self.ln_shared(x)
+        x = F.relu(x)
+        x = self.fc_shared2(x)
+        x = self.ln_shared2(x)
+        x = F.relu(x)
+        
+        return x, new_hidden
+
+    @torch.jit.script_method
+    def infer_policy_value(
+        self, 
+        obs_seq: torch.Tensor, 
+        h: torch.Tensor, 
+        c: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Infer policy (mean, std) and value from observation sequence.
+        
+        Args:
+            obs_seq: (B, T, obs_dim) observation sequence
+            h: (B, H) or (1, B, H) LSTM hidden state
+            c: (B, H) or (1, B, H) LSTM cell state
+            
+        Returns:
+            mean: (B, action_dim) policy mean
+            std: (B, action_dim) policy std  
+            value: (B, 1) state value
+        """
+        # Normalize h/c to (1, B, H)
         if h.dim() == 2:
             h_in = h.unsqueeze(0)
             c_in = c.unsqueeze(0)
         else:
             h_in = h
             c_in = c
+        
         hidden = (h_in, c_in)
-        mean, std, _ = self.net.forward_actor(obs_seq, hidden, return_sequence=False)
-        v, _ = self.net.forward_value_local(obs_seq, hidden, return_sequence=False)
-        return mean, std, v
+        x, _ = self._encode_obs(obs_seq, hidden)
+        
+        # Policy head
+        policy_x = F.relu(self.policy_fc(x))
+        mean = torch.tanh(self.policy_mean(policy_x))
+        log_std = self.policy_log_std(policy_x)
+        log_std = torch.clamp(log_std, -5.0, 1.0)
+        std = torch.exp(log_std)
+        
+        # Value head
+        value_x = F.relu(self.value_fc(x))
+        value = self.value_head(value_x)
+        
+        return mean, std, value
 
-    @torch.jit.export
-    def infer_next_hidden(self, obs_seq: torch.Tensor, h: torch.Tensor, c: torch.Tensor, action: torch.Tensor):
-        # obs_seq: (B,T,obs_dim)
-        # h/c: (B,H) or (1,B,H)
+    @torch.jit.script_method
+    def infer_next_hidden(
+        self, 
+        obs_seq: torch.Tensor, 
+        h: torch.Tensor, 
+        c: torch.Tensor, 
+        action: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute action-conditioned next LSTM hidden state.
+        
+        Args:
+            obs_seq: (B, T, obs_dim) observation sequence
+            h: (B, H) or (1, B, H) LSTM hidden state
+            c: (B, H) or (1, B, H) LSTM cell state
+            action: (B, action_dim) action taken
+            
+        Returns:
+            h_next: (1, B, H) next hidden state
+            c_next: (1, B, H) next cell state
+        """
+        # Normalize h/c
         if h.dim() == 2:
             h_in = h.unsqueeze(0)
             c_in = c.unsqueeze(0)
         else:
             h_in = h
             c_in = c
-        hidden = (h_in, c_in)
-        hn, cn = self.net.next_hidden(obs_seq, action, hidden)
-        return hn, cn
+        
+        # Take last observation
+        if obs_seq.dim() == 3:
+            obs_step = obs_seq[:, -1, :]
+        else:
+            obs_step = obs_seq
+        
+        # Encode observation
+        x_obs = self.fc_input(obs_step)
+        x_obs = self.ln_input(x_obs)
+        x_obs = F.relu(x_obs)
+        
+        # Encode action
+        x_act = self.action_embed(action)
+        x_act = F.relu(x_act)
+        
+        # Concatenate
+        x = torch.cat([x_obs, x_act], dim=-1)
+        
+        # Get (B, H) from (1, B, H)
+        h0 = h_in[0]
+        c0 = c_in[0]
+        
+        # LSTMCell step
+        h1, c1 = self.lstm_step(x, (h0, c0))
+        
+        # Return as (1, B, H)
+        return h1.unsqueeze(0), c1.unsqueeze(0)
 
-    def forward(self, obs_seq: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
+    @torch.jit.script_method
+    def forward(
+        self, 
+        obs_seq: torch.Tensor, 
+        h: torch.Tensor, 
+        c: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass (alias for infer_policy_value)."""
         return self.infer_policy_value(obs_seq, h, c)

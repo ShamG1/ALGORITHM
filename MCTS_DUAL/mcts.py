@@ -327,9 +327,16 @@ class MCTS:
                 )
             except RuntimeError as e:
                 # TorchScript model format mismatch or other error
-                if "infer_policy_value" in str(e) or "not defined" in str(e):
-                    # Old TorchScript model format - delete it so it will be regenerated
-                    import sys
+                error_str = str(e)
+                import sys
+                
+                # Print detailed error for diagnosis
+                sys.stderr.write(
+                    f"\n[MCTS] TorchScript RuntimeError: {error_str}\n"
+                )
+                
+                if "infer_policy_value" in error_str or "infer_next_hidden" in error_str or "not defined" in error_str:
+                    # Method signature mismatch - delete model for regeneration
                     sys.stderr.write(
                         f"[MCTS] Incompatible TorchScript model at {ts_path}. "
                         f"Deleting for regeneration. Using Python callbacks this run.\n"
