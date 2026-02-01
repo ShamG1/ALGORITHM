@@ -6,5 +6,5 @@ CXX_DEFINES = -DCPP_MCTS_ENABLE_RENDER -DUSE_C10D_GLOO -DUSE_C10D_NCCL -DUSE_DIS
 
 CXX_INCLUDES = -I/home/g/algorithm/MCTS_DUAL/cpp -isystem /home/g/anaconda3/envs/g308/include/python3.8 -isystem /home/g/anaconda3/envs/g308/include -isystem /home/g/anaconda3/envs/g308/lib/python3.8/site-packages/torch/include -isystem /home/g/anaconda3/envs/g308/lib/python3.8/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda-12.6/include
 
-CXX_FLAGS = -O3 -DNDEBUG -O3 -march=native -ffast-math -funroll-loops -ftree-vectorize -std=gnu++17 -fPIC -fvisibility=hidden -fvisibility=hidden -fomit-frame-pointer -flto=auto -fno-fat-lto-objects -D_GLIBCXX_USE_CXX11_ABI=0
+CXX_FLAGS = -O3 -DNDEBUG -O3 -march=native -ffast-math -funroll-loops -flto -ftree-vectorize -std=gnu++17 -fPIC -fvisibility=hidden -fvisibility=hidden -fomit-frame-pointer -flto=auto -fno-fat-lto-objects -D_GLIBCXX_USE_CXX11_ABI=0
 

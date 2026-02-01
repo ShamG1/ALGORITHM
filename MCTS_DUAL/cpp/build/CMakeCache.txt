@@ -49,7 +49,7 @@ CMAKE_CUDA_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
 CMAKE_CUDA_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
 
 //CXX compiler
-CMAKE_CXX_COMPILER:STRING=/usr/bin/c++
+CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++
 
 //A wrapper around 'ar' adding the appropriate '--plugin' option
 // for the GCC compiler
@@ -93,7 +93,7 @@ CMAKE_EXE_LINKER_FLAGS_RELEASE:STRING=
 CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO:STRING=
 
 //Enable/Disable output of compile commands during generation.
-CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=OFF
+CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=
 
 //Value Computed by CMake.
 CMAKE_FIND_PACKAGE_REDIRECTS_DIR:STATIC=/home/g/algorithm/MCTS_DUAL/cpp/build/CMakeFiles/pkgRedirects
@@ -184,23 +184,23 @@ CMAKE_SKIP_INSTALL_RPATH:BOOL=NO
 //If set, runtime paths are not added when using shared libraries.
 CMAKE_SKIP_RPATH:BOOL=NO
 
-//Flags used by the linker during the creation of static libraries
+//Flags used by the archiver during the creation of static libraries
 // during all build types.
 CMAKE_STATIC_LINKER_FLAGS:STRING=
 
-//Flags used by the linker during the creation of static libraries
+//Flags used by the archiver during the creation of static libraries
 // during DEBUG builds.
 CMAKE_STATIC_LINKER_FLAGS_DEBUG:STRING=
 
-//Flags used by the linker during the creation of static libraries
+//Flags used by the archiver during the creation of static libraries
 // during MINSIZEREL builds.
 CMAKE_STATIC_LINKER_FLAGS_MINSIZEREL:STRING=
 
-//Flags used by the linker during the creation of static libraries
+//Flags used by the archiver during the creation of static libraries
 // during RELEASE builds.
 CMAKE_STATIC_LINKER_FLAGS_RELEASE:STRING=
 
-//Flags used by the linker during the creation of static libraries
+//Flags used by the archiver during the creation of static libraries
 // during RELWITHDEBINFO builds.
 CMAKE_STATIC_LINKER_FLAGS_RELWITHDEBINFO:STRING=
 
@@ -483,7 +483,7 @@ Caffe2_DIR:PATH=/home/g/anaconda3/envs/g308/lib/python3.8/site-packages/torch/sh
 ENABLE_FAST_MATH:BOOL=ON
 
 //Enable Link Time Optimization
-ENABLE_LTO:BOOL=OFF
+ENABLE_LTO:BOOL=ON
 
 //Enable -march=native for maximum performance on this CPU
 ENABLE_NATIVE_OPTIMIZATION:BOOL=ON
@@ -956,8 +956,6 @@ _Python3_INCLUDE_DIR:INTERNAL=/home/g/anaconda3/envs/g308/include/python3.8
 //Python3 Properties
 _Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;8;20;64;<none>;cpython-38-x86_64-linux-gnu;abi3;/home/g/anaconda3/envs/g308/lib/python3.8;/home/g/anaconda3/envs/g308/lib/python3.8;/home/g/anaconda3/envs/g308/lib/python3.8/site-packages;/home/g/anaconda3/envs/g308/lib/python3.8/site-packages
 _Python3_INTERPRETER_SIGNATURE:INTERNAL=b5afc39576485842910091eeca4d887f
-//Interpreter reason failure
-_Python3_Interpreter_REASON_FAILURE:INTERNAL=
 //NumPy reason failure
 _Python3_NumPy_REASON_FAILURE:INTERNAL=
 //Result of TRY_COMPILE

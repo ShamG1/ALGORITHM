@@ -35,7 +35,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang"
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -funroll-loops")
     
     # 链接时优化（LTO）- 可显著提升性能但增加编译时间
-    option(ENABLE_LTO "Enable Link Time Optimization" OFF)
+    option(ENABLE_LTO "Enable Link Time Optimization" ON)
     if(ENABLE_LTO)
         set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
         set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto")
