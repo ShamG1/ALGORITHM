@@ -60,44 +60,41 @@ $\text{Block}(X) = \text{Activation}(\text{CausalConv}(X) + \text{Residual}(X))$
 
 **A. LSTM 模式（Recurrent）：**
 
-$
-h_t = \text{LSTM}(f_{\text{input}}(o_t), h_{t-1})
-$
-
-$
-x_t = f_{\text{shared}}(h_t)
-$
+```tex
+h_t = LSTM(f_input(o_t), h_{t-1})
+x_t = f_shared(h_t)
+```
 
 **B. TCN 模式（Temporal Convolutional）：**
 
 针对窗口长度为 $K$ 的历史观测，采用**非均匀采样**和**差分增强**处理：
 
 1. **输入构造：** 拼接当前观测与时序差分
-   $ \tilde{o}_t = [o_t, o_t - o_{t-k}] $
+```tex
+o_t_tilde = [o_t, o_t - o_{t-k}]
+```
 2. **非均匀采样序列：** 提取指数级回溯的历史特征序列
-   $ S_t = \{ \tilde{o}_t, \tilde{o}_{t-1}, \tilde{o}_{t-3}, \tilde{o}_{t-7}, \tilde{o}_{t-15} \} $
+```tex
+S_t = { o_t_tilde, o_{t-1}_tilde, o_{t-3}_tilde, o_{t-7}_tilde, o_{t-15}_tilde }
+```
 3. **特征提取：** 通过多层膨胀因果卷积提取特征
-   $ x_t = f_{\text{shared}}(\text{TCN}(S_t)) $
+```tex
+x_t = f_shared(TCN(S_t))
+```
 
 **策略输出：**
 
-$$
-\mu_t = \tanh(f_{\mu}(x_t)) \in [-1, 1]
-$$
-
-$$
-\log \sigma_t = \text{clamp}(f_{\sigma}(x_t), -5, 1)
-$$
-
-$$
-\sigma_t = \exp(\log \sigma_t)
-$$
+```tex
+mu_t = tanh(f_mu(x_t)) \in [-1, 1]
+log_sigma_t = clamp(f_sigma(x_t), -5, 1)
+sigma_t = exp(log_sigma_t)
+```
 
 **价值输出：**
 
-$$
+```tex
 V_t = f_v(x_t)
-$$
+```
 
 其中：
 - $f_{\text{input}}$: 输入投影层
@@ -109,15 +106,15 @@ $$
 
 策略分布为多元高斯分布：
 
-$$
-a_t \sim \mathcal{N}(\mu_t, \sigma_t^2)
-$$
+```tex
+a_t \sim N(mu_t, sigma_t^2)
+```
 
 动作被裁剪到 $[-1, 1]$ 范围内：
 
-$$
-a_t = \text{clip}(a_t, -1, 1)
-$$
+```tex
+a_t = clip(a_t, -1, 1)
+```
 
 ### 2. 蒙特卡洛树搜索（MCTS）
 
@@ -143,9 +140,9 @@ MCTS 搜索包含四个阶段，重复执行 $N$ 次模拟：
 
 对于节点 $s$，选择动作 $a$ 的 UCB 分数为：
 
-$$
-U(s, a) = Q(s, a) + c_{\text{puct}} \cdot P(s, a) \cdot \frac{\sqrt{N(s)}}{1 + N(s, a)}
-$$
+```tex
+U(s, a) = Q(s, a) + c_puct * P(s, a) * (sqrt(N(s)) / (1 + N(s, a)))
+```
 
 其中：
 - $Q(s, a)$: 动作价值估计
