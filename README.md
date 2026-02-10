@@ -55,17 +55,29 @@ $\text{Block}(X) = \text{Activation}(\text{CausalConv}(X) + \text{Residual}(X))$
 
 #### 数学表示
 
-对于观测序列 $o_{1:t} = \{o_1, o_2, \ldots, o_t\}$，网络前向传播为：
 
-**共享特征提取：**
+对于观测序列 $o_{1:t} = \{o_1, o_2, \ldots, o_t\}$，网络支持两种主要的共享特征提取模式：
 
-$$
+**A. LSTM 模式（Recurrent）：**
+
+$
 h_t = \text{LSTM}(f_{\text{input}}(o_t), h_{t-1})
-$$
+$
 
-$$
+$
 x_t = f_{\text{shared}}(h_t)
-$$
+$
+
+**B. TCN 模式（Temporal Convolutional）：**
+
+针对窗口长度为 $K$ 的历史观测，采用**非均匀采样**和**差分增强**处理：
+
+1. **输入构造：** 拼接当前观测与时序差分
+   $ \tilde{o}_t = [o_t, o_t - o_{t-k}] $
+2. **非均匀采样序列：** 提取指数级回溯的历史特征序列
+   $ S_t = \{ \tilde{o}_t, \tilde{o}_{t-1}, \tilde{o}_{t-3}, \tilde{o}_{t-7}, \tilde{o}_{t-15} \} $
+3. **特征提取：** 通过多层膨胀因果卷积提取特征
+   $ x_t = f_{\text{shared}}(\text{TCN}(S_t)) $
 
 **策略输出：**
 
