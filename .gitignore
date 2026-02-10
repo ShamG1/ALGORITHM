@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+build/
+dist/
+*.egg-info/
+.vscode/
+.idea/
+MCTS_DUAL/checkpoints/*.pth
+MCTS_DUAL/checkpoints/*.pt
+MCTS_DUAL/checkpoints/*.txt
+MCTS_DUAL/checkpoints/*.csv

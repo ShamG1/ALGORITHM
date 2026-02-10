@@ -1,0 +1,23 @@
+# Build instructions (Windows / Linux)
+
+```bash
+mkdir -p build && cd build
+cmake -A x64 ..   # Or simply `cmake ..` on Linux/Mac
+cmake --build . --config Release
+
+# NOTE: 新位置：建议在 envs/intersection/cpp 下构建
+# 例如：
+# cd envs/intersection/cpp
+# mkdir -p build && cd build
+# cmake -A x64 ..   # Or simply `cmake ..` on Linux/Mac
+# cmake --build . --config Release
+```
+
+The resulting `cpp_mcts.*.pyd` (Windows) or `cpp_mcts.so` (Unix) will be produced in the `build` directory and can be imported in Python:
+
+```python
+import cpp_mcts
+env = cpp_mcts.IntersectionEnv()
+car = cpp_mcts.Car()
+env.cars.append(car)
+```
