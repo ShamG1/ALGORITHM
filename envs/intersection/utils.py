@@ -19,7 +19,9 @@ DEFAULT_REWARD_CONFIG = {
         'stuck_speed_threshold': 1.0,  # m/s
         'stuck_penalty': -0.01,
         'crash_vehicle_penalty': -10.0,
-        'crash_object_penalty': -5.0,  # Includes CRASH_WALL (off-road) and CRASH_LINE
+        'crash_wall_penalty': -5.0,   # Off-road / wall
+        'crash_line_penalty': -2.0,   # Yellow line crossing (lighter than wall)
+        'crash_object_penalty': -5.0,  # Legacy fallback: applies to both if specific keys missing
         'success_reward': 10.0,
         'action_smoothness_scale': -0.02,
         'team_alpha': 0.2,

@@ -59,8 +59,15 @@ def _apply_reward_config(env: Any, reward_cfg: Dict[str, Any]) -> None:
         rc.k_stuck = float(reward_cfg["stuck_penalty"])
     if "crash_vehicle_penalty" in reward_cfg:
         rc.k_cv = float(reward_cfg["crash_vehicle_penalty"])
+    if "crash_wall_penalty" in reward_cfg:
+        rc.k_cw = float(reward_cfg["crash_wall_penalty"])
+    if "crash_line_penalty" in reward_cfg:
+        rc.k_cl = float(reward_cfg["crash_line_penalty"])
+    # Fallback for old config
     if "crash_object_penalty" in reward_cfg:
-        rc.k_co = float(reward_cfg["crash_object_penalty"])
+        val = float(reward_cfg["crash_object_penalty"])
+        if "crash_wall_penalty" not in reward_cfg: rc.k_cw = val
+        if "crash_line_penalty" not in reward_cfg: rc.k_cl = val
     if "success_reward" in reward_cfg:
         rc.k_succ = float(reward_cfg["success_reward"])
     if "action_smoothness_scale" in reward_cfg:

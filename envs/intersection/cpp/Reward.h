@@ -7,14 +7,15 @@ struct RewardConfig {
     float v_min_ms{1.0f};
     float k_stuck{-0.01f};
     float k_cv{-10.0f};
-    float k_co{-5.0f};
+    float k_cw{-5.0f};    // Crash Wall/Off-road
+    float k_cl{-2.0f};    // Crash Line (Yellow line)
     float k_succ{10.0f};
     float k_sm{-0.02f};
     float alpha{0.2f};
 };
 
 struct StepResult {
-    std::vector<std::vector<float>> obs; // (N,127)
+    std::vector<std::vector<float>> obs; // (N,135)
     std::vector<float> rewards;          // (N)
     std::vector<int> done;               // (N)
     std::vector<std::string> status;     // (N)

@@ -16,23 +16,36 @@ static inline float wrap_angle_rad(float a) {
 }
 
 static inline float compute_progress(Car &car, const RewardConfig& cfg) {
+    // Path-based progress: use path_index as primary progress signal.
+    // This reduces corner-cutting towards the final goal point and
+    // aligns shaping with the route topology.
     if (car.path.empty()) return 0.0f;
-    auto goal = car.path.back();
-    float cur_dist = std::hypot(car.state.x - goal.first, car.state.y - goal.second);
+
     float r = 0.0f;
-    if (car.prev_dist_to_goal > 0.0f) {
-        float progress = car.prev_dist_to_goal - cur_dist;
-        float max_progress = std::hypot(float(WIDTH), float(HEIGHT));
-        float normalized = (max_progress > 0.0f) ? (progress / max_progress) : 0.0f;
-        r = cfg.k_prog * normalized;
+    // Use path_index as a monotonic progress measure in [0, path.size()-1]
+    float cur_idx = float(car.path_index);
+    if (car.prev_dist_to_goal > -0.5f) { // repurpose prev_dist_to_goal as prev_index storage
+        float delta = cur_idx - car.prev_dist_to_goal;
+        if (delta > 0.0f) {
+            // Normalize by path length to keep scale roughly invariant
+            float max_idx = std::max(1.0f, float((int)car.path.size() - 1));
+            float normalized = delta / max_idx;
+            r = cfg.k_prog * normalized;
+        }
     }
-    car.prev_dist_to_goal = cur_dist;
+    // store current index in prev_dist_to_goal to avoid extra member
+    car.prev_dist_to_goal = cur_idx;
     return r;
 }
 
 static inline float compute_stuck(const Car &car, const RewardConfig &cfg) {
     float speed_ms = (car.state.v * FPS) / SCALE;
-    return (speed_ms < cfg.v_min_ms) ? cfg.k_stuck : 0.0f;
+    if (speed_ms >= cfg.v_min_ms) return 0.0f;
+    // Continuous shaping: penalize proportional to how far below v_min we are.
+    float diff = cfg.v_min_ms - speed_ms; // >= 0
+    // A small scaling keeps magnitude comparable to the old constant penalty.
+    // For example, diff in [0, 1] -> penalty in approximately [0, |k_stuck|].
+    return cfg.k_stuck * diff;
 }
 
 static inline float compute_smooth(Car &car, const RewardConfig &cfg) {
@@ -324,7 +337,8 @@ StepResult IntersectionEnv::step(const std::vector<float>& throttles,
     for (size_t i = 0; i < n; ++i) {
         if (!res.done[i]) continue;
         if (res.status[i] == "CRASH_CAR") res.rewards[i] += reward_config.k_cv;
-        else if (res.status[i] == "CRASH_WALL" || res.status[i] == "CRASH_LINE") res.rewards[i] += reward_config.k_co;
+        else if (res.status[i] == "CRASH_WALL") res.rewards[i] += reward_config.k_cw;
+        else if (res.status[i] == "CRASH_LINE") res.rewards[i] += reward_config.k_cl;
         else if (res.status[i] == "SUCCESS") res.rewards[i] += reward_config.k_succ;
     }
 

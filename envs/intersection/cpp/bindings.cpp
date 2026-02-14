@@ -37,7 +37,8 @@ PYBIND11_MODULE(cpp_mcts, m) {
         .def_readwrite("v_min_ms", &RewardConfig::v_min_ms)
         .def_readwrite("k_stuck", &RewardConfig::k_stuck)
         .def_readwrite("k_cv", &RewardConfig::k_cv)
-        .def_readwrite("k_co", &RewardConfig::k_co)
+        .def_readwrite("k_cw", &RewardConfig::k_cw)
+        .def_readwrite("k_cl", &RewardConfig::k_cl)
         .def_readwrite("k_succ", &RewardConfig::k_succ)
         .def_readwrite("k_sm", &RewardConfig::k_sm)
         .def_readwrite("alpha", &RewardConfig::alpha);
