@@ -2,7 +2,7 @@
 
 env:
   num_agents: 6
-  num_lanes: 2
+  scenario_name: "cross_3lane"
   max_steps: 500
   respawn_enabled: true
 

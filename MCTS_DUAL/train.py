@@ -466,10 +466,13 @@ def _pinned_worker_loop_shm_optimized(
                     from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
                 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
+                _num_lanes = env_cfg.get('num_lanes', 3)
+                _scenario_name = env_cfg.get('scenario_name', f"cross_{int(_num_lanes)}lane")
+                
                 _WORKER_CACHE["env"] = _ScenarioEnv({
+                    'scenario_name': _scenario_name,
                     'traffic_flow': False,
                     'num_agents': env_cfg.get('num_agents', 1),
-                    'num_lanes': env_cfg.get('num_lanes', 3),
                     'render_mode': None,
                     'max_steps': env_cfg.get('max_steps', 2000),
                     'respawn_enabled': env_cfg.get('respawn_enabled', True),
@@ -718,68 +721,79 @@ except ImportError:
     from mcts import MCTS
 
 
-def generate_ego_routes(num_agents: int, num_lanes: int):
-    """Generate routes for agents based on num_agents and num_lanes."""
-    from SIM_MARL.envs.utils import DEFAULT_ROUTE_MAPPING_2LANES, DEFAULT_ROUTE_MAPPING_3LANES
-    
-    if num_lanes == 2:
-        route_mapping = DEFAULT_ROUTE_MAPPING_2LANES
-    elif num_lanes == 3:
-        route_mapping = DEFAULT_ROUTE_MAPPING_3LANES
-    else:
-        route_mapping = DEFAULT_ROUTE_MAPPING_2LANES
-    
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+def generate_ego_routes(num_agents: int, num_lanes: int, scenario_name: Optional[str] = None):
+    """Generate routes for agents.
+
+    SIM_MARL 已将旧的 DEFAULT_ROUTE_MAPPING_* 常量替换为按场景索引的 ROUTE_MAP_BY_SCENARIO。
+    这里做兼容：
+    - 优先使用传入的 scenario_name
+    - 否则按 num_lanes 选择一个默认场景（cross_{num_lanes}lane）
+
+    Returns:
+        List[Tuple[str, str]] like ('IN_1','OUT_3')
+    """
+    from SIM_MARL.envs.utils import ROUTE_MAP_BY_SCENARIO
+
+    if scenario_name is None:
+        scenario_name = f"cross_{int(num_lanes)}lane"
+
+    mapping = ROUTE_MAP_BY_SCENARIO.get(str(scenario_name))
+    if not mapping:
+        # fallback：尽量按车道数选一个存在的场景
+        fallback = f"cross_{int(num_lanes)}lane"
+        mapping = ROUTE_MAP_BY_SCENARIO.get(fallback)
+
+    if not mapping:
+        raise ValueError(
+            f"No route mapping found for scenario_name={scenario_name!r}. "
+            f"Available: {sorted(ROUTE_MAP_BY_SCENARIO.keys())}"
+        )
+
+    # Flatten mapping: turn_type -> {in_idx: out_idx}
     all_routes = []
-    for start, ends in route_mapping.items():
-        for end in ends:
-            all_routes.append((start, end))
-    
+    for mp in mapping.values():
+        for in_idx, out_idx in mp.items():
+            all_routes.append((f"IN_{in_idx}", f"OUT_{out_idx}"))
+
+    if not all_routes:
+        raise RuntimeError(f"Empty route mapping for scenario_name={scenario_name!r}")
+
     selected_routes = []
     agents_per_dir = num_agents // 4
     extra_agents = num_agents % 4
-    
+
     used_routes = set()
-    
+
+    # Try to balance by approach direction blocks: indices are grouped by direction in build_lane_layout
     for i in range(4):
         count = agents_per_dir + (1 if i < extra_agents else 0)
-        if num_lanes == 3:
-            start_idx = i * num_lanes + 1
-            dir_routes = [r for r in all_routes 
-                         if any(r[0].startswith(f'IN_{j}') for j in range(start_idx, start_idx + num_lanes))]
-        else:
-            start_idx = i * num_lanes + 1
-            dir_routes = [r for r in all_routes 
-                         if any(r[0].startswith(f'IN_{j}') for j in range(start_idx, start_idx + num_lanes))]
-        
-        if len(dir_routes) == 0:
+        start_idx = i * int(num_lanes) + 1
+        dir_routes = [
+            r
+            for r in all_routes
+            if any(r[0].startswith(f"IN_{j}") for j in range(start_idx, start_idx + int(num_lanes)))
+        ]
+
+        if not dir_routes:
             dir_routes = all_routes
-        
-        available_routes = [r for r in dir_routes if r not in used_routes]
-        if len(available_routes) == 0:
-            available_routes = dir_routes
-        
-        dir_route_idx = 0
-        for _ in range(count):
-            if available_routes:
-                route = available_routes[dir_route_idx % len(available_routes)]
-                selected_routes.append(route)
-                used_routes.add(route)
-                dir_route_idx += 1
-            elif dir_routes:
-                route = dir_routes[dir_route_idx % len(dir_routes)]
-                selected_routes.append(route)
-                dir_route_idx += 1
-    
+
+        available_routes = [r for r in dir_routes if r not in used_routes] or dir_routes
+
+        for k in range(count):
+            route = available_routes[k % len(available_routes)]
+            selected_routes.append(route)
+            used_routes.add(route)
+
+    # Fill remaining if num_agents > distinct dir-balanced picks
     remaining_routes = [r for r in all_routes if r not in used_routes]
     while len(selected_routes) < num_agents:
         if remaining_routes:
-            route = remaining_routes.pop(0)
-            selected_routes.append(route)
-            used_routes.add(route)
+            selected_routes.append(remaining_routes.pop(0))
         else:
-            route = all_routes[(len(selected_routes) - len(used_routes)) % len(all_routes)]
-            selected_routes.append(route)
-    
+            selected_routes.append(all_routes[len(selected_routes) % len(all_routes)])
+
     return selected_routes[:num_agents]
 
 
@@ -924,10 +938,12 @@ class MCTSTrainer:
             print(f"WARNING: Found duplicate routes: {duplicates}")
             print(f"All routes: {ego_routes}")
         
+        scenario_name = getattr(self, 'scenario_name', None) or f"cross_{int(num_lanes)}lane"
+
         self.env = ScenarioEnv({
+            'scenario_name': scenario_name,
             'traffic_flow': False,
             'num_agents': num_agents,
-            'num_lanes': num_lanes,
             'use_team_reward': use_team_reward,
             'render_mode': 'human' if render else None,
             'max_steps': max_steps_per_episode,
@@ -961,9 +977,9 @@ class MCTSTrainer:
         
         def create_env_copy():
             return ScenarioEnv({
+                'scenario_name': scenario_name,
                 'traffic_flow': False,
                 'num_agents': num_agents,
-                'num_lanes': num_lanes,
                 'render_mode': None,
                 'max_steps': max_steps_per_episode,
                 'respawn_enabled': respawn_enabled,
@@ -1959,7 +1975,7 @@ def main():
     
     trainer = MCTSTrainer(
         num_agents=int(config.get('env', {}).get('num_agents', 6)),
-        num_lanes=int(config.get('env', {}).get('num_lanes', 2)),
+        scenario_name=str(config.get('env', {}).get('scenario_name', "cross_3lane")),
         max_episodes=int(config.get('train', {}).get('max_episodes', 100000)),
         max_steps_per_episode=int(config.get('env', {}).get('max_steps', 500)),
         mcts_simulations=int(config.get('mcts', {}).get('simulations', 5)),
