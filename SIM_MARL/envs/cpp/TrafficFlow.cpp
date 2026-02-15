@@ -70,6 +70,25 @@ static inline std::pair<float, float> plan_npc_action_tf(const Car& npc, const s
 void ScenarioEnv::init_traffic_routes() {
     traffic_routes.clear();
 
+    if (scenario_name.find("highway") != std::string::npos) {
+        // Highway: One-way straight-through routes (IN_i -> OUT_i)
+        for (const auto& direction : lane_layout.dir_order) {
+            auto it_in = lane_layout.in_by_dir.find(direction);
+            auto it_out = lane_layout.out_by_dir.find(direction);
+            if (it_in == lane_layout.in_by_dir.end() || it_out == lane_layout.out_by_dir.end()) continue;
+
+            const auto& in_lanes = it_in->second;
+            const auto& out_lanes = it_out->second;
+
+            for (size_t i = 0; i < in_lanes.size(); ++i) {
+                if (i < out_lanes.size()) {
+                    traffic_routes.emplace_back(in_lanes[i], out_lanes[i]);
+                }
+            }
+        }
+        return;
+    }
+
     // Mirror Scenario/env.py::_init_traffic_routes fallback (straight + left using lane indices)
     // dir_order in python: ['N','E','S','W']
     const auto &dir_order = lane_layout.dir_order;
@@ -154,9 +173,43 @@ void ScenarioEnv::try_spawn_traffic_car() {
     const auto it = lane_layout.points.find(route.first);
     if (it == lane_layout.points.end()) return;
 
-    const float sx = it->second.first;
-    const float sy = it->second.second;
-    if (is_spawn_blocked(sx, sy)) return;
+    float sx = it->second.first;
+    float sy = it->second.second;
+
+    auto try_adjust_spawn = [&](float& ax, float& ay, const std::vector<std::pair<float,float>>& p) {
+        if (p.size() < 2) return;
+        float dx = p[1].first - p[0].first;
+        float dy = p[1].second - p[0].second;
+        float len = std::hypot(dx, dy);
+        if (len < 1e-6f) return;
+        dx /= len;
+        dy /= len;
+        ax -= dx * (2.0f * CAR_LENGTH);
+        ay -= dy * (2.0f * CAR_LENGTH);
+    };
+
+    if (is_spawn_blocked(sx, sy)) {
+        // Attempt to spawn further back along the lane to avoid immediate collisions.
+        // Move two car lengths opposite the initial travel direction.
+        int tmp_intent = INTENT_STRAIGHT;
+        auto it_int = route_intents.find({route.first, route.second});
+        if (it_int != route_intents.end()) tmp_intent = it_int->second;
+        else tmp_intent = determine_intent(lane_layout, route.first, route.second);
+
+        std::vector<std::pair<float,float>> tmp_path;
+        if (scenario_name.find("roundabout") != std::string::npos) {
+            tmp_path = generate_path_roundabout_cpp(lane_layout, num_lanes, tmp_intent, route.first, route.second);
+        } else {
+            tmp_path = generate_path_cpp(lane_layout, num_lanes, tmp_intent, route.first, route.second);
+        }
+
+        float ax = sx;
+        float ay = sy;
+        try_adjust_spawn(ax, ay, tmp_path);
+        if (is_spawn_blocked(ax, ay)) return;
+        sx = ax;
+        sy = ay;
+    }
 
     int intent = INTENT_STRAIGHT;
     auto it_int = route_intents.find({route.first, route.second});
