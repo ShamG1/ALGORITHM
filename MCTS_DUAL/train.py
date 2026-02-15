@@ -50,8 +50,8 @@ except ImportError:
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from envs.intersection.env import IntersectionEnv
-from envs.intersection.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
+from SIM_MARL.envs.env import ScenarioEnv
+from SIM_MARL.envs.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
 # ============================================================================
 # Optimized Shared Memory Buffer with Event-Based Synchronization
@@ -424,7 +424,7 @@ def _pinned_worker_loop_shm_optimized(
             
             if _WORKER_CACHE.get("network") is None:
                 from dual_net import DualNetwork
-                from envs.intersection.utils import OBS_DIM as _OBS_DIM
+                from SIM_MARL.envs.utils import OBS_DIM as _OBS_DIM
                 
                 # Use 2 * OBS_DIM if using TCN with delta features (seq_len 5 mode)
                 use_tcn = config.get('use_tcn', False)
@@ -460,13 +460,13 @@ def _pinned_worker_loop_shm_optimized(
             if _WORKER_CACHE.get("env") is None:
                 try:
                     from .train import generate_ego_routes
-                    from envs.intersection.env import IntersectionEnv as _IntersectionEnv
+                    from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
                 except ImportError:
                     from train import generate_ego_routes
-                    from envs.intersection.env import IntersectionEnv as _IntersectionEnv
+                    from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
                 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
-                _WORKER_CACHE["env"] = _IntersectionEnv({
+                _WORKER_CACHE["env"] = _ScenarioEnv({
                     'traffic_flow': False,
                     'num_agents': env_cfg.get('num_agents', 1),
                     'num_lanes': env_cfg.get('num_lanes', 3),
@@ -613,7 +613,7 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
             device = torch.device(config['device'])
             if _WORKER_CACHE.get("network") is None:
                 from dual_net import DualNetwork
-                from envs.intersection.utils import OBS_DIM as _OBS_DIM
+                from SIM_MARL.envs.utils import OBS_DIM as _OBS_DIM
 
                 net = DualNetwork(
                     obs_dim=_OBS_DIM, action_dim=2,
@@ -628,13 +628,13 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
             if _WORKER_CACHE.get("env") is None:
                 try:
                     from .train import generate_ego_routes
-                    from envs.intersection.env import IntersectionEnv as _IntersectionEnv
+                    from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
                 except ImportError:
                     from train import generate_ego_routes
-                    from envs.intersection.env import IntersectionEnv as _IntersectionEnv
+                    from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
-                _WORKER_CACHE["env"] = _IntersectionEnv({
+                _WORKER_CACHE["env"] = _ScenarioEnv({
                     'traffic_flow': False, 'num_agents': env_cfg.get('num_agents', 1),
                     'num_lanes': env_cfg.get('num_lanes', 3), 'render_mode': None,
                     'max_steps': env_cfg.get('max_steps', 2000),
@@ -720,7 +720,7 @@ except ImportError:
 
 def generate_ego_routes(num_agents: int, num_lanes: int):
     """Generate routes for agents based on num_agents and num_lanes."""
-    from envs.intersection.utils import DEFAULT_ROUTE_MAPPING_2LANES, DEFAULT_ROUTE_MAPPING_3LANES
+    from SIM_MARL.envs.utils import DEFAULT_ROUTE_MAPPING_2LANES, DEFAULT_ROUTE_MAPPING_3LANES
     
     if num_lanes == 2:
         route_mapping = DEFAULT_ROUTE_MAPPING_2LANES
@@ -924,7 +924,7 @@ class MCTSTrainer:
             print(f"WARNING: Found duplicate routes: {duplicates}")
             print(f"All routes: {ego_routes}")
         
-        self.env = IntersectionEnv({
+        self.env = ScenarioEnv({
             'traffic_flow': False,
             'num_agents': num_agents,
             'num_lanes': num_lanes,
@@ -960,7 +960,7 @@ class MCTSTrainer:
         self.networks = [self.network] * num_agents
         
         def create_env_copy():
-            return IntersectionEnv({
+            return ScenarioEnv({
                 'traffic_flow': False,
                 'num_agents': num_agents,
                 'num_lanes': num_lanes,
@@ -1559,7 +1559,7 @@ class MCTSTrainer:
                 mean_reward = episode_reward.mean()
                 collisions = info.get('collisions', {})
                 has_success = any(status == 'SUCCESS' for status in collisions.values())
-                has_crash = any(status in ['CRASH_CAR', 'CRASH_WALL', 'CRASH_LINE'] for status in collisions.values())
+                has_crash = any(status in ['CRASH_CAR', 'CRASH_WALL'] for status in collisions.values())
                 
                 rollout_info = ""
                 total_rollouts = sum(mcts.get_rollout_stats()['total_rollouts'] for mcts in self.mcts_instances)

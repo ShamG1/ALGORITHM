@@ -289,7 +289,7 @@ MCTS_DUAL/
 ├── utils.py             # 工具函数
 └── cpp/                 # C++ 后端实现
     ├── mcts_search.cpp  # MCTS 搜索实现
-    ├── IntersectionEnv.cpp  # 环境实现
+    ├── ScenarioEnv.cpp  # 环境实现
     └── ...
 ```
 
@@ -322,7 +322,7 @@ MCTS_DUAL/
 ### 构建 C++ 后端（推荐：Release + LTO）
 
 ```bash
-cd envs/intersection/cpp/build
+cd SIM_MARL/envs/cpp/build
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)

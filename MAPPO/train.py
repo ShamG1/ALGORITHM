@@ -13,11 +13,11 @@ from tqdm import tqdm
 # Add parent directory to path to import env
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import from MCTS_DUAL instead of Intersection
-from envs.intersection.env import IntersectionEnv, DEFAULT_ROUTE_MAPPING_2LANES, DEFAULT_ROUTE_MAPPING_3LANES
-from envs.intersection.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
+# Import from SIM_MARL instead of Scenario
+from SIM_MARL.envs.env import ScenarioEnv, DEFAULT_ROUTE_MAPPING_2LANES, DEFAULT_ROUTE_MAPPING_3LANES
+from SIM_MARL.envs.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
-# Import MAPPO - handle both absolute and relative imports
+# Import MAPPO
 try:
     from .mappo import MAPPO
 except ImportError:
@@ -80,7 +80,7 @@ def generate_ego_routes(num_agents: int, num_lanes: int):
 
 
 class Trainer:
-    """MAPPO Trainer for multi-agent intersection navigation."""
+    """MAPPO Trainer for multi-agent scenario navigation."""
     
     def __init__(
         self,
@@ -139,7 +139,7 @@ class Trainer:
                 'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
                 'ego_routes': ego_routes
             }
-            self.envs.append(IntersectionEnv(env_config))
+            self.envs.append(ScenarioEnv(env_config))
         self.env = self.envs[0]
 
         # Initialize MAPPO

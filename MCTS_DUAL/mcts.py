@@ -11,7 +11,7 @@ import os
 # When running as a package (python -m C_MCTS.train) we can use relative import.
 # When running as a script (python C_MCTS/train.py) relative import fails, so fallback to absolute.
 try:
-    from envs.intersection import cpp_backend  # type: ignore
+    from SIM_MARL.envs.cpp import cpp_backend  # type: ignore
 except Exception:
     try:
         from . import cpp_backend  # type: ignore
@@ -158,7 +158,7 @@ class MCTS:
 
         if not hasattr(env, 'env') or not hasattr(env.env, 'get_state'):
             raise TypeError(
-                "C++ MCTS requires a FastIntersectionEnv wrapper with a C++ backend (env.env) that has get_state/set_state methods."
+                "C++ MCTS requires a FastScenarioEnv wrapper with a C++ backend (env.env) that has get_state/set_state methods."
             )
 
         cpp_env = env.env
