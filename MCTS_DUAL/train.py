@@ -466,8 +466,7 @@ def _pinned_worker_loop_shm_optimized(
                     from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
                 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
-                _num_lanes = env_cfg.get('num_lanes', 3)
-                _scenario_name = env_cfg.get('scenario_name', f"cross_{int(_num_lanes)}lane")
+                _scenario_name = env_cfg.get('scenario_name', "cross_3lane")
                 
                 _WORKER_CACHE["env"] = _ScenarioEnv({
                     'scenario_name': _scenario_name,
@@ -639,7 +638,7 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
                 _WORKER_CACHE["env"] = _ScenarioEnv({
                     'traffic_flow': False, 'num_agents': env_cfg.get('num_agents', 1),
-                    'num_lanes': env_cfg.get('num_lanes', 3), 'render_mode': None,
+                    'scenario_name': env_cfg.get('scenario_name', "cross_3lane"), 'render_mode': None,
                     'max_steps': env_cfg.get('max_steps', 2000),
                     'respawn_enabled': env_cfg.get('respawn_enabled', True),
                     'reward_config': env_cfg.get('reward_config', {}),
@@ -723,13 +722,13 @@ except ImportError:
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-def generate_ego_routes(num_agents: int, num_lanes: int, scenario_name: Optional[str] = None):
+def generate_ego_routes(num_agents: int, scenario_name: Optional[str] = None):
     """Generate routes for agents.
 
     SIM_MARL 已将旧的 DEFAULT_ROUTE_MAPPING_* 常量替换为按场景索引的 ROUTE_MAP_BY_SCENARIO。
     这里做兼容：
     - 优先使用传入的 scenario_name
-    - 否则按 num_lanes 选择一个默认场景（cross_{num_lanes}lane）
+    - 否则选择一个默认场景（cross_3lane）
 
     Returns:
         List[Tuple[str, str]] like ('IN_1','OUT_3')
@@ -737,12 +736,12 @@ def generate_ego_routes(num_agents: int, num_lanes: int, scenario_name: Optional
     from SIM_MARL.envs.utils import ROUTE_MAP_BY_SCENARIO
 
     if scenario_name is None:
-        scenario_name = f"cross_{int(num_lanes)}lane"
+        scenario_name = "cross_3lane"
 
     mapping = ROUTE_MAP_BY_SCENARIO.get(str(scenario_name))
     if not mapping:
         # fallback：尽量按车道数选一个存在的场景
-        fallback = f"cross_{int(num_lanes)}lane"
+        fallback = "cross_3lane"
         mapping = ROUTE_MAP_BY_SCENARIO.get(fallback)
 
     if not mapping:
@@ -765,7 +764,10 @@ def generate_ego_routes(num_agents: int, num_lanes: int, scenario_name: Optional
     extra_agents = num_agents % 4
 
     used_routes = set()
-
+    import re
+    # 自动解析 num_lanes
+    m = re.findall(r"(?:^|_)(\d+)lane(?:$|_)", str(scenario_name))
+    num_lanes = int(m[-1]) if m else 2
     # Try to balance by approach direction blocks: indices are grouped by direction in build_lane_layout
     for i in range(4):
         count = agents_per_dir + (1 if i < extra_agents else 0)
@@ -866,7 +868,7 @@ class MCTSTrainer:
     def __init__(
         self,
         num_agents: int = 6,
-        num_lanes: int = 3,
+        scenario_name: str = "cross_3lane",
         max_episodes: int = 10000,
         max_steps_per_episode: int = 2000,
         mcts_simulations: int = 50,
@@ -891,7 +893,7 @@ class MCTSTrainer:
         use_shm: bool = True
     ):
         self.num_agents = num_agents
-        self.num_lanes = num_lanes
+        self.scenario_name = scenario_name
         self.max_episodes = max_episodes
         self.max_steps_per_episode = max_steps_per_episode
         self.mcts_simulations = mcts_simulations
@@ -927,7 +929,7 @@ class MCTSTrainer:
         os.makedirs(save_dir, exist_ok=True)
         self.save_dir = save_dir
         
-        ego_routes = generate_ego_routes(num_agents, num_lanes)
+        ego_routes = generate_ego_routes(num_agents, scenario_name)
         self.ego_routes = ego_routes
         
         route_counts = {}
@@ -938,8 +940,6 @@ class MCTSTrainer:
             print(f"WARNING: Found duplicate routes: {duplicates}")
             print(f"All routes: {ego_routes}")
         
-        scenario_name = getattr(self, 'scenario_name', None) or f"cross_{int(num_lanes)}lane"
-
         self.env = ScenarioEnv({
             'scenario_name': scenario_name,
             'traffic_flow': False,
@@ -1041,7 +1041,7 @@ class MCTSTrainer:
         with open(self.log_file, 'w') as f:
             f.write(f"Training started at {datetime.now()}\n")
             f.write(f"Num agents: {num_agents}\n")
-            f.write(f"Num lanes: {num_lanes}\n")
+            f.write(f"Scenario name: {scenario_name}\n")
             f.write(f"Use team reward: {use_team_reward}\n")
             f.write(f"Respawn enabled: {respawn_enabled}\n")
             f.write(f"MCTS simulations: {mcts_simulations}\n")
@@ -1075,7 +1075,7 @@ class MCTSTrainer:
         
         init_env_config = {
             'num_agents': self.num_agents,
-            'num_lanes': self.num_lanes,
+            'scenario_name': self.scenario_name,
             'use_team_reward': self.use_team_reward,
             'max_steps': self.max_steps_per_episode,
             'respawn_enabled': self.respawn_enabled,
@@ -1119,7 +1119,7 @@ class MCTSTrainer:
 
         init_env_config = {
             'num_agents': self.num_agents,
-            'num_lanes': self.num_lanes,
+            'scenario_name': self.scenario_name,
             'use_team_reward': self.use_team_reward,
             'max_steps': self.max_steps_per_episode,
             'respawn_enabled': self.respawn_enabled,
@@ -1966,8 +1966,11 @@ def main():
     else:
         device = device_name
     
+    scenario_name = str(config.get('env', {}).get('scenario_name', "cross_3lane"))
+
     print(f"[INFO] Training device: {device}")
     print(f"[INFO] Worker inference device: CPU (optimal for small networks)")
+    print(f"[INFO] Scenario: {scenario_name}")
 
     seed = config.get('train', {}).get('seed')
     if seed is not None:
