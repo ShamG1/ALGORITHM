@@ -154,6 +154,9 @@ LaneLayout build_lane_layout_highway_cpp(int num_lanes) {
     layout.in_by_dir = {{"E", {}}};
     layout.out_by_dir = {{"E", {}}};
 
+    layout.in_by_dir["E"] = {};
+    layout.out_by_dir["E"] = {};
+
     for (int j = 0; j < num_lanes; ++j) {
         float total_rw = num_lanes * LANE_WIDTH_PX;
         float top_edge = CY - (total_rw / 2.0f);

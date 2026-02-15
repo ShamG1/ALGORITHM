@@ -11,11 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from SIM_MARL.envs.env import ScenarioEnv, ROUTE_MAP_BY_SCENARIO
 
 # mapping: cross_2lane, cross_3lane, roundabout_2lane, roundabout_3lane
-#          T_2lane, T_3lane, highway_2lane, highway_3lane
+#          T_2lane, T_3lane, highway_2lane, highway_4lane
 def main():
     config = {
         'traffic_flow': True,
-        'traffic_density': 7,
+        'traffic_density': 3,
         'num_agents': 1,
         'scenario_name': 'highway_2lane',
         'render_mode': 'human',

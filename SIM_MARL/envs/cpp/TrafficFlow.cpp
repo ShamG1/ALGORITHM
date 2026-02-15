@@ -3,6 +3,7 @@
 #include <cmath>
 #include <random>
 #include <unordered_map>
+#include <iostream>
 
 static constexpr float PI_F_TF = 3.14159265358979323846f;
 static inline float wrap_angle_rad_tf(float a) {
@@ -80,9 +81,14 @@ void ScenarioEnv::init_traffic_routes() {
             const auto& in_lanes = it_in->second;
             const auto& out_lanes = it_out->second;
 
+            // Log available lanes for debugging
+            std::cout << "[TrafficFlow] Init highway routes for dir=" << direction 
+                      << " in_size=" << in_lanes.size() << " out_size=" << out_lanes.size() << std::endl;
+
             for (size_t i = 0; i < in_lanes.size(); ++i) {
                 if (i < out_lanes.size()) {
                     traffic_routes.emplace_back(in_lanes[i], out_lanes[i]);
+                    std::cout << "[TrafficFlow]   Added route: " << in_lanes[i] << " -> " << out_lanes[i] << std::endl;
                 }
             }
         }
@@ -129,21 +135,21 @@ void ScenarioEnv::init_traffic_routes() {
 }
 
 bool ScenarioEnv::is_spawn_blocked(float sx, float sy) const {
-    const float min_dist = CAR_LENGTH * 2.5f;
-    const float min_d2 = min_dist * min_dist;
+    // 构造一个临时的探测车，用于精确碰撞检测
+    Car probe;
+    probe.state.x = sx;
+    probe.state.y = sy;
+    probe.state.v = 0.0f;
+    probe.state.heading = 0.0f; // 初始探测朝向，后面在 try_spawn 里会根据路径校准
 
-    // Check ego cars
+    // 检查所有主车
     for (const auto &c : cars) {
-        float dx = c.state.x - sx;
-        float dy = c.state.y - sy;
-        if (dx * dx + dy * dy < min_d2) return true;
+        if (probe.check_collision(c)) return true;
     }
 
-    // Check NPC cars
+    // 检查所有 NPC 车
     for (const auto &c : traffic_cars) {
-        float dx = c.state.x - sx;
-        float dy = c.state.y - sy;
-        if (dx * dx + dy * dy < min_d2) return true;
+        if (probe.check_collision(c)) return true;
     }
 
     return false;
@@ -176,48 +182,11 @@ void ScenarioEnv::try_spawn_traffic_car() {
     float sx = it->second.first;
     float sy = it->second.second;
 
-    auto try_adjust_spawn = [&](float& ax, float& ay, const std::vector<std::pair<float,float>>& p) {
-        if (p.size() < 2) return;
-        float dx = p[1].first - p[0].first;
-        float dy = p[1].second - p[0].second;
-        float len = std::hypot(dx, dy);
-        if (len < 1e-6f) return;
-        dx /= len;
-        dy /= len;
-        ax -= dx * (2.0f * CAR_LENGTH);
-        ay -= dy * (2.0f * CAR_LENGTH);
-    };
-
-    if (is_spawn_blocked(sx, sy)) {
-        // Attempt to spawn further back along the lane to avoid immediate collisions.
-        // Move two car lengths opposite the initial travel direction.
-        int tmp_intent = INTENT_STRAIGHT;
-        auto it_int = route_intents.find({route.first, route.second});
-        if (it_int != route_intents.end()) tmp_intent = it_int->second;
-        else tmp_intent = determine_intent(lane_layout, route.first, route.second);
-
-        std::vector<std::pair<float,float>> tmp_path;
-        if (scenario_name.find("roundabout") != std::string::npos) {
-            tmp_path = generate_path_roundabout_cpp(lane_layout, num_lanes, tmp_intent, route.first, route.second);
-        } else {
-            tmp_path = generate_path_cpp(lane_layout, num_lanes, tmp_intent, route.first, route.second);
-        }
-
-        float ax = sx;
-        float ay = sy;
-        try_adjust_spawn(ax, ay, tmp_path);
-        if (is_spawn_blocked(ax, ay)) return;
-        sx = ax;
-        sy = ay;
-    }
-
+    // --- Generate path first to know the heading (also needed for forward offset direction) ---
     int intent = INTENT_STRAIGHT;
     auto it_int = route_intents.find({route.first, route.second});
-    if (it_int != route_intents.end()) {
-        intent = it_int->second;
-    } else {
-        intent = determine_intent(lane_layout, route.first, route.second);
-    }
+    if (it_int != route_intents.end()) intent = it_int->second;
+    else intent = determine_intent(lane_layout, route.first, route.second);
 
     std::vector<std::pair<float,float>> path;
     if (scenario_name.find("roundabout") != std::string::npos) {
@@ -226,6 +195,36 @@ void ScenarioEnv::try_spawn_traffic_car() {
         path = generate_path_cpp(lane_layout, num_lanes, intent, route.first, route.second);
     }
     if (path.size() < 2) return;
+
+    auto is_blocked_with_heading = [&](float x, float y) {
+        float dx = path[1].first - path[0].first;
+        float dy = path[1].second - path[0].second;
+        float h = std::atan2(-dy, dx);
+
+        Car probe;
+        probe.state.x = x;
+        probe.state.y = y;
+        probe.state.v = 0.0f;
+        probe.state.heading = h;
+
+        for (const auto &c : cars) if (probe.check_collision(c)) return true;
+        for (const auto &c : traffic_cars) if (probe.check_collision(c)) return true;
+        return false;
+    };
+
+    if (is_blocked_with_heading(sx, sy)) {
+        float dx = path[1].first - path[0].first;
+        float dy = path[1].second - path[0].second;
+        float len = std::hypot(dx, dy);
+        if (len <= 1e-6f) return;
+
+        float ax = sx + (dx / len) * (2.0f * CAR_LENGTH);
+        float ay = sy + (dy / len) * (2.0f * CAR_LENGTH);
+        if (is_blocked_with_heading(ax, ay)) return;
+
+        sx = ax;
+        sy = ay;
+    }
 
     float heading = 0.0f;
     {
