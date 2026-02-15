@@ -21,7 +21,7 @@ except Exception:
         except Exception:
             cpp_backend = None
 
-HAS_CPP_MCTS = bool(cpp_backend) and hasattr(cpp_backend, "mcts_search")
+HAS_SIM_MARL = bool(cpp_backend) and hasattr(cpp_backend, "mcts_search")
 
 
 class TensorCache:
@@ -94,10 +94,10 @@ class MCTS:
         all_networks: Optional[List] = None,  # Kept for API compatibility
         agent_id: int = 0,
         num_action_samples: int = 5,
-        use_cpp_mcts: bool = True,  # Kept for API compatibility
+        use_SIM_MARL: bool = True,  # Kept for API compatibility
         ts_model_path: Optional[str] = None
     ):
-        if not HAS_CPP_MCTS:
+        if not HAS_SIM_MARL:
             raise RuntimeError("C++ MCTS backend is not available. Please build it first.")
 
         self.network = network

@@ -13,11 +13,11 @@ cmake --build . --config Release
 # cmake --build . --config Release
 ```
 
-The resulting `cpp_mcts.*.pyd` (Windows) or `cpp_mcts.so` (Unix) will be produced in the `build` directory and can be imported in Python:
+The resulting `SIM_MARL.*.pyd` (Windows) or `SIM_MARL.so` (Unix) will be produced in the `build` directory and can be imported in Python:
 
 ```python
-import cpp_mcts
-env = cpp_mcts.ScenarioEnv()
-car = cpp_mcts.Car()
+import SIM_MARL
+env = SIM_MARL.ScenarioEnv()
+car = SIM_MARL.Car()
 env.cars.append(car)
 ```

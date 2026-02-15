@@ -1,9 +1,17 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.18)
 
-project(cpp_mcts LANGUAGES CXX)
+if(POLICY CMP0148)
+  cmake_policy(SET CMP0148 OLD)
+endif()
+
+project(SIM_MARL_ENV_ENV LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_EXTENSIONS ON)
 
 # ============================================================================
 # 编译优化选项
@@ -70,7 +78,21 @@ endif()
 # Python和pybind11
 # ============================================================================
 
-find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+if(NOT Python3_EXECUTABLE)
+    set(Python3_EXECUTABLE /home/g/anaconda3/envs/g308/bin/python)
+endif()
+
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_path('include'))"
+    OUTPUT_VARIABLE Python3_INCLUDE_DIRS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; import os; print(os.path.dirname(sysconfig.get_config_var('LIBDIR') or '/'))"
+    OUTPUT_VARIABLE Python3_LIBRARY_DIRS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
 
 find_package(pybind11 CONFIG QUIET)
 
@@ -151,10 +173,10 @@ set(MCTS_SOURCES
 add_definitions(-DCPP_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
 
 if(WIN32)
-    pybind11_add_module(cpp_mcts ${MCTS_SOURCES})
+    pybind11_add_module(SIM_MARL_ENV ${MCTS_SOURCES})
 else()
-    add_compile_definitions(CPP_MCTS_ENABLE_RENDER)
-    pybind11_add_module(cpp_mcts ${MCTS_SOURCES})
+    add_compile_definitions(SIM_MARL_ENABLE_RENDER)
+    pybind11_add_module(SIM_MARL_ENV ${MCTS_SOURCES})
 endif()
 
 # ============================================================================
@@ -163,7 +185,7 @@ endif()
 
 # 针对目标的额外优化
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(cpp_mcts PRIVATE
+    target_compile_options(SIM_MARL_ENV PRIVATE
         $<$<CONFIG:Release>:-fvisibility=hidden>  # 隐藏不必要的符号
         $<$<CONFIG:Release>:-fomit-frame-pointer>  # 省略帧指针
     )
@@ -173,7 +195,7 @@ endif()
 # Torch链接
 # ============================================================================
 
-target_link_libraries(cpp_mcts PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(SIM_MARL_ENV PRIVATE ${TORCH_LIBRARIES})
 
 # ============================================================================
 # OpenGL + GLFW
@@ -201,25 +223,25 @@ if(WIN32)
         message(FATAL_ERROR "Cannot find glfw3.lib or glfw3dll.lib in ${GLFW_LIB_DIR}. Check GLFW_ROOT")
     endif()
 
-    target_include_directories(cpp_mcts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${GLFW_INCLUDE_DIR})
-    target_link_directories(cpp_mcts PRIVATE ${GLFW_LIB_DIR})
+    target_include_directories(SIM_MARL_ENV PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${GLFW_INCLUDE_DIR})
+    target_link_directories(SIM_MARL_ENV PRIVATE ${GLFW_LIB_DIR})
 
-    target_link_libraries(cpp_mcts PRIVATE ${GLFW_LIB_NAME} opengl32)
-    target_link_libraries(cpp_mcts PRIVATE gdi32)
+    target_link_libraries(SIM_MARL_ENV PRIVATE ${GLFW_LIB_NAME} opengl32)
+    target_link_libraries(SIM_MARL_ENV PRIVATE gdi32)
 
-    target_compile_options(cpp_mcts PRIVATE /utf-8)
+    target_compile_options(SIM_MARL_ENV PRIVATE /utf-8)
 else()
     find_package(glfw3 3.3 REQUIRED)
-    target_include_directories(cpp_mcts PUBLIC 
+    target_include_directories(SIM_MARL_ENV PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR} 
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
 )
-    target_link_libraries(cpp_mcts PRIVATE glfw OpenGL::GL dl pthread)
+    target_link_libraries(SIM_MARL_ENV PRIVATE glfw OpenGL::GL dl pthread)
     
     # OpenMP链接（如果启用）
     if(ENABLE_OPENMP AND OpenMP_CXX_FOUND)
-        target_link_libraries(cpp_mcts PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(SIM_MARL_ENV PRIVATE OpenMP::OpenMP_CXX)
     endif()
 endif()
 

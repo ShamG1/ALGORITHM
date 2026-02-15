@@ -1,4 +1,4 @@
-"""Lazy bridge to cpp_mcts, with auto path setup.
+"""Lazy bridge to SIM_MARL, with auto path setup.
 
 We try to locate the built extension in typical CMake output folders:
 - cpp/build/Release (MSVC multi-config)
@@ -32,7 +32,7 @@ def _lazy_import():
     global _cpp_mod
     if _cpp_mod is None:
         try:
-            _cpp_mod = importlib.import_module("cpp_mcts")
+            _cpp_mod = importlib.import_module("SIM_MARL_ENV")
         except ModuleNotFoundError:
             _cpp_mod = None
     return _cpp_mod
@@ -46,7 +46,7 @@ def _require():
     mod = _lazy_import()
     if mod is None:
         raise RuntimeError(
-            "cpp_mcts backend not available – build it first (or ensure cpp/build/Release is on PYTHONPATH)."
+            "SIM_MARL backend not available – build it first (or ensure cpp/build/Release is on PYTHONPATH)."
         )
     return mod
 

@@ -133,8 +133,8 @@ class ScenarioEnv:
 
         if not cpp_backend.has_cpp_backend():
             raise RuntimeError(
-                "cpp_mcts backend not available. Build it first, or run with the pure-Python environment. "
-                "(cpp/build or cpp/build/Release must contain the cpp_mcts extension)"
+                "SIM_MARL_ENV backend not available. Build it first, or run with the pure-Python environment. "
+                "(cpp/build or cpp/build/Release must contain the SIM_MARL_ENV extension)"
             )
 
         self.env = cpp_backend.ScenarioEnv(self.num_lanes)

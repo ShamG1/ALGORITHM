@@ -16,14 +16,14 @@
 #include "BitmapMask.h"
 #include "EnvState.h"
 
-#ifdef CPP_MCTS_ENABLE_RENDER
+#ifdef SIM_MARL_ENABLE_RENDER
 #include "Renderer.h"
 #endif
 
 // Match Scenario/config.py constants
 constexpr int NEIGHBOR_COUNT = 5;
 
-#ifdef CPP_MCTS_ENABLE_RENDER
+#ifdef SIM_MARL_ENABLE_RENDER
 class Renderer;
 #endif
 
@@ -123,7 +123,7 @@ public:
     EnvState get_state() const;
     void set_state(const EnvState& s);
 
-#ifdef CPP_MCTS_ENABLE_RENDER
+#ifdef SIM_MARL_ENABLE_RENDER
     void render(bool show_lane_ids = false, bool show_lidar = false);
 
     // GLFW input/window helpers (available only after first render() creates a window)
@@ -140,7 +140,7 @@ public:
 
 private:
     // Rendering
-#ifdef CPP_MCTS_ENABLE_RENDER
+#ifdef SIM_MARL_ENABLE_RENDER
     bool render_enabled{false};
     std::unique_ptr<Renderer> renderer; // allocated only when render_enabled
 #endif
