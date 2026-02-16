@@ -323,7 +323,6 @@ MCTS_DUAL/
 
 ```bash
 cd SIM_MARL/core/cpp/build
-mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 ```

@@ -1,10 +1,10 @@
 # MCTS_DUAL training config (YAML-only)
 # Available scenarios:
 # cross_2lane, cross_3lane, highway_2lane, highway_4lane 
-# roundabout_2lane, roundabout_3lane
+# roundabout_2lane, roundabout_3lane, onrampmerge_3lane, bottleneck
 env:
   num_agents: 6
-  scenario_name: "cross_3lane" 
+  scenario_name: "onrampmerge_3lane" 
   max_steps: 500
   respawn_enabled: true
 
@@ -31,7 +31,7 @@ train:
   use_shm: true
 
 render:
-  enabled: false
+  enabled: true
   show_lane_ids: false
   show_lidar: false
 

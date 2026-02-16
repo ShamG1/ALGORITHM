@@ -9,7 +9,7 @@ import numpy as np
 from typing import Optional, Tuple
 
 # Handle both relative and absolute imports
-from SIM_MARL.envs.utils import OBS_DIM
+from SIM_MARL.core.utils import OBS_DIM
 
 
 class TCNBlock(nn.Module):

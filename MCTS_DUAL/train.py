@@ -50,8 +50,8 @@ except ImportError:
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from SIM_MARL.envs.env import ScenarioEnv
-from SIM_MARL.envs.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
+from SIM_MARL.core.env import ScenarioEnv
+from SIM_MARL.core.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
 # ============================================================================
 # Optimized Shared Memory Buffer with Event-Based Synchronization
@@ -424,7 +424,7 @@ def _pinned_worker_loop_shm_optimized(
             
             if _WORKER_CACHE.get("network") is None:
                 from dual_net import DualNetwork
-                from SIM_MARL.envs.utils import OBS_DIM as _OBS_DIM
+                from SIM_MARL.core.utils import OBS_DIM as _OBS_DIM
                 
                 # Use 2 * OBS_DIM if using TCN with delta features (seq_len 5 mode)
                 use_tcn = config.get('use_tcn', False)
@@ -460,10 +460,10 @@ def _pinned_worker_loop_shm_optimized(
             if _WORKER_CACHE.get("env") is None:
                 try:
                     from .train import generate_ego_routes
-                    from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
+                    from SIM_MARL.core.env import ScenarioEnv as _ScenarioEnv
                 except ImportError:
                     from train import generate_ego_routes
-                    from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
+                    from SIM_MARL.core.env import ScenarioEnv as _ScenarioEnv
                 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
                 _scenario_name = env_cfg.get('scenario_name', "cross_3lane")
@@ -615,7 +615,7 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
             device = torch.device(config['device'])
             if _WORKER_CACHE.get("network") is None:
                 from dual_net import DualNetwork
-                from SIM_MARL.envs.utils import OBS_DIM as _OBS_DIM
+                from SIM_MARL.core.utils import OBS_DIM as _OBS_DIM
 
                 net = DualNetwork(
                     obs_dim=_OBS_DIM, action_dim=2,
@@ -630,10 +630,10 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
             if _WORKER_CACHE.get("env") is None:
                 try:
                     from .train import generate_ego_routes
-                    from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
+                    from SIM_MARL.core.env import ScenarioEnv as _ScenarioEnv
                 except ImportError:
                     from train import generate_ego_routes
-                    from SIM_MARL.envs.env import ScenarioEnv as _ScenarioEnv
+                    from SIM_MARL.core.env import ScenarioEnv as _ScenarioEnv
 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
                 _WORKER_CACHE["env"] = _ScenarioEnv({
@@ -723,17 +723,8 @@ except ImportError:
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 def generate_ego_routes(num_agents: int, scenario_name: Optional[str] = None):
-    """Generate routes for agents.
-
-    SIM_MARL 已将旧的 DEFAULT_ROUTE_MAPPING_* 常量替换为按场景索引的 ROUTE_MAP_BY_SCENARIO。
-    这里做兼容：
-    - 优先使用传入的 scenario_name
-    - 否则选择一个默认场景（cross_3lane）
-
-    Returns:
-        List[Tuple[str, str]] like ('IN_1','OUT_3')
-    """
-    from SIM_MARL.envs.utils import ROUTE_MAP_BY_SCENARIO
+ 
+    from SIM_MARL.core.utils import ROUTE_MAP_BY_SCENARIO
 
     if scenario_name is None:
         scenario_name = "cross_3lane"
@@ -751,10 +742,14 @@ def generate_ego_routes(num_agents: int, scenario_name: Optional[str] = None):
         )
 
     # Flatten mapping: turn_type -> {in_idx: out_idx}
+    # Support both numeric lane indices (e.g. 2 -> 8) and already-prefixed lane ids
+    # (e.g. "IN_RAMP_1" -> "OUT_2").
     all_routes = []
     for mp in mapping.values():
-        for in_idx, out_idx in mp.items():
-            all_routes.append((f"IN_{in_idx}", f"OUT_{out_idx}"))
+        for in_id, out_id in mp.items():
+            start = in_id if isinstance(in_id, str) else f"IN_{in_id}"
+            end = out_id if isinstance(out_id, str) else f"OUT_{out_id}"
+            all_routes.append((start, end))
 
     if not all_routes:
         raise RuntimeError(f"Empty route mapping for scenario_name={scenario_name!r}")
@@ -936,9 +931,9 @@ class MCTSTrainer:
         for route in ego_routes:
             route_counts[route] = route_counts.get(route, 0) + 1
         duplicates = {r: c for r, c in route_counts.items() if c > 1}
-        if duplicates:
-            print(f"WARNING: Found duplicate routes: {duplicates}")
-            print(f"All routes: {ego_routes}")
+        # if duplicates:
+        #     print(f"WARNING: Found duplicate routes: {duplicates}")
+        #     print(f"All routes: {ego_routes}")
         
         self.env = ScenarioEnv({
             'scenario_name': scenario_name,
