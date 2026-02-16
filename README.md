@@ -322,7 +322,7 @@ MCTS_DUAL/
 ### 构建 C++ 后端（推荐：Release + LTO）
 
 ```bash
-cd SIM_MARL/envs/cpp/build
+cd SIM_MARL/core/cpp/build
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
