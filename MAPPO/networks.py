@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from MCTS_DUAL.utils import OBS_DIM
+from SIM_MARL.core.utils import OBS_DIM
 
 class Actor(nn.Module):
     """Actor network (policy network) for MAPPO with LSTM."""

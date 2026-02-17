@@ -14,8 +14,8 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import from SIM_MARL instead of Scenario
-from SIM_MARL.envs.env import ScenarioEnv, DEFAULT_ROUTE_MAPPING_2LANES, DEFAULT_ROUTE_MAPPING_3LANES
-from SIM_MARL.envs.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
+from SIM_MARL.core.env import ScenarioEnv
+from SIM_MARL.core.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
 # Import MAPPO
 try:
@@ -24,59 +24,25 @@ except ImportError:
     from mappo import MAPPO
 
 
-def generate_ego_routes(num_agents: int, num_lanes: int):
-    """
-    Generate ego routes for agents based on default route mappings, ensuring balanced distribution.
-    """
-    if num_lanes == 2:
-        route_mapping = DEFAULT_ROUTE_MAPPING_2LANES
-    elif num_lanes == 3:
-        route_mapping = DEFAULT_ROUTE_MAPPING_3LANES
-    else:
-        route_mapping = {}
-        for dir_idx in range(4):
-            for lane_idx in range(num_lanes):
-                in_id = dir_idx * num_lanes + lane_idx + 1
-                opposite_dir_idx = (dir_idx + 2) % 4
-                out_id = opposite_dir_idx * num_lanes + lane_idx + 1
-                route_mapping[f"IN_{in_id}"] = [f"OUT_{out_id}"]
-    
+def generate_ego_routes(num_agents: int, scenario_name: str):
+    from SIM_MARL.core.utils import ROUTE_MAP_BY_SCENARIO
+
+    mapping = ROUTE_MAP_BY_SCENARIO.get(str(scenario_name))
+    if not mapping:
+        raise ValueError(f"No route mapping found for scenario_name={scenario_name!r}")
+
+    # Flatten mapping: turn_type -> {in_id: out_id}
     all_routes = []
-    for in_id, out_ids in route_mapping.items():
-        for out_id in out_ids:
-            all_routes.append((in_id, out_id))
-    
-    routes_by_dir = {i: [] for i in range(4)}
-    for route in all_routes:
-        in_id = route[0]
-        in_num = int(in_id.split('_')[1])
-        dir_idx = (in_num - 1) // num_lanes
-        routes_by_dir[dir_idx].append(route)
-    
-    selected_routes = []
-    agents_per_dir = num_agents // 4
-    extra_agents = num_agents % 4
-    
-    for dir_idx in range(4):
-        count = agents_per_dir + (1 if dir_idx < extra_agents else 0)
-        if count > 0 and routes_by_dir[dir_idx]:
-            for i in range(count):
-                route_idx = i % len(routes_by_dir[dir_idx])
-                selected_routes.append(routes_by_dir[dir_idx][route_idx])
-    
-    if len(selected_routes) < num_agents:
-        all_remaining = []
-        used = set(selected_routes)
-        for dir_idx in range(4):
-            remaining = [r for r in routes_by_dir[dir_idx] if r not in used]
-            all_remaining.extend(remaining)
-        
-        remaining_needed = num_agents - len(selected_routes)
-        if all_remaining:
-            step = max(1, len(all_remaining) // remaining_needed) if remaining_needed > 0 else 1
-            selected_routes.extend(all_remaining[::step][:remaining_needed])
-    
-    return selected_routes[:num_agents]
+    for mp in mapping.values():
+        for in_id, out_id in mp.items():
+            start = in_id if isinstance(in_id, str) else f"IN_{in_id}"
+            end = out_id if isinstance(out_id, str) else f"OUT_{out_id}"
+            all_routes.append((start, end))
+
+    if not all_routes:
+        raise RuntimeError(f"No valid routes generated for scenario_name={scenario_name!r}")
+
+    return [all_routes[i % len(all_routes)] for i in range(num_agents)]
 
 
 class Trainer:
@@ -85,7 +51,7 @@ class Trainer:
     def __init__(
         self,
         num_agents: int = 6,
-        num_lanes: int = 2,
+        scenario_name: str = "cross_3lane",
         num_envs: int = 1,
         max_episodes: int = 10000,
         max_steps_per_episode: int = 500,
@@ -104,7 +70,7 @@ class Trainer:
         use_tqdm: bool = False
     ):
         self.num_agents = num_agents
-        self.num_lanes = num_lanes
+        self.scenario_name = scenario_name
         self.num_envs = num_envs
         self.max_episodes = max_episodes
         self.max_steps_per_episode = max_steps_per_episode
@@ -123,7 +89,7 @@ class Trainer:
         self.use_tqdm = use_tqdm
         
         os.makedirs(save_dir, exist_ok=True)
-        ego_routes = generate_ego_routes(num_agents, num_lanes)
+        ego_routes = generate_ego_routes(num_agents, scenario_name)
         
         # Initialize environments
         self.envs = []
@@ -131,7 +97,7 @@ class Trainer:
             env_config = {
                 'traffic_flow': False,
                 'num_agents': num_agents,
-                'num_lanes': num_lanes,
+                'scenario_name': scenario_name,
                 'use_team_reward': use_team_reward,
                 'render_mode': 'human' if (render and i == 0) else None,
                 'max_steps': max_steps_per_episode,
@@ -278,41 +244,59 @@ class Trainer:
         for env in self.envs: env.close()
 
 
+def load_config_from_yaml(yaml_path: str):
+    import yaml
+    try:
+        with open(yaml_path, 'r') as f:
+            config = yaml.safe_load(f)
+        print(f"[INFO] Configuration loaded from {yaml_path}")
+    except Exception as e:
+        print(f"[ERROR] Failed to load YAML config from {yaml_path}: {e}")
+        sys.exit(1)
+    return config
+
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--num-agents', type=int, default=6)
-    parser.add_argument('--num-lanes', type=int, default=2)
-    parser.add_argument('--num-envs', type=int, default=1, help='Number of parallel environments')
-    parser.add_argument('--max-episodes', type=int, default=10000)
-    parser.add_argument('--update-frequency', type=int, default=2048)
-    parser.add_argument('--update-epochs', type=int, default=5)
-    parser.add_argument('--batch-size', type=int, default=128)
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--render', action='store_true')
-    parser.add_argument('--save-dir', type=str, default='MAPPO/checkpoints')
-    parser.add_argument('--tqdm', action='store_true')
-    
+
+    parser = argparse.ArgumentParser(description='MAPPO Training (YAML Config Only)')
+    parser.add_argument('--config', type=str, default='MAPPO/train_config.yaml', help='Path to YAML configuration file')
     args = parser.parse_args()
-    
+
+    config = load_config_from_yaml(args.config)
+
+    device_name = config.get('net', {}).get('device', 'cpu')
+    if device_name == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        device = device_name
+
+    scenario_name = str(config.get('env', {}).get('scenario_name', 'cross_3lane'))
+
     trainer = Trainer(
-        num_agents=args.num_agents,
-        num_lanes=args.num_lanes,
-        num_envs=args.num_envs,
-        max_episodes=args.max_episodes,
-        update_frequency=args.update_frequency,
-        update_epochs=args.update_epochs,
-        batch_size=args.batch_size,
-        device=args.device,
-        render=args.render,
-        save_dir=args.save_dir,
-        use_tqdm=args.tqdm
+        num_agents=int(config.get('env', {}).get('num_agents', 6)),
+        num_envs=int(config.get('env', {}).get('num_envs', 1)),
+        max_episodes=int(config.get('train', {}).get('max_episodes', 10000)),
+        max_steps_per_episode=int(config.get('env', {}).get('max_steps', 500)),
+        update_frequency=int(config.get('train', {}).get('update_frequency', 2048)),
+        update_epochs=int(config.get('train', {}).get('update_epochs', 5)),
+        batch_size=int(config.get('train', {}).get('batch_size', 128)),
+        save_frequency=int(config.get('train', {}).get('save_frequency', 100)),
+        log_frequency=int(config.get('train', {}).get('log_frequency', 10)),
+        device=device,
+        use_team_reward=bool(config.get('reward', {}).get('use_team_reward', True)),
+        render=bool(config.get('render', {}).get('enabled', False)),
+        show_lane_ids=bool(config.get('render', {}).get('show_lane_ids', False)),
+        show_lidar=bool(config.get('render', {}).get('show_lidar', False)),
+        respawn_enabled=bool(config.get('env', {}).get('respawn_enabled', True)),
+        save_dir=str(config.get('train', {}).get('save_dir', 'MAPPO/checkpoints')),
+        use_tqdm=bool(config.get('misc', {}).get('tqdm', True)),
     )
-    
+
     try:
         trainer.train()
     except KeyboardInterrupt:
-        trainer.mappo.save(os.path.join(args.save_dir, 'mappo_interrupted.pth'))
+        trainer.mappo.save(os.path.join(trainer.save_dir, 'mappo_interrupted.pth'))
 
 if __name__ == '__main__':
     main()
