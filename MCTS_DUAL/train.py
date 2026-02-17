@@ -50,8 +50,8 @@ except ImportError:
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from SIM_MARL.core.env import ScenarioEnv
-from SIM_MARL.core.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
+from DriveSimX.core.env import ScenarioEnv
+from DriveSimX.core.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
 # ============================================================================
 # Optimized Shared Memory Buffer with Event-Based Synchronization
@@ -424,7 +424,7 @@ def _pinned_worker_loop_shm_optimized(
             
             if _WORKER_CACHE.get("network") is None:
                 from dual_net import DualNetwork
-                from SIM_MARL.core.utils import OBS_DIM as _OBS_DIM
+                from DriveSimX.core.utils import OBS_DIM as _OBS_DIM
                 
                 # Use 2 * OBS_DIM if using TCN with delta features (seq_len 5 mode)
                 use_tcn = config.get('use_tcn', False)
@@ -460,10 +460,10 @@ def _pinned_worker_loop_shm_optimized(
             if _WORKER_CACHE.get("env") is None:
                 try:
                     from .train import generate_ego_routes
-                    from SIM_MARL.core.env import ScenarioEnv as _ScenarioEnv
+                    from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
                 except ImportError:
                     from train import generate_ego_routes
-                    from SIM_MARL.core.env import ScenarioEnv as _ScenarioEnv
+                    from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
                 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
                 _scenario_name = env_cfg.get('scenario_name', "cross_3lane")
@@ -615,7 +615,7 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
             device = torch.device(config['device'])
             if _WORKER_CACHE.get("network") is None:
                 from dual_net import DualNetwork
-                from SIM_MARL.core.utils import OBS_DIM as _OBS_DIM
+                from DriveSimX.core.utils import OBS_DIM as _OBS_DIM
 
                 net = DualNetwork(
                     obs_dim=_OBS_DIM, action_dim=2,
@@ -630,10 +630,10 @@ def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
             if _WORKER_CACHE.get("env") is None:
                 try:
                     from .train import generate_ego_routes
-                    from SIM_MARL.core.env import ScenarioEnv as _ScenarioEnv
+                    from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
                 except ImportError:
                     from train import generate_ego_routes
-                    from SIM_MARL.core.env import ScenarioEnv as _ScenarioEnv
+                    from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
                 _WORKER_CACHE["env"] = _ScenarioEnv({
@@ -724,7 +724,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 def generate_ego_routes(num_agents: int, scenario_name: Optional[str] = None):
  
-    from SIM_MARL.core.utils import ROUTE_MAP_BY_SCENARIO
+    from DriveSimX.core.utils import ROUTE_MAP_BY_SCENARIO
 
     if scenario_name is None:
         scenario_name = "cross_3lane"

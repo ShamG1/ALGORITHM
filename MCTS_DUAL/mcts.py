@@ -11,7 +11,7 @@ import os
 # When running as a package (python -m C_MCTS.train) we can use relative import.
 # When running as a script (python C_MCTS/train.py) relative import fails, so fallback to absolute.
 try:
-    from SIM_MARL.envs.cpp import cpp_backend  # type: ignore
+    from DriveSimX.core.cpp import cpp_backend  # type: ignore
 except Exception:
     try:
         from . import cpp_backend  # type: ignore

@@ -14,8 +14,8 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import from SIM_MARL instead of Scenario
-from SIM_MARL.core.env import ScenarioEnv
-from SIM_MARL.core.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
+from DriveSimX.core.env import ScenarioEnv
+from DriveSimX.core.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
 # Import MAPPO
 try:
@@ -25,7 +25,7 @@ except ImportError:
 
 
 def generate_ego_routes(num_agents: int, scenario_name: str):
-    from SIM_MARL.core.utils import ROUTE_MAP_BY_SCENARIO
+    from DriveSimX.core.utils import ROUTE_MAP_BY_SCENARIO
 
     mapping = ROUTE_MAP_BY_SCENARIO.get(str(scenario_name))
     if not mapping:
