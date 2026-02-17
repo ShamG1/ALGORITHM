@@ -31,7 +31,7 @@ train:
   use_shm: true
 
 render:
-  enabled: true
+  enabled: false
   show_lane_ids: false
   show_lidar: false
 
