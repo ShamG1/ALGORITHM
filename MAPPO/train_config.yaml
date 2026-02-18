@@ -26,8 +26,6 @@ reward:
 
 render:
   enabled: false
-  show_lane_ids: false
-  show_lidar: false
 
 misc:
   tqdm: false

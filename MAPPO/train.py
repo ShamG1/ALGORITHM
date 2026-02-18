@@ -286,8 +286,6 @@ def main():
         device=device,
         use_team_reward=bool(config.get('reward', {}).get('use_team_reward', True)),
         render=bool(config.get('render', {}).get('enabled', False)),
-        show_lane_ids=bool(config.get('render', {}).get('show_lane_ids', False)),
-        show_lidar=bool(config.get('render', {}).get('show_lidar', False)),
         respawn_enabled=bool(config.get('env', {}).get('respawn_enabled', True)),
         save_dir=str(config.get('train', {}).get('save_dir', 'MAPPO/checkpoints')),
         use_tqdm=bool(config.get('misc', {}).get('tqdm', True)),

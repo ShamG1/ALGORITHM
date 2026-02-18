@@ -32,8 +32,6 @@ train:
 
 render:
   enabled: false
-  show_lane_ids: false
-  show_lidar: false
 
 reward:
   use_team_reward: true

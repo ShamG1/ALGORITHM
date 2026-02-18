@@ -1985,8 +1985,6 @@ def main():
         use_lstm=bool(config.get('net', {}).get('use_lstm', True)),
         use_tcn=bool(config.get('net', {}).get('use_tcn', False)),
         render=bool(config.get('render', {}).get('enabled', False)),
-        show_lane_ids=bool(config.get('render', {}).get('show_lane_ids', False)),
-        show_lidar=bool(config.get('render', {}).get('show_lidar', False)),
         respawn_enabled=bool(config.get('env', {}).get('respawn_enabled', True)),
         save_dir=str(config.get('train', {}).get('save_dir', 'MCTS_DUAL/checkpoints')),
         parallel_mcts=bool(config.get('mcts', {}).get('parallel', True)),
