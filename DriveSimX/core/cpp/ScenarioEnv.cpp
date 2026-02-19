@@ -6,6 +6,8 @@
 #include <cmath>
 #include <random>
 #include <vector>
+#include <unordered_map>
+#include <cstdint>
 
 static constexpr float PI_F = 3.14159265358979323846f;
 
@@ -60,6 +62,56 @@ static inline float compute_smooth(Car &car, const RewardConfig &cfg) {
     car.prev_action = {current_acc_norm, current_steer_norm};
     return r;
 }
+
+// Spatial Acceleration Structure for Collision and Neighbor Search
+struct SpatialHashGrid {
+    float cell_size;
+    struct Entry {
+        bool is_npc;
+        int index;
+    };
+    std::unordered_map<int64_t, std::vector<Entry>> buckets;
+
+    SpatialHashGrid(float cs) : cell_size(cs) {}
+
+    static int64_t hash(int x, int y) {
+        return (static_cast<int64_t>(x) << 32) | (static_cast<uint32_t>(y));
+    }
+
+    void insert(const Car& car, int index, bool is_npc) {
+        int cx = static_cast<int>(std::floor(car.state.x / cell_size));
+        int cy = static_cast<int>(std::floor(car.state.y / cell_size));
+        buckets[hash(cx, cy)].push_back({is_npc, index});
+    }
+
+    // Returns candidates in 3x3 neighborhood
+    void query_neighborhood(float x, float y, std::vector<Entry>& out) const {
+        int cx = static_cast<int>(std::floor(x / cell_size));
+        int cy = static_cast<int>(std::floor(y / cell_size));
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                auto it = buckets.find(hash(cx + dx, cy + dy));
+                if (it != buckets.end()) {
+                    out.insert(out.end(), it->second.begin(), it->second.end());
+                }
+            }
+        }
+    }
+
+    // Extended query for Top-K neighbor search if 3x3 is insufficient
+    void query_neighborhood_extended(float x, float y, int radius, std::vector<Entry>& out) const {
+        int cx = static_cast<int>(std::floor(x / cell_size));
+        int cy = static_cast<int>(std::floor(y / cell_size));
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                auto it = buckets.find(hash(cx + dx, cy + dy));
+                if (it != buckets.end()) {
+                    out.insert(out.end(), it->second.begin(), it->second.end());
+                }
+            }
+        }
+    }
+};
 
 ScenarioEnv::~ScenarioEnv() = default;
 
@@ -424,12 +476,38 @@ StepResult ScenarioEnv::step(const std::vector<float>& throttles,
         res.status[i] = status;
     }
 
-    // car-car collisions override (ego vs ego, ego vs npc)
+    // car-car collisions override (ego vs ego, ego vs npc) -- accelerated with uniform grid
+    // Build spatial grid for alive ego cars and alive NPC cars.
+    constexpr float kGridCell = 100.0f;
+    SpatialHashGrid grid(kGridCell);
+    grid.buckets.reserve(cars.size() + traffic_cars.size());
+
+    for (size_t i = 0; i < n; ++i) {
+        if (!cars[i].alive || res.done[i]) continue;
+        grid.insert(cars[i], (int)i, /*is_npc=*/false);
+    }
+    if (traffic_flow) {
+        for (size_t j = 0; j < traffic_cars.size(); ++j) {
+            if (!traffic_cars[j].alive) continue;
+            grid.insert(traffic_cars[j], (int)j, /*is_npc=*/true);
+        }
+    }
+
+    std::vector<SpatialHashGrid::Entry> cand;
+    cand.reserve(64);
+
+    // ego collisions
     for (size_t i = 0; i < n; ++i) {
         if (!cars[i].alive || res.done[i]) continue;
 
-        // vs other egos
-        for (size_t j = i + 1; j < n; ++j) {
+        cand.clear();
+        grid.query_neighborhood(cars[i].state.x, cars[i].state.y, cand);
+
+        for (const auto& e : cand) {
+            if (!e.is_npc) {
+                const size_t j = (size_t)e.index;
+                if (j <= i) continue;
+                if (j >= n) continue;
             if (!cars[j].alive || res.done[j]) continue;
             if (cars[i].check_collision(cars[j])) {
                 res.done[i] = 1;
@@ -437,11 +515,10 @@ StepResult ScenarioEnv::step(const std::vector<float>& throttles,
                 res.status[i] = "CRASH_CAR";
                 res.status[j] = "CRASH_CAR";
             }
-        }
-
-        // vs NPCs
-        if (traffic_flow) {
-            for (const auto& npc : traffic_cars) {
+            } else if (traffic_flow) {
+                const size_t tj = (size_t)e.index;
+                if (tj >= traffic_cars.size()) continue;
+                const auto& npc = traffic_cars[tj];
                 if (!npc.alive) continue;
                 if (cars[i].check_collision(npc)) {
                     res.done[i] = 1;
@@ -788,10 +865,10 @@ void ScenarioEnv::update_observations_buffer() {
             base += 7;
         }
 
-        const auto lidar_norm = lidars[i].normalized();
         const size_t lidar_base = 14 + 7 * NEIGHBOR_COUNT;
-        for (size_t k = 0; k < lidar_norm.size() && (lidar_base + k) < (size_t)kObsDim; ++k) {
-            obs[lidar_base + k] = lidar_norm[k];
+        const int write_len = std::min<int>((int)lidars[i].distances.size(), (int)kObsDim - (int)lidar_base);
+        if (write_len > 0) {
+            lidars[i].normalized_into(obs + lidar_base, write_len);
         }
     }
 }
@@ -943,10 +1020,10 @@ std::vector<std::vector<float>> ScenarioEnv::get_observations() const {
             base += 5;
         }
 
-        const auto lidar_norm = lidars[i].normalized();
         const size_t lidar_base = 14 + 5 * NEIGHBOR_COUNT; // Shifted from 6 to 14
-        for (size_t k = 0; k < lidar_norm.size() && (lidar_base + k) < obs.size(); ++k) {
-            obs[lidar_base + k] = lidar_norm[k];
+        const int write_len = std::min<int>((int)lidars[i].distances.size(), (int)obs.size() - (int)lidar_base);
+        if (write_len > 0) {
+            lidars[i].normalized_into(obs.data() + lidar_base, write_len);
         }
 
         out.push_back(std::move(obs));
