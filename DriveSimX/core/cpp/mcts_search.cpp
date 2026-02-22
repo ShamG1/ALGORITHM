@@ -1069,9 +1069,213 @@ std::pair<std::vector<float>, py::dict> mcts_search_seq(
         action_out[1] = rootn.edges[best_i].action[1];
     }
 
+    // stats dict (needs to be declared before filling root stats below)
     py::dict stats;
     stats["num_simulations"] = num_simulations;
+
+    if (!rootn.edges.empty()) {
+        py::list edge_stats;
+        float root_v = rootn.V;
+        int root_n_total = rootn.total_N;
+
+        for (size_t i = 0; i < rootn.edges.size(); ++i) {
+            const auto& e = rootn.edges[i];
+            py::dict e_info;
+            e_info["action"] = py::make_tuple(e.action[0], e.action[1]);
+            e_info["n"] = e.N;
+            e_info["w"] = e.W;
+            e_info["q"] = (e.N > 0) ? (e.W / (float)e.N) : 0.0f;
+            e_info["prior"] = e.prior;
+            edge_stats.append(e_info);
+        }
+        stats["root_v"] = root_v;
+        stats["root_n"] = root_n_total;
+        stats["edges"] = edge_stats;
+    }
+
     return {action_out, stats};
+}
+
+// ============================================================================
+// Scheme A: Compact and SHM stats output implementation
+// ============================================================================
+
+py::tuple mcts_search_lstm_torchscript_compact(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    const std::vector<float>& root_obs_seq,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    const std::vector<float>& root_h,
+    const std::vector<float>& root_c,
+    int lstm_hidden_dim,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed
+) {
+    auto res = mcts_search_lstm_torchscript(
+        env, root_state, root_obs_seq, seq_len, obs_dim, model_path,
+        root_h, root_c, lstm_hidden_dim, agent_index, num_simulations,
+        num_action_samples, rollout_depth, c_puct, temperature, gamma,
+        dirichlet_alpha, dirichlet_eps, seed
+    );
+
+    const std::vector<float>& action_out = res.first;
+    const py::dict& stats = res.second;
+
+    float root_v = 0.0f;
+    int root_n = 0;
+    if (stats.contains("root_v")) root_v = py::cast<float>(stats["root_v"]);
+    if (stats.contains("root_n")) root_n = py::cast<int>(stats["root_n"]);
+
+    py::array_t<float> action_arr({2});
+    {
+        auto a = action_arr.mutable_unchecked<1>();
+        a(0) = action_out.size() > 0 ? action_out[0] : 0.0f;
+        a(1) = action_out.size() > 1 ? action_out[1] : 0.0f;
+    }
+
+    const int K = num_action_samples;
+    py::array_t<float> actions_arr({K, 2});
+    py::array_t<int> visits_arr({K});
+    {
+        auto aa = actions_arr.mutable_unchecked<2>();
+        auto vv = visits_arr.mutable_unchecked<1>();
+        for (int i = 0; i < K; ++i) {
+            aa(i, 0) = 0.0f; aa(i, 1) = 0.0f; vv(i) = 0;
+        }
+
+        if (stats.contains("edges")) {
+            py::list edges = py::cast<py::list>(stats["edges"]);
+            const int n = std::min((int)edges.size(), K);
+            for (int i = 0; i < n; ++i) {
+                py::dict e = py::cast<py::dict>(edges[i]);
+                py::tuple act = py::cast<py::tuple>(e["action"]);
+                aa(i, 0) = py::cast<float>(act[0]);
+                aa(i, 1) = py::cast<float>(act[1]);
+                vv(i) = py::cast<int>(e["n"]);
+            }
+        }
+    }
+
+    py::array_t<float> h_next_arr({lstm_hidden_dim});
+    py::array_t<float> c_next_arr({lstm_hidden_dim});
+    {
+        auto h = h_next_arr.mutable_unchecked<1>();
+        auto c = c_next_arr.mutable_unchecked<1>();
+        for (int i = 0; i < lstm_hidden_dim; ++i) { h(i) = 0.0f; c(i) = 0.0f; }
+        if (stats.contains("h_next")) {
+            py::array h_in = py::array::ensure(stats["h_next"]);
+            if (h_in && h_in.ndim() == 1) {
+                auto hi = h_in.unchecked<float, 1>();
+                const int n = std::min((int)hi.shape(0), lstm_hidden_dim);
+                for (int i = 0; i < n; ++i) h(i) = hi(i);
+            }
+        }
+        if (stats.contains("c_next")) {
+            py::array c_in = py::array::ensure(stats["c_next"]);
+            if (c_in && c_in.ndim() == 1) {
+                auto ci = c_in.unchecked<float, 1>();
+                const int n = std::min((int)ci.shape(0), lstm_hidden_dim);
+                for (int i = 0; i < n; ++i) c(i) = ci(i);
+            }
+        }
+    }
+
+    return py::make_tuple(action_arr, actions_arr, visits_arr, root_v, root_n, h_next_arr, c_next_arr);
+}
+
+void mcts_search_to_shm(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    const std::vector<float>& root_obs_seq,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    const std::vector<float>& root_h,
+    const std::vector<float>& root_c,
+    int lstm_hidden_dim,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed,
+    size_t action_ptr_addr,
+    size_t stats_ptr_addr
+) {
+    float* action_ptr = reinterpret_cast<float*>(action_ptr_addr);
+    float* stats_ptr = reinterpret_cast<float*>(stats_ptr_addr);
+
+    auto res = mcts_search_lstm_torchscript(
+        env, root_state, root_obs_seq, seq_len, obs_dim, model_path,
+        root_h, root_c, lstm_hidden_dim, agent_index, num_simulations,
+        num_action_samples, rollout_depth, c_puct, temperature, gamma,
+        dirichlet_alpha, dirichlet_eps, seed
+    );
+
+    if (action_ptr) {
+        action_ptr[0] = res.first.size() > 0 ? res.first[0] : 0.0f;
+        action_ptr[1] = res.first.size() > 1 ? res.first[1] : 0.0f;
+    }
+
+    if (stats_ptr) {
+        const py::dict& stats = res.second;
+        stats_ptr[0] = stats.contains("root_v") ? py::cast<float>(stats["root_v"]) : 0.0f;
+        stats_ptr[1] = stats.contains("root_n") ? (float)py::cast<int>(stats["root_n"]) : 0.0f;
+
+        const int H = 128;
+        std::memset(stats_ptr + 2, 0, sizeof(float) * 2 * H);
+        
+        if (stats.contains("h_next")) {
+            py::array h_in = py::array::ensure(stats["h_next"]);
+            if (h_in && h_in.ndim() == 1) {
+                auto hi = h_in.unchecked<float, 1>();
+                int n_h = std::min((int)hi.shape(0), H);
+                for (int i = 0; i < n_h; ++i) stats_ptr[2 + i] = hi(i);
+            }
+        }
+        if (stats.contains("c_next")) {
+            py::array c_in = py::array::ensure(stats["c_next"]);
+            if (c_in && c_in.ndim() == 1) {
+                auto ci = c_in.unchecked<float, 1>();
+                int n_c = std::min((int)ci.shape(0), H);
+                for (int i = 0; i < n_c; ++i) stats_ptr[2 + H + i] = ci(i);
+            }
+        }
+
+        if (stats.contains("edges")) {
+            py::list edges = py::cast<py::list>(stats["edges"]);
+            const int n = std::min((int)edges.size(), num_action_samples);
+            int actions_offset = 2 + 2 * H;
+            int visits_offset = 2 + 2 * H + num_action_samples * 2;
+            
+            for (int i = 0; i < n; ++i) {
+                py::dict e = py::cast<py::dict>(edges[i]);
+                py::tuple act = py::cast<py::tuple>(e["action"]);
+                stats_ptr[actions_offset + i*2] = py::cast<float>(act[0]);
+                stats_ptr[actions_offset + i*2 + 1] = py::cast<float>(act[1]);
+                stats_ptr[visits_offset + i] = (float)py::cast<int>(e["n"]);
+            }
+            for (int i = n; i < num_action_samples; ++i) {
+                stats_ptr[actions_offset + i*2] = 0.0f;
+                stats_ptr[actions_offset + i*2 + 1] = 0.0f;
+                stats_ptr[visits_offset + i] = 0.0f;
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1666,15 +1870,35 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
     std::vector<float> action_out = {0.0f, 0.0f};
     int selected_edge = -1;
 
+    py::dict stats;
+    stats["num_simulations"] = num_simulations;
+
     if (!rootn.edges.empty()) {
+        py::list edge_stats;
+        float root_v = rootn.V;
+        int root_n_total = rootn.total_N;
+
         std::vector<float> probs(rootn.edges.size(), 0.0f);
         float sum = 0.0f;
         for (size_t i = 0; i < rootn.edges.size(); ++i) {
-            float p = float(std::max(0, rootn.edges[i].N));
+            const auto& e = rootn.edges[i];
+            py::dict e_info;
+            e_info["action"] = py::make_tuple(e.action[0], e.action[1]);
+            e_info["n"] = e.N;
+            e_info["w"] = e.W;
+            e_info["q"] = (e.N > 0) ? (e.W / (float)e.N) : 0.0f;
+            e_info["prior"] = e.prior;
+            edge_stats.append(e_info);
+
+            float p = float(std::max(0, e.N));
             if (temperature > 1e-6f) p = std::pow(p, 1.0f / temperature);
             probs[i] = p;
             sum += p;
         }
+        stats["root_v"] = root_v;
+        stats["root_n"] = root_n_total;
+        stats["edges"] = edge_stats;
+
         size_t best_i = 0;
         if (sum > 0.0f) {
             for (auto& p : probs) p /= sum;
@@ -1685,9 +1909,6 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
         action_out[0] = rootn.edges[best_i].action[0];
         action_out[1] = rootn.edges[best_i].action[1];
     }
-
-    py::dict stats;
-    stats["num_simulations"] = num_simulations;
 
     if (selected_edge >= 0) {
         py::array_t<float> h_next({lstm_hidden_dim});

@@ -1,0 +1,40 @@
+# MCTS_DUAL training config (YAML-only)
+# Available scenarios:
+# cross_2lane, cross_3lane, highway_2lane, highway_4lane 
+# roundabout_2lane, roundabout_3lane, onrampmerge_3lane, bottleneck
+env:
+  num_agents: 6
+  scenario_name: "onrampmerge_3lane" 
+  max_steps: 500
+  respawn_enabled: true
+
+mcts:
+  simulations: 5
+  rollout_depth: 5
+  num_action_samples: 3
+  parallel: true
+  max_workers: 6
+
+net:
+  device: cpu          # auto/cpu/cuda
+  use_tcn: true
+  use_lstm: false
+  sequence_length: 5
+
+train:
+  max_episodes: 100000
+  save_frequency: 100
+  save_dir: "MCTS_AlphaZero/checkpoints"
+  load_checkpoint: ""  # empty means no load
+  seed: 42
+  deterministic: false
+  use_shm: true
+
+render:
+  enabled: false
+
+reward:
+  use_team_reward: true
+
+misc:
+  tqdm: false
