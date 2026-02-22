@@ -11,7 +11,6 @@ import sys
 import time
 import struct
 import queue
-import threading
 
 # Suppress pygame messages in worker processes (set before any pygame imports)
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
@@ -55,6 +54,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from DriveSimX.core.env import ScenarioEnv
 from DriveSimX.core.utils import DEFAULT_REWARD_CONFIG, OBS_DIM
 
+# Local training components
+try:
+    from .dual_net import DualNetwork
+    from .mcts import MCTS, prepare_obs_sequence
+except ImportError:
+    from dual_net import DualNetwork
+    from mcts import MCTS, prepare_obs_sequence
+
 # ============================================================================
 # Optimized Shared Memory Buffer with Event-Based Synchronization
 # ============================================================================
@@ -65,19 +72,16 @@ class SharedMemoryBuffer:
     Eliminates busy-wait polling for significant performance improvement.
     Includes space for MCTS stats (AlphaZero training).
     """
-    def __init__(self, num_agents: int, obs_dim: int, action_dim: int = 2, num_action_samples: int = 5):
+    def __init__(self, num_agents: int, obs_dim: int, lstm_hidden_dim: int, action_dim: int = 2, num_action_samples: int = 5):
         self.num_agents = num_agents
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.num_action_samples = num_action_samples
         
         # Calculate buffer size
-        # stats layout per agent: 
+        # Stats layout per agent (Scheme A):
         # [root_v (1), root_n (1), h_next (H), c_next (H), actions_k (K*2), visits_k (K)]
-        # For AlphaZero training, we need:
-        # [root_v, root_n, h_next (128), c_next (128), actions_k (K*2), visits_k (K)]
-        # = 1 + 1 + 128 + 128 + K*2 + K = 258 + 3*K floats
-        self.lstm_hidden_dim = 128
+        self.lstm_hidden_dim = lstm_hidden_dim
         self.stats_per_agent = 2 + 2 * self.lstm_hidden_dim + 3 * num_action_samples
         
         self.obs_size = num_agents * obs_dim * 4  # float32
@@ -209,7 +213,7 @@ class SharedMemoryBuffer:
 class SharedMemoryBufferClient:
     """Optimized shared memory buffer client for worker processes."""
     
-    def __init__(self, shm_name: str, num_agents: int, agent_id: int, obs_dim: int, action_dim: int = 2, num_action_samples: int = 5,
+    def __init__(self, shm_name: str, num_agents: int, agent_id: int, obs_dim: int, lstm_hidden_dim: int, action_dim: int = 2, num_action_samples: int = 5,
                  ready_event: mp.Event = None, done_event: mp.Event = None,
                  all_done_event: mp.Event = None, done_events_list: List[mp.Event] = None):
         self.num_agents = num_agents
@@ -217,7 +221,8 @@ class SharedMemoryBufferClient:
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.num_action_samples = num_action_samples
-        self.lstm_hidden_dim = 128
+        # We now use a dynamic hidden dim to avoid hardcoding risks.
+        self.lstm_hidden_dim = lstm_hidden_dim
         self.stats_per_agent = 2 + 2 * self.lstm_hidden_dim + 3 * num_action_samples
         
         self.obs_size = num_agents * obs_dim * 4
@@ -289,7 +294,7 @@ class SharedMemoryBufferClient:
             K = self.num_action_samples
             H = self.lstm_hidden_dim
             
-            # Scheme A: [root_v, root_n, h_next(128), c_next(128), actions_k(K*2), visits_k(K)]
+            # Scheme A: [root_v, root_n, h_next(H), c_next(H), actions_k(K*2), visits_k(K)]
             
             # Fill h_next/c_next
             if "h_next" in stats:
@@ -345,7 +350,9 @@ class SharedMemoryBufferClient:
 # Worker Tensor Cache for Reduced Allocations
 # ============================================================================
 
+
 class WorkerTensorCache:
+
     """Pre-allocated tensor cache for worker processes."""
     
     def __init__(self, obs_dim: int, seq_len: int, hidden_dim: int, device: str):
@@ -365,43 +372,15 @@ class WorkerTensorCache:
             self.h_buffer = self.h_buffer.pin_memory()
             self.c_buffer = self.c_buffer.pin_memory()
     
-    def prepare_obs_sequence(self, obs_history: deque) -> torch.Tensor:
-        """Prepare observation sequence tensor from history with non-uniform sampling and delta."""
-        hist_list = list(obs_history)
-        seq_len = self.seq_len
-        
-        # Consistent with mcts.py: Non-uniform sampling [t, t-1, t-3, t-7, t-15]
-        if seq_len == 5:
-            idx = [-1, -2, -4, -8, -16]
-            sampled = []
-            for i in idx:
-                if -i <= len(hist_list):
-                    sampled.append(hist_list[i])
-                else:
-                    sampled.append(hist_list[0])
-            sampled = sampled[::-1] # oldest -> newest
-            
-            # Delta features
-            feat = []
-            prev = sampled[0]
-            for x in sampled:
-                dx = x - prev
-                feat.append(np.concatenate([x, dx], axis=0))
-                prev = x
-            processed_hist = feat
-        else:
-            # Standard uniform sampling
-            if len(hist_list) < seq_len:
-                pad = [hist_list[0]] * (seq_len - len(hist_list))
-                hist_list = pad + hist_list
-            else:
-                hist_list = hist_list[-seq_len:]
-            processed_hist = hist_list
+    def prepare_obs_sequence(self, obs_history: deque, use_tcn: bool = False) -> torch.Tensor:
+        """Prepare observation sequence tensor from history (unified with main prepare_obs_sequence())."""
+        seq = prepare_obs_sequence(list(obs_history), self.seq_len, use_tcn=use_tcn)
+        processed_hist = list(seq)
         
         # Ensure buffer is the right size (it might need re-allocation if dim changed)
         current_dim = processed_hist[0].size
         if self.obs_buffer.shape[2] != current_dim:
-            self.obs_buffer = torch.zeros(1, seq_len, current_dim, dtype=torch.float32)
+            self.obs_buffer = torch.zeros(1, self.seq_len, current_dim, dtype=torch.float32)
             if self.device != 'cpu':
                 self.obs_buffer = self.obs_buffer.pin_memory()
 
@@ -497,9 +476,22 @@ def _pinned_worker_loop_shm_optimized(
     _WORKER_CACHE["hidden"] = None
     _WORKER_CACHE["obs_history"] = None
     
+    config = None
+    # Wait for initial config if not provided
+    while config is None and not stop_event.is_set():
+        try:
+            msg = control_queue.get(timeout=0.1)
+            if msg[0] == 'CONFIG':
+                config = msg[1]
+            elif msg[0] == 'CLOSE':
+                return
+        except queue.Empty:
+            continue
+
     # Connect to shared memory with event references
     shm_client = SharedMemoryBufferClient(
         shm_name, num_agents, agent_id, obs_dim,
+        lstm_hidden_dim=int(config.get('lstm_hidden_dim', 128)),
         num_action_samples=num_action_samples,
         ready_event=ready_event,
         done_event=done_event,
@@ -507,7 +499,6 @@ def _pinned_worker_loop_shm_optimized(
         done_events_list=done_events_list
     )
     
-    config = None
     tensor_cache = None
     current_token = -1
 
@@ -566,6 +557,11 @@ def _pinned_worker_loop_shm_optimized(
             
             _WORKER_CACHE["obs_history"].append(obs_data)
             
+            # --- PREPARE OBSERVATION SEQUENCE (HANDLES TCN DELTA FEATURES) ---
+            use_tcn = config.get('use_tcn', False)
+            seq_len = config.get('sequence_length', 5)
+            obs_seq_np = prepare_obs_sequence(list(_WORKER_CACHE["obs_history"]), seq_len, use_tcn=use_tcn)
+            
             # CRITICAL: Workers ALWAYS use CPU to avoid CUDA fork issues
             # For small networks (FC+LSTM), CPU is often faster for single-sample inference
             worker_device = torch.device('cpu')
@@ -575,8 +571,6 @@ def _pinned_worker_loop_shm_optimized(
                 from DriveSimX.core.utils import OBS_DIM as _OBS_DIM
                 
                 # Use 2 * OBS_DIM if using TCN with delta features (seq_len 5 mode)
-                use_tcn = config.get('use_tcn', False)
-                seq_len = config.get('sequence_length', 5)
                 effective_obs_dim = _OBS_DIM * 2 if (use_tcn and seq_len == 5) else _OBS_DIM
                 
                 net = DualNetwork(
@@ -606,10 +600,7 @@ def _pinned_worker_loop_shm_optimized(
                 _WORKER_CACHE["tensor_cache"] = tensor_cache
             
             if _WORKER_CACHE.get("env") is None:
-                try:
-                    from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
-                except ImportError:
-                    from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
+                from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
                 
                 env_cfg = _WORKER_CACHE.get('env_config') or {}
                 _scenario_name = env_cfg.get('scenario_name', "cross_3lane")
@@ -634,20 +625,16 @@ def _pinned_worker_loop_shm_optimized(
                 _num_agents = int(env_cfg.get('num_agents', 1))
                 mcts = MCTS(
                     network=_WORKER_CACHE["network"],
-                    action_space=None,
                     num_simulations=config['num_simulations'],
                     c_puct=config['c_puct'],
                     temperature=config['temperature'],
                     device='cpu',  # Workers always use CPU
                     rollout_depth=config['rollout_depth'],
-                    env_factory=None,
-                    all_networks=[_WORKER_CACHE["network"]] * _num_agents,
                     agent_id=agent_id,
                     num_action_samples=config['num_action_samples'],
-                    ts_model_path=config.get('ts_model_path')
+                    ts_model_path=config.get('ts_model_path'),
                 )
                 mcts._env_cache = _WORKER_CACHE["env"]
-                mcts.env_factory = lambda: None
                 _WORKER_CACHE["mcts"] = mcts
             
             # Sync weights only when version changes
@@ -663,42 +650,82 @@ def _pinned_worker_loop_shm_optimized(
             
             mcts = _WORKER_CACHE["mcts"]
             mcts.agent_id = agent_id
-            
-            hidden_state_tensor = _WORKER_CACHE.get('hidden') if config.get('use_lstm') else None
-            
+
+            use_lstm_flag = bool(config.get('use_lstm', True))
+            use_tcn_flag = bool(config.get('use_tcn', False))
+
+            hidden_state_tensor = _WORKER_CACHE.get('hidden') if use_lstm_flag else None
+
             with torch.inference_mode():
                 # Provide SHM pointers to the search function
                 # This will bypass Python queues and write directly to SHM
                 shm_ptrs = (shm_client.action_ptr_addr, shm_client.stats_ptr_addr)
-                
-                action, search_stats = mcts.search(
-                    obs_data,
-                    _WORKER_CACHE["env"],
-                    list(_WORKER_CACHE["obs_history"]) if (config.get('use_lstm') or config.get('use_tcn')) else None,
-                    hidden_state_tensor,
-                    None,
-                    shm_ptrs=shm_ptrs
-                )
-            
+
+                if use_lstm_flag:
+                    # LSTM path: use unified Python wrapper, which calls C++ mcts_search_to_shm
+                    action, search_stats = mcts.search(
+                        obs_data,
+                        _WORKER_CACHE["env"],
+                        list(_WORKER_CACHE["obs_history"]) if (use_lstm_flag or use_tcn_flag) else None,
+                        hidden_state_tensor,
+                        shm_ptrs=shm_ptrs
+                    )
+                else:
+                    # TCN / MLP path: call C++ TorchScript+SHM implementation directly
+                    from DriveSimX.core import cpp_backend as _cpp_backend
+
+                    env_cpp = _WORKER_CACHE["env"].env
+                    root_state_cpp = env_cpp.get_state()
+
+                    # Use the already prepared obs_seq_np (handles TCN delta features/dim doubling)
+                    root_obs_seq_flat = obs_seq_np.astype(np.float32).flatten()
+                    obs_dim_net = int(root_obs_seq_flat.size // seq_len)
+
+                    _cpp_backend.mcts_search_tcn_torchscript_seq_to_shm(
+                        env_cpp,
+                        root_state_cpp,
+                        root_obs_seq_flat.tolist(),
+                        seq_len,
+                        obs_dim_net,
+                        config.get('ts_model_path'),
+                        int(config['lstm_hidden_dim']),
+                        int(agent_id),
+                        int(config['num_simulations']),
+                        int(config['num_action_samples']),
+                        int(config['rollout_depth']),
+                        float(config['c_puct']),
+                        float(config['temperature']),
+                        0.99,
+                        0.3,
+                        0.25,
+                        int(config.get('base_seed', 0)),
+                        shm_client.action_ptr_addr,
+                        shm_client.stats_ptr_addr,
+                    )
+
+                    # In pure SHM mode, action/stats are consumed from SHM by the main process.
+                    action = np.zeros(2, dtype=np.float32)
+                    search_stats = {}
+
             # CRITICAL FIX: If C++ didn't write to SHM (fallback path), write manually
-            if shm_ptrs is not None and search_stats:
+            if search_stats:
                 # This means we entered Python fallback in mcts.py despite shm_ptrs being provided
                 shm_client.write_action_and_stats(agent_id, action, search_stats)
             
             # --- Update hidden state ---
             # In SHM mode, search_stats is {} (Python overhead reduced).
             # We must read h_next/c_next from SHM stats buffer to update worker hidden state.
-            if config.get('use_lstm'):
-                lstm_hidden_dim = int(config.get('lstm_hidden_dim', 128))
+            if use_lstm_flag:
+                lstm_hidden_dim = int(config['lstm_hidden_dim'])
                 
                 if shm_ptrs is not None:
                     # SHM Path: Read directly from stats buffer
-                    # Layout: [root_v(1), root_n(1), h_next(128), c_next(128), ...]
+                    # Layout: [root_v(1), root_n(1), h_next(H), c_next(H), ...]
                     import ctypes
                     stats_ptr = ctypes.cast(shm_client.stats_ptr_addr, ctypes.POINTER(ctypes.c_float))
-                    # h_next starts at offset 2, c_next starts at offset 2 + 128
-                    h_np = np.fromiter(stats_ptr[2 : 2 + lstm_hidden_dim], dtype=np.float32)
-                    c_np = np.fromiter(stats_ptr[2 + lstm_hidden_dim : 2 + 2 * lstm_hidden_dim], dtype=np.float32)
+                    # h_next starts at offset 2, c_next starts at offset 2 + H
+                    h_np = np.fromiter(stats_ptr[2 : 2 + lstm_hidden_dim], dtype=np.float32, count=lstm_hidden_dim)
+                    c_np = np.fromiter(stats_ptr[2 + lstm_hidden_dim : 2 + 2 * lstm_hidden_dim], dtype=np.float32, count=lstm_hidden_dim)
                 elif isinstance(search_stats, dict) and ("h_next" in search_stats):
                     # Legacy/Fallback Path: Read from dict
                     h_np = np.asarray(search_stats.get("h_next"), dtype=np.float32).reshape(-1)
@@ -747,169 +774,8 @@ def _pinned_worker_loop_shm_optimized(
 
 
 # ============================================================================
-# Legacy Worker Loop (kept for backwards compatibility)
+# Generation of ego routes
 # ============================================================================
-
-def _pinned_worker_loop(agent_id: int, in_q: mp.Queue, out_q: mp.Queue):
-    """
-    Legacy pinned worker using Queue (kept for backwards compatibility).
-    """
-    os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
-    torch.set_num_threads(1)
-
-    global _WORKER_CACHE
-    _WORKER_CACHE["agent_id"] = agent_id
-    _WORKER_CACHE["hidden"] = None
-    _WORKER_CACHE["obs_history"] = None
-
-    while True:
-        try:
-            msg = in_q.get()
-            if not msg: 
-                continue
-            mtype = msg[0]
-
-            if mtype == 'CLOSE':
-                break
-
-            if mtype == 'RESET':
-                _WORKER_CACHE["hidden"] = None
-                oh = _WORKER_CACHE.get("obs_history")
-                if oh is not None:
-                    try:
-                        oh.clear()
-                    except Exception:
-                        _WORKER_CACHE["obs_history"] = None
-                continue
-
-            if mtype != 'STEP':
-                continue
-
-            obs_data = msg[1]
-            config = msg[2]
-
-            seq_len = int(config.get('sequence_length', 5))
-            if _WORKER_CACHE.get("obs_history") is None:
-                _WORKER_CACHE["obs_history"] = deque(maxlen=seq_len)
-            else:
-                try:
-                    if getattr(_WORKER_CACHE["obs_history"], "maxlen", None) != seq_len:
-                        _WORKER_CACHE["obs_history"] = deque(maxlen=seq_len)
-                except Exception:
-                    _WORKER_CACHE["obs_history"] = deque(maxlen=seq_len)
-
-            _WORKER_CACHE["obs_history"].append(np.asarray(obs_data, dtype=np.float32))
-
-            device = torch.device(config['device'])
-            if _WORKER_CACHE.get("network") is None:
-                from dual_net import DualNetwork
-                from DriveSimX.core.utils import OBS_DIM as _OBS_DIM
-
-                net = DualNetwork(
-                    obs_dim=_OBS_DIM, action_dim=2,
-                    hidden_dim=config['hidden_dim'], lstm_hidden_dim=config['lstm_hidden_dim'],
-                    use_lstm=config.get('use_lstm', True),
-                    use_tcn=config.get('use_tcn', False),
-                    sequence_length=config['sequence_length']
-                ).to(device)
-                net.eval()
-                _WORKER_CACHE["network"] = net
-
-            if _WORKER_CACHE.get("env") is None:
-                try:
-                    # from .train import generate_ego_routes  # unused
-                    from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
-                except ImportError:
-                    # from train import generate_ego_routes  # unused
-                    from DriveSimX.core.env import ScenarioEnv as _ScenarioEnv
-
-                env_cfg = _WORKER_CACHE.get('env_config') or {}
-                _WORKER_CACHE["env"] = _ScenarioEnv({
-                    'traffic_flow': False, 'num_agents': env_cfg.get('num_agents', 1),
-                    'scenario_name': env_cfg.get('scenario_name', "cross_3lane"), 'render_mode': None,
-                    'max_steps': env_cfg.get('max_steps', 2000),
-                    'respawn_enabled': env_cfg.get('respawn_enabled', True),
-                    'reward_config': env_cfg.get('reward_config', {}),
-                    'ego_routes': list(env_cfg.get('ego_routes', [])),
-                })
-
-            if _WORKER_CACHE.get("mcts") is None:
-                try: 
-                    from .mcts import MCTS
-                except ImportError: 
-                    from mcts import MCTS
-                env_cfg = _WORKER_CACHE.get('env_config') or {}
-                num_agents = int(env_cfg.get('num_agents', 1))
-                mcts = MCTS(
-                    network=_WORKER_CACHE["network"], action_space=None,
-                    num_simulations=config['num_simulations'], c_puct=config['c_puct'],
-                    temperature=config['temperature'], device=device,
-                    rollout_depth=config['rollout_depth'], env_factory=None,
-                    all_networks=[_WORKER_CACHE["network"]] * num_agents,
-                    agent_id=agent_id, num_action_samples=config['num_action_samples'],
-                    ts_model_path=config.get('ts_model_path')
-                )
-                mcts._env_cache = _WORKER_CACHE["env"]
-                mcts.env_factory = lambda: None
-                _WORKER_CACHE["mcts"] = mcts
-
-            if _SHARED_STATE.get("version") is not None:
-                last_ver = _WORKER_CACHE.get("_last_weight_version", -1)
-                cur_ver = int(_SHARED_STATE["version"].value)
-                if cur_ver != last_ver:
-                    with _SHARED_STATE["lock"]:
-                        state = _WORKER_CACHE["network"].state_dict()
-                        for _p, src in zip(state.values(), _SHARED_STATE["tensors"]):
-                            _p.copy_(src)
-                    _WORKER_CACHE["_last_weight_version"] = cur_ver
-
-            mcts = _WORKER_CACHE["mcts"]
-            mcts.agent_id = agent_id
-            
-            hidden_state_tensor = _WORKER_CACHE.get('hidden') if config.get('use_lstm') else None
-
-            with torch.inference_mode():
-                action, search_stats = mcts.search(
-                    obs_data,
-                    _WORKER_CACHE["env"],
-                    list(_WORKER_CACHE["obs_history"]) if (config.get('use_lstm') or config.get('use_tcn')) else None,
-                    hidden_state_tensor,
-                    None
-                )
-
-            if config.get('use_lstm') and isinstance(search_stats, dict) and ("h_next" in search_stats):
-                lstm_hidden_dim = int(config.get('lstm_hidden_dim', 128))
-                h_np = np.asarray(search_stats.get("h_next"), dtype=np.float32).reshape(-1)
-                c_np = np.asarray(search_stats.get("c_next"), dtype=np.float32).reshape(-1)
-
-                if h_np.size != lstm_hidden_dim or c_np.size != lstm_hidden_dim:
-                    hn = torch.zeros(1, 1, lstm_hidden_dim, device=device, dtype=torch.float32)
-                    cn = torch.zeros(1, 1, lstm_hidden_dim, device=device, dtype=torch.float32)
-                else:
-                    hn = torch.as_tensor(h_np, device=device).view(1, 1, lstm_hidden_dim)
-                    cn = torch.as_tensor(c_np, device=device).view(1, 1, lstm_hidden_dim)
-
-                _WORKER_CACHE["hidden"] = (hn, cn)
-
-            # Return (action, stats) for AlphaZero training
-            out_q.put((agent_id, np.array(action, dtype=np.float32).flatten(), search_stats))
-
-        except Exception as e:
-            import traceback
-            sys.stdout.write(f"[PinnedWorker {agent_id}] Error: {e}\\n{traceback.format_exc()}\\n")
-            sys.stdout.flush()
-            out_q.put((agent_id, np.zeros(2, dtype=np.float32), None))
-
-
-try:
-    from .dual_net import DualNetwork
-    from .mcts import MCTS
-except ImportError:
-    from dual_net import DualNetwork
-    from mcts import MCTS
-
-
-from typing import Any, Dict, List, Optional
 
 def generate_ego_routes(num_agents: int, scenario_name: Optional[str] = None):
  
@@ -1004,14 +870,6 @@ class MCTSTrainer:
                 except Exception:
                     pass
         
-        # Send close commands (legacy version)
-        if hasattr(self, '_pinned_in_queues') and self._pinned_in_queues is not None:
-            for q in self._pinned_in_queues:
-                try:
-                    q.put(('CLOSE',))
-                except Exception:
-                    pass
-        
         # Wait for worker processes to end
         if hasattr(self, '_pinned_procs') and self._pinned_procs is not None:
             for p in self._pinned_procs:
@@ -1097,28 +955,18 @@ class MCTSTrainer:
         self.max_workers = max_workers if max_workers is not None else num_agents
         self.use_tqdm = use_tqdm and tqdm is not None
         self.use_shm = use_shm
+        if not self.use_shm:
+            raise ValueError("use_shm must be True")
+        # LSTM hidden dim will be taken from the network after it is constructed.
+        # (Set after self.network is created; do not read from env vars.)
+        self.lstm_hidden_dim = None
         
         # Worker resources
-        self._pinned_in_queues = None
-        self._pinned_out_queues = None
         self._pinned_procs = None
         self._control_queues = None
         self._shm_buffer = None
         self._stop_event = None
 
-        # Async stats tracking (for fallback only)
-        self._stats_queues = None
-        self._stats_accumulator = {}  # token -> {agent_id: stats}
-        self._stats_lock = threading.Lock()
-        
-        # Stats tracking counters
-        self._stats_counters = {
-            'on_time': 0,
-            'late_injected': 0,
-            'dropped': 0,
-            'total_steps_monitored': 0
-        }
-        self._last_stats_report_step = 0
         
         self.seed = seed
         self.deterministic = deterministic
@@ -1165,6 +1013,9 @@ class MCTSTrainer:
             use_tcn=self.use_tcn,
             sequence_length=5
         ).to(self.device)
+
+        # Single source of truth for SHM layout.
+        self.lstm_hidden_dim = int(getattr(self.network, "lstm_hidden_dim", 128))
         
         # NOTE: torch.compile is disabled because:
         # 1. It's incompatible with fork-based multiprocessing + CUDA
@@ -1173,32 +1024,17 @@ class MCTSTrainer:
         
         self.networks = [self.network] * num_agents
         
-        def create_env_copy():
-            return ScenarioEnv({
-                'scenario_name': scenario_name,
-                'traffic_flow': False,
-                'num_agents': num_agents,
-                'render_mode': None,
-                'max_steps': max_steps_per_episode,
-                'respawn_enabled': respawn_enabled,
-                'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
-                'ego_routes': ego_routes
-            })
-        
         self.mcts_instances = [
             MCTS(
                 network=self.network,
-                action_space=None,
                 num_simulations=mcts_simulations,
                 c_puct=1.0,
                 temperature=1.0,
                 device=device,
                 rollout_depth=self.rollout_depth,
-                num_action_samples=self.num_action_samples,
-                env_factory=create_env_copy,
-                all_networks=self.networks,
                 agent_id=i,
-                ts_model_path=os.path.join(self.save_dir, 'mcts_infer.pt')
+                num_action_samples=self.num_action_samples,
+                ts_model_path=os.path.join(self.save_dir, 'mcts_infer.pt'),
             )
             for i in range(num_agents)
         ]
@@ -1274,75 +1110,18 @@ class MCTSTrainer:
         with open(self.log_file, 'a') as f:
             f.write(message + "\n")
     
-    def _stats_collector_loop(self):
-        """Background thread to drain all stats queues into the accumulator with high efficiency."""
-        while not self._stats_collector_stop.is_set():
-            if self._stats_queues is None:
-                time.sleep(0.1)
-                continue
-            
-            any_data = False
-            for i in range(self.num_agents):
-                if self._stats_queues[i] is None:
-                    continue
-                try:
-                    # Drain all available messages for this agent
-                    while True:
-                        res = self._stats_queues[i].get_nowait()
-                        if res is None:
-                            break
-                        
-                        msg_token, agent_id, stats = res
-                        with self._stats_lock:
-                            if msg_token not in self._stats_accumulator:
-                                self._stats_accumulator[msg_token] = {}
-                            self._stats_accumulator[msg_token][agent_id] = stats
-                            
-                            # Delayed injection logic
-                            if hasattr(self, 'buffer') and 'tokens' in self.buffer:
-                                for b_idx in range(len(self.buffer['tokens'][agent_id])):
-                                    if self.buffer['tokens'][agent_id][b_idx] == msg_token:
-                                        # Only inject if not already present
-                                        if self.buffer['mcts_pi'][agent_id][b_idx] is None:
-                                            self._inject_stats_to_buffer(agent_id, b_idx, stats)
-                                            self._stats_counters['late_injected'] += 1
-                                        break
-
-                        any_data = True
-                except queue.Empty:
-                    pass
-                except Exception:
-                    pass
-            
-            if not any_data:
-                # Use a much smaller sleep to increase responsiveness
-                time.sleep(0.001)
-
-    def _inject_stats_to_buffer(self, agent_id, buf_idx, stats):
-        """Inject late-arriving stats into the experience buffer."""
-        if stats is not None and "edges" in stats:
-            edges = stats["edges"]
-            total_n = stats.get("root_n", sum(e["n"] for e in edges))
-            if total_n > 0:
-                pi = [(np.array(e["action"]), e["n"] / total_n) for e in edges]
-            else:
-                # Uniform prior if no visits
-                num_edges = len(edges) if edges else 1
-                pi = [(np.array(e["action"]), 1.0 / num_edges) for e in edges]
-            self.buffer['mcts_pi'][agent_id][buf_idx] = pi
-            self.buffer['mcts_v'][agent_id][buf_idx] = float(stats.get("root_v", 0.0))
-
     def _start_pinned_workers_shm(self):
         """Start worker processes with optimized Event-based synchronization."""
         if self._pinned_procs is not None:
             return
         
-        # Stats collector thread is disabled in SHM mode (Scheme A).
-        # We now rely 100% on synchronous SHM stats reading.
-        self._stats_collector_thread = None
-
         # 1. Start SHM buffer with stats support
-        self._shm_buffer = SharedMemoryBuffer(self.num_agents, OBS_DIM, num_action_samples=self.num_action_samples)
+        self._shm_buffer = SharedMemoryBuffer(
+            self.num_agents, 
+            OBS_DIM, 
+            lstm_hidden_dim=self.lstm_hidden_dim, 
+            num_action_samples=self.num_action_samples
+        )
         self._stop_event = mp.Event()
         
         init_env_config = {
@@ -1367,7 +1146,6 @@ class MCTSTrainer:
         self._control_queues = [mp.Queue(maxsize=8) for _ in range(self.num_agents)]
 
         # Stats backchannel disabled in SHM mode (Scheme A): stats are read synchronously from SHM.
-        self._stats_queues = [None for _ in range(self.num_agents)]
         self._pinned_procs = []
         
         for i in range(self.num_agents):
@@ -1387,40 +1165,6 @@ class MCTSTrainer:
                     self._shm_buffer._all_done_event,
                     self._shm_buffer.done_events  # Pass all done events for checking
                 )
-            )
-            p.daemon = True
-            p.start()
-            self._pinned_procs.append(p)
-
-    def _start_pinned_workers(self):
-        """Legacy worker startup using Queue."""
-        if self._pinned_procs is not None:
-            return
-
-        init_env_config = {
-            'num_agents': self.num_agents,
-            'scenario_name': self.scenario_name,
-            'use_team_reward': self.use_team_reward,
-            'max_steps': self.max_steps_per_episode,
-            'respawn_enabled': self.respawn_enabled,
-            'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
-            'ego_routes': self.ego_routes,
-        }
-        _init_worker_shared_state(
-            self._shared_weight_tensors,
-            self._shared_weight_version,
-            self._shared_weight_lock,
-            init_env_config
-        )
-
-        self._pinned_in_queues = [mp.Queue(maxsize=2) for _ in range(self.num_agents)]
-        self._pinned_out_queues = [mp.Queue(maxsize=2) for _ in range(self.num_agents)]
-        self._pinned_procs = []
-
-        for i in range(self.num_agents):
-            p = mp.Process(
-                target=_pinned_worker_loop,
-                args=(i, self._pinned_in_queues[i], self._pinned_out_queues[i])
             )
             p.daemon = True
             p.start()
@@ -1453,7 +1197,7 @@ class MCTSTrainer:
         
         config = {
             'hidden_dim': 256,
-            'lstm_hidden_dim': 128,
+            'lstm_hidden_dim': self.lstm_hidden_dim,
             'use_lstm': self.use_lstm,
             'use_tcn': self.use_tcn,
             'sequence_length': 5,
@@ -1463,7 +1207,7 @@ class MCTSTrainer:
             'temperature': 1.0,
             'rollout_depth': self.rollout_depth,
             'num_action_samples': self.num_action_samples,
-            'base_seed': self.seed,
+            'base_seed': int(self.seed) if self.seed is not None else 0,
             'episode': int(episode),
             'step': int(step),
             'ts_model_path': os.path.join(self.save_dir, 'mcts_infer.pt'),
@@ -1499,8 +1243,8 @@ class MCTSTrainer:
         if self.stats['total_steps'] % 200 == 0:
             root_ns = [s['root_n'] if s else 0 for s in all_search_stats]
             active_agents = sum(1 for n in root_ns if n > 0)
-            self.log(f"[DEBUG_SHM] Step {step} | Actions Mean: {np.mean(actions):.4f} Std: {np.std(actions):.4f} | "
-                     f"Root_N range: [{min(root_ns)}, {max(root_ns)}] | Active Agents: {active_agents}/{self.num_agents}")
+            #self.log(f"[DEBUG_SHM] Step {step} | Actions Mean: {np.mean(actions):.4f} Std: {np.std(actions):.4f} | "
+            #         f"Root_N range: [{min(root_ns)}, {max(root_ns)}] | Active Agents: {active_agents}/{self.num_agents}")
             
             # If all root_n are 0, dump raw memory snippet for the first agent to see if anything is there
             if active_agents == 0:
@@ -1509,99 +1253,8 @@ class MCTSTrainer:
                 raw_vals = np.frombuffer(raw_buf, dtype=np.float32).tolist()
                 self.log(f"[DEBUG_RAW_SHM] First 8 floats of Agent 0 stats buffer: {raw_vals}")
 
-        # 6. SHM is now 100% on-time because search is synchronous for the worker.
-        self._stats_counters['total_steps_monitored'] += 1
-        
-        # Check if all agents have valid stats in SHM
-        if all(s is not None for s in all_search_stats):
-            self._stats_counters['on_time'] += 1
-        else:
-            # Fallback to async accumulator ONLY if SHM had an issue (very rare now)
-            # Give a very small grace period
-            start_wait = time.time()
-            while time.time() - start_wait < 0.02:
-                with self._stats_lock:
-                    if token in self._stats_accumulator:
-                        current_stats = self._stats_accumulator[token]
-                        for i in range(self.num_agents):
-                            if all_search_stats[i] is None:
-                                all_search_stats[i] = current_stats.get(i)
-                        
-                        if all(s is not None for s in all_search_stats):
-                            self._stats_counters['on_time'] += 1
-                            break
-                time.sleep(0.001)
-
-        # Cleanup async accumulator to prevent memory leak
-        with self._stats_lock:
-            tokens_to_remove = [t for t in list(self._stats_accumulator.keys()) if t < token - 100]
-            for t in tokens_to_remove:
-                del self._stats_accumulator[t]
-
-        # Log summary periodically
-        if self.stats['total_steps'] - self._last_stats_report_step >= 1000:
-            self._report_stats_summary()
-            self._last_stats_report_step = self.stats['total_steps']
-
         return actions, all_search_stats, token
 
-    def _report_stats_summary(self):
-        """Print a summary of MCTS stats collection health."""
-        c = self._stats_counters
-        total = max(1, c['total_steps_monitored'])
-        on_time_pct = (c['on_time'] / total) * 100
-        late_pct = (c['late_injected'] / (total * self.num_agents)) * 100 # Rough approx
-        
-        msg = (f"[STATS_HEALTH] Total Steps: {total} | "
-               f"On-Time: {on_time_pct:2.1f}% | "
-               f"Late Injected: {c['late_injected']} | "
-               f"Dropped: {c['dropped']}")
-        self.log(msg)
-        print(f"\n{msg}")
-
-    def _parallel_mcts_search(self, obs, _env_state, episode: int = 0, step: int = 0):
-        """Legacy parallel MCTS search using Queue."""
-        if self._pinned_procs is None:
-            self._start_pinned_workers()
-
-        # OPTIMIZATION: Only sync weights at episode start
-        if step == 0:
-            self._broadcast_weights_if_dirty()
-
-        config = {
-            'hidden_dim': 256,
-            'lstm_hidden_dim': 128,
-            'use_lstm': self.use_lstm,
-            'use_tcn': self.use_tcn,
-            'sequence_length': 5,
-            'device': str(self.device),
-            'num_simulations': self.mcts_simulations,
-            'c_puct': 1.0,
-            'temperature': 1.0,
-            'rollout_depth': self.rollout_depth,
-            'num_action_samples': self.num_action_samples,
-            'base_seed': self.seed,
-            'episode': int(episode),
-            'step': int(step),
-            'ts_model_path': os.path.join(self.save_dir, 'mcts_infer.pt'),
-        }
-
-        if step == 0:
-            for q in self._pinned_in_queues:
-                q.put(('RESET',))
-
-        for i in range(self.num_agents):
-            self._pinned_in_queues[i].put(('STEP', obs[i], config))
-
-        actions = [None] * self.num_agents
-        all_search_stats = [None] * self.num_agents
-        for i in range(self.num_agents):
-            agent_id, action, search_stats = self._pinned_out_queues[i].get()
-            actions[agent_id] = action
-            all_search_stats[agent_id] = search_stats
-
-        return np.asarray(actions, dtype=np.float32), all_search_stats
-    
     def _ensure_torchscript_model(self):
         """Generate and force-verify TorchScript model for optimized MCTS inference."""
         ts_model_path = os.path.join(self.save_dir, 'mcts_infer.pt')
@@ -1818,10 +1471,9 @@ class MCTSTrainer:
                     step_token = -1
                     try:
                         if self.parallel_mcts and self.num_agents > 1:
-                            if self.use_shm:
-                                actions, all_search_stats, step_token = self._parallel_mcts_search_shm(obs, env_state, episode=episode, step=episode_length)
-                            else:
-                                actions, all_search_stats = self._parallel_mcts_search(obs, env_state, episode=episode, step=episode_length)
+                            actions, all_search_stats, step_token = self._parallel_mcts_search_shm(
+                                obs, env_state, episode=episode, step=episode_length
+                            )
                         else:
                             actions, all_search_stats = self._sequential_mcts_search(obs, env_state)
                     except Exception as e:
@@ -2031,14 +1683,7 @@ class MCTSTrainer:
                 self.buffer['mcts_v'][i].append(0.0)
 
         buffer_size = len(self.buffer['obs'][0])
-        # AlphaZero usually updates at the end of episodes, but we can do it periodically
-        update_every = int(getattr(self, 'update_every', 512))
-        if buffer_size >= update_every:
-            self._batch_update_networks()
-            self.buffer['mcts_v'][i].append(0.0)
-
-        buffer_size = len(self.buffer['obs'][0])
-        # AlphaZero usually updates at the end of episodes, but we can do it periodically
+        # AlphaZero usually updates at the end of episodes, but we can do it periodically.
         update_every = int(getattr(self, 'update_every', 512))
         if buffer_size >= update_every:
             self._batch_update_networks()
@@ -2149,7 +1794,6 @@ class MCTSTrainer:
 
                 # --- Value Loss (MSE) ---
                 step_value_loss = torch.nn.functional.mse_loss(value, z_chunk)
-
                 # Total Combined Loss
                 total_loss = c_pi * step_policy_loss + c_v * step_value_loss
                 total_loss.backward()
@@ -2205,14 +1849,11 @@ class MCTSTrainer:
             use_tcn = getattr(self.network, 'use_tcn', False)
             effective_obs_dim = OBS_DIM * 2 if (use_tcn and s_len == 5) else OBS_DIM
 
-            # Export policy/value network (policy_net_jit.pt)
-            # Use torch.jit.script when possible to support TCN (and avoid trace issues with non-Tensor outputs).
-            try:
-                scripted_policy = torch.jit.script(self.network.cpu().eval())
-                scripted_policy.save(os.path.join(os.path.dirname(path), 'policy_net_jit.pt'))
-            finally:
-                # Restore device
-                self.network.to(self.device)
+            # NOTE: We intentionally do NOT TorchScript-export the raw DualNetwork here.
+            # The C++ MCTS backend expects the exported methods on MCTSInferWrapper
+            # (infer_policy_value / infer_next_hidden). Scripting DualNetwork directly
+            # can produce warnings in TCN/LSTM feature-gated configs and is not required.
+            # If you need a standalone policy TS artifact, export the wrapper instead.
 
             # Prepare hidden_dim for wrapper tests
             hidden_dim = int(getattr(self.network, 'lstm_hidden_dim', 128))
@@ -2220,7 +1861,10 @@ class MCTSTrainer:
             # Export MCTSInferWrapper for C++ MCTS
             # NOTE: Do NOT use torch.jit.freeze() or optimize_for_inference()
             # These optimizations can strip @torch.jit.export methods that C++ needs
-            from .mcts import MCTSInferWrapper
+            try:
+                from .dual_net import MCTSInferWrapper
+            except ImportError:
+                from dual_net import MCTSInferWrapper
             wrapper = MCTSInferWrapper(self.network.cpu())
             wrapper.eval()
             scripted = torch.jit.script(wrapper)
@@ -2347,19 +1991,13 @@ def main():
         print("Training completed normally.")
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
-        final_checkpoint = os.path.join(trainer.save_dir, 'mcts_interrupted.pth')
-        trainer.save_checkpoint(final_checkpoint, trainer.stats['episode'])
-        print(f"Final checkpoint saved: {final_checkpoint}")
+        #final_checkpoint = os.path.join(trainer.save_dir, 'mcts_interrupted.pth')
+        #trainer.save_checkpoint(final_checkpoint, trainer.stats['episode'])
+        #print(f"Final checkpoint saved: {final_checkpoint}")
     except Exception as e:
         print(f"\nTraining error: {e}")
         import traceback
         traceback.print_exc()
-        try:
-            final_checkpoint = os.path.join(trainer.save_dir, 'mcts_error.pth')
-            trainer.save_checkpoint(final_checkpoint, trainer.stats.get('episode', 0))
-            print(f"Error checkpoint saved: {final_checkpoint}")
-        except Exception:
-            pass
     finally:
         try:
             trainer.close()
