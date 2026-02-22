@@ -325,6 +325,8 @@ MCTS_DUAL/
 cd DriveSimX/core/cpp/build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
+git remote set-url origin git@github.com:ShamG1/ALGORITHM.git
+ssh -T git@github.com
 ```
 
 ### 训练

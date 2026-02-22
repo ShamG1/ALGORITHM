@@ -126,6 +126,10 @@ private:
     std::vector<float> temp_obs_flat;
     std::vector<float> throttles;
     std::vector<float> steerings;
+
+    // ========== 预分配 EnvState 缓冲区 ==========
+    EnvState saved_state;
+    EnvState next_state;
     
     // ========== 预分配 Tensor 缓冲区 ==========
     // 批量推理用的 tensor（避免每次 clone + to(device)）
@@ -356,6 +360,54 @@ py::tuple mcts_search_lstm_torchscript_compact(
     float dirichlet_alpha,
     float dirichlet_eps,
     unsigned int seed
+);
+
+// --- NEW OPTIMIZED INTERFACES RECEIVING py::array_t ---
+
+void mcts_search_tcn_torchscript_seq_to_shm_np(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    py::array_t<float, py::array::c_style | py::array::forcecast> root_obs_seq,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    int lstm_hidden_dim,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed,
+    size_t action_ptr_addr,
+    size_t stats_ptr_addr
+);
+
+void mcts_search_to_shm_np(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    py::array_t<float, py::array::c_style | py::array::forcecast> root_obs_seq,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    const std::vector<float>& root_h,
+    const std::vector<float>& root_c,
+    int lstm_hidden_dim,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed,
+    size_t action_ptr_addr,
+    size_t stats_ptr_addr
 );
 
 std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(

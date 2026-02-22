@@ -161,12 +161,63 @@ struct ChildEdge {
     int child{-1};
 };
 
+// ============================================================================
+// 观测值 Arena：用于彻底消掉 Node 内的 std::vector<float> obs_seq_flat
+// 原理：每个 Node 不再存 T*D 的完整序列，只存一个指向 Arena 的索引或指针。
+// 由于 MCTS 是树状结构，许多节点的序列是高度重叠的（只有最后一帧不同）。
+// ============================================================================
+
+struct ObservationArena {
+    std::vector<float> data;
+    int obs_dim{0};
+
+    void init(int dim, int reserve_count = 10000) {
+        obs_dim = dim;
+        data.clear();
+        data.reserve((size_t)reserve_count * (size_t)dim);
+    }
+
+    // 存入一个新的观测帧，返回其在 data 中的起始位置（offset）
+    int push(const std::vector<float>& obs) {
+        if ((int)obs.size() != obs_dim) {
+            throw std::runtime_error("ObservationArena::push: obs dim mismatch");
+        }
+        int offset = (int)data.size();
+        data.insert(data.end(), obs.begin(), obs.end());
+        return offset;
+    }
+
+    int push(const float* ptr) {
+        int offset = (int)data.size();
+        data.insert(data.end(), ptr, ptr + obs_dim);
+        return offset;
+    }
+
+    const float* get(int offset) const {
+        return &data[(size_t)offset];
+    }
+};
+
+static MCTS_THREAD_LOCAL ObservationArena g_obs_arena;
+
 struct Node {
     EnvState state;
     float V{0.0f};
     int total_N{0};
     std::vector<ChildEdge> edges;
-    std::vector<float> obs_seq_flat; // flattened (T*obs_dim), per-branch observation history
+    // 优化：不再存完整的 vector，只存组成序列的帧在 Arena 中的 offsets
+    std::vector<int> obs_offsets; 
+
+    // 获取完整的展平序列（用于推理）
+    void fill_obs_seq_flat(std::vector<float>& out, int obs_dim) const {
+        int seq_len = (int)obs_offsets.size();
+        out.resize((size_t)seq_len * (size_t)obs_dim);
+        for (int i = 0; i < seq_len; ++i) {
+            std::memcpy(out.data() + (size_t)i * (size_t)obs_dim, 
+                       g_obs_arena.get(obs_offsets[(size_t)i]), 
+                       sizeof(float) * (size_t)obs_dim);
+        }
+    }
 };
 
 struct LSTMEdge {
@@ -186,7 +237,18 @@ struct LSTMNode {
     std::vector<LSTMEdge> edges;
     std::vector<float> h;
     std::vector<float> c;
-    std::vector<float> obs_seq_flat;
+    // 优化：同样改为存储 Arena 偏移量
+    std::vector<int> obs_offsets;
+
+    void fill_obs_seq_flat(std::vector<float>& out, int obs_dim) const {
+        int seq_len = (int)obs_offsets.size();
+        out.resize((size_t)seq_len * (size_t)obs_dim);
+        for (int i = 0; i < seq_len; ++i) {
+            std::memcpy(out.data() + (size_t)i * (size_t)obs_dim, 
+                       g_obs_arena.get(obs_offsets[(size_t)i]), 
+                       sizeof(float) * (size_t)obs_dim);
+        }
+    }
 };
 
 // ============================================================================
@@ -304,20 +366,27 @@ static float puct_score_basic(int total_N, float prior, int N, float W, float c_
 // ============================================================================
 
 static inline torch::Tensor make_obs_seq_tensor(
+    const float* obs_seq_ptr,
+    int seq_len,
+    int obs_dim,
+    torch::Device device
+) {
+    auto t = torch::from_blob(
+        const_cast<float*>(obs_seq_ptr),
+        {1, seq_len, obs_dim},
+        torch::TensorOptions().dtype(torch::kFloat32)
+    ).clone();
+    return t.to(device);
+}
+
+// Overload for compatibility if needed, but we should migrate away
+static inline torch::Tensor make_obs_seq_tensor(
     const std::vector<float>& obs_seq_flat,
     int seq_len,
     int obs_dim,
     torch::Device device
 ) {
-    if ((int)obs_seq_flat.size() != seq_len * obs_dim) {
-        throw std::runtime_error("root_obs_seq size mismatch: expected seq_len*obs_dim");
-    }
-    auto t = torch::from_blob(
-        const_cast<float*>(obs_seq_flat.data()),
-        {1, seq_len, obs_dim},
-        torch::TensorOptions().dtype(torch::kFloat32)
-    ).clone();
-    return t.to(device);
+    return make_obs_seq_tensor(obs_seq_flat.data(), seq_len, obs_dim, device);
 }
 
 // 优化：使用RingBuffer的版本
@@ -330,6 +399,26 @@ static inline torch::Tensor make_obs_seq_tensor_from_ring(
     auto t = torch::from_blob(
         temp_flat.data(),
         {1, ring_buf.seq_len(), ring_buf.obs_dim()},
+        torch::TensorOptions().dtype(torch::kFloat32)
+    ).clone();
+    return t.to(device);
+}
+
+// NEW: create obs tensor directly from a raw pointer without an intermediate std::vector copy.
+// NOTE: We clone() to own the memory because the source pointer (py::array buffer / SHM)
+// may not outlive the tensor usage beyond this call.
+static inline torch::Tensor make_obs_seq_tensor_from_ptr(
+    const float* ptr,
+    int seq_len,
+    int obs_dim,
+    torch::Device device
+) {
+    if (!ptr) {
+        throw std::runtime_error("make_obs_seq_tensor_from_ptr: null ptr");
+    }
+    auto t = torch::from_blob(
+        const_cast<float*>(ptr),
+        {1, seq_len, obs_dim},
         torch::TensorOptions().dtype(torch::kFloat32)
     ).clone();
     return t.to(device);
@@ -380,7 +469,31 @@ static inline void parse_policy_value_tensors(
     value_out = v.data_ptr<float>()[0];
 }
 
-// 保留原版shift_append用于兼容性，但新代码优先使用RingBuffer
+static inline std::vector<float> prepare_obs_for_arena(
+    const float* prev_raw_ptr,
+    const std::vector<float>& next_raw,
+    int obs_dim
+) {
+    int raw_dim = (int)next_raw.size();
+    if (obs_dim == raw_dim * 2) {
+        // Concat [raw, delta]
+        std::vector<float> out((size_t)obs_dim);
+        for (int i = 0; i < raw_dim; ++i) {
+            out[i] = next_raw[i];
+            float prev_val = prev_raw_ptr ? prev_raw_ptr[i] : next_raw[i];
+            out[raw_dim + i] = next_raw[i] - prev_val;
+        }
+        return out;
+    } else if (obs_dim == raw_dim) {
+        return next_raw;
+    } else {
+        throw std::runtime_error("prepare_obs_for_arena: obs_dim mismatch. expected " + 
+                                 std::to_string(raw_dim) + " or " + std::to_string(raw_dim * 2) + 
+                                 ", got " + std::to_string(obs_dim));
+    }
+}
+
+// 保留原版shift_append用于兼容性，但新代码优先使用Arena
 static inline std::vector<float> shift_append_obs_seq(
     const std::vector<float>& obs_seq_flat,
     int seq_len,
@@ -489,7 +602,10 @@ static std::vector<float> step_env_with_joint_action_deterministic(
     std::vector<float>* c_out,
     TSProfile* prof
 ) {
-    EnvState saved = env.get_state();
+    if (!t_workspace.initialized) {
+        t_workspace.init(static_cast<int>(base_state.cars.size()), 5, 145, lstm_hidden_dim);
+    }
+    env.get_state_into(t_workspace.saved_state);
     env.set_state(base_state);
 
     const int n_agents = (int)base_state.cars.size();
@@ -633,13 +749,13 @@ static std::vector<float> step_env_with_joint_action_deterministic(
         if (res.terminated || res.truncated) { terminated = true; break; }
     }
 
-    next_state_out = env.get_state();
+    env.get_state_into(next_state_out);
 
     auto obs = env.get_observations();
     std::vector<float> ego_obs;
     if (agent_index >= 0 && agent_index < (int)obs.size()) ego_obs = obs[(size_t)agent_index];
 
-    env.set_state(saved);
+    env.set_state(t_workspace.saved_state);
 
     done_out = terminated;
     total_return_out = total_reward;
@@ -678,7 +794,10 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
     std::vector<float>* c_out,
     TSProfile* prof
 ) {
-    EnvState saved = env.get_state();
+    if (!t_workspace.initialized) {
+        t_workspace.init(static_cast<int>(base_state.cars.size()), seq_len, obs_dim, lstm_hidden_dim);
+    }
+    env.get_state_into(t_workspace.saved_state);
     env.set_state(base_state);
 
     const int n_agents = (int)base_state.cars.size();
@@ -870,13 +989,14 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
         if (res.terminated || res.truncated) { terminated = true; break; }
     }
 
-    next_state_out = env.get_state();
+    next_state_out = env.get_state(); // This will be optimized next
+    env.get_state_into(next_state_out);
 
     auto obs = env.get_observations();
     std::vector<float> ego_obs;
     if (agent_index >= 0 && agent_index < (int)obs.size()) ego_obs = obs[(size_t)agent_index];
 
-    env.set_state(saved);
+    env.set_state(t_workspace.saved_state);
 
     done_out = terminated;
     total_return_out = total_reward;
@@ -941,20 +1061,30 @@ std::pair<std::vector<float>, py::dict> mcts_search_seq(
 ) {
     std::mt19937 rng(seed ? seed : std::random_device{}());
 
+    // 初始化 Arena
+    g_obs_arena.init(obs_dim, num_simulations + seq_len);
+
     std::vector<Node> nodes;
     nodes.reserve((size_t)num_simulations + 1);
 
     Node root;
     root.state = root_state;
-    root.obs_seq_flat = root_obs_seq; // 初始化根节点序列
+    // 将初始序列存入 Arena
+    for (int t = 0; t < seq_len; ++t) {
+        root.obs_offsets.push_back(g_obs_arena.push(root_obs_seq.data() + (size_t)t * obs_dim));
+    }
     nodes.push_back(std::move(root));
 
+    // 预分配临时 flatten 序列缓冲区
+    std::vector<float> temp_obs_flat;
+
     auto expand_node_seq = [&](Node& node, bool add_dirichlet) {
-        // 构建单样本batch，每个样本是 flatten 序列 (T*D)
+        node.fill_obs_seq_flat(temp_obs_flat, obs_dim);
+
         py::list obs_batch_list;
         {
             py::list row;
-            for (float v : node.obs_seq_flat) row.append(v);
+            for (float v : temp_obs_flat) row.append(v);
             obs_batch_list.append(row);
         }
 
@@ -963,7 +1093,6 @@ std::pair<std::vector<float>, py::dict> mcts_search_seq(
         h_arr.mutable_at(0,0) = 0.0f;
         c_arr.mutable_at(0,0) = 0.0f;
 
-        // 回调 Python: infer_fn 现在接收 flatten 序列
         py::tuple pv = infer_fn(obs_batch_list, h_arr, c_arr).cast<py::tuple>();
         if (pv.size() < 3) throw std::runtime_error("infer_fn must return (mean,std,value)");
 
@@ -972,7 +1101,6 @@ std::pair<std::vector<float>, py::dict> mcts_search_seq(
         parse_infer_out(pv, means, stds, values);
         node.V = values.empty() ? 0.0f : values[0];
 
-        // 采样动作... (与原版逻辑一致)
         std::vector<std::array<float,2>> sampled;
         sampled.reserve((size_t)num_action_samples);
         std::vector<float> logps;
@@ -1039,24 +1167,31 @@ std::pair<std::vector<float>, py::dict> mcts_search_seq(
             }
 
             // Expand
-            EnvState saved = env.get_state();
             env.set_state(n.state);
             auto res = env.step({e.action[0]}, {e.action[1]});
             
             float immediate_r = res.rewards.empty() ? 0.0f : res.rewards[0];
-            EnvState next_state = env.get_state();
+            EnvState next_state;
+            env.get_state_into(next_state);
             bool done = res.terminated || res.truncated;
             std::vector<float> next_obs = res.obs.empty() ? std::vector<float>() : res.obs[0];
 
-            env.set_state(saved);
-
             Node child;
             child.state = std::move(next_state);
-            // 关键优化：滚动更新序列并存入子节点
+            
+            // 优化：从父节点继承前 T-1 个 offset，只在 Arena 存入最新的 obs
             if (!next_obs.empty()) {
-                child.obs_seq_flat = shift_append_obs_seq(n.obs_seq_flat, seq_len, obs_dim, next_obs);
+                child.obs_offsets.reserve((size_t)seq_len);
+                // 继承父节点的后 seq_len - 1 个帧
+                for (size_t i = 1; i < (size_t)seq_len; ++i) {
+                    child.obs_offsets.push_back(n.obs_offsets[i]);
+                }
+                // 存入新帧并添加 offset
+                const float* prev_raw_ptr = g_obs_arena.get(n.obs_offsets.back());
+                std::vector<float> obs_to_push = prepare_obs_for_arena(prev_raw_ptr, next_obs, obs_dim);
+                child.obs_offsets.push_back(g_obs_arena.push(obs_to_push));
             } else {
-                child.obs_seq_flat = n.obs_seq_flat;
+                child.obs_offsets = n.obs_offsets;
             }
 
             int child_idx = (int)nodes.size();
@@ -1376,6 +1511,187 @@ void mcts_search_seq_to_shm(
     }
 }
 
+// Forward declarations for ptr-based fast paths (needed before *_np wrappers)
+void mcts_search_tcn_torchscript_seq_to_shm_ptr(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    const float* root_obs_ptr,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    int lstm_hidden_dim,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed,
+    size_t action_ptr_addr,
+    size_t stats_ptr_addr
+);
+
+std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq_ptr(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    const float* root_obs_ptr,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed
+);
+
+void mcts_search_tcn_torchscript_seq_to_shm_np(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    py::array_t<float, py::array::c_style | py::array::forcecast> root_obs_seq,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    int lstm_hidden_dim,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed,
+    size_t action_ptr_addr,
+    size_t stats_ptr_addr
+) {
+    auto buf = root_obs_seq.request();
+    if (buf.size != (size_t)seq_len * obs_dim) {
+        throw std::runtime_error("mcts_search_tcn_torchscript_seq_to_shm_np: obs size mismatch");
+    }
+    const float* ptr = static_cast<const float*>(buf.ptr);
+
+    // Optimized: use the ptr version to avoid the std::vector<float> copy
+    mcts_search_tcn_torchscript_seq_to_shm_ptr(
+        env, root_state, ptr, seq_len, obs_dim, model_path,
+        lstm_hidden_dim, agent_index, num_simulations, num_action_samples,
+        rollout_depth, c_puct, temperature, gamma,
+        dirichlet_alpha, dirichlet_eps, seed, action_ptr_addr, stats_ptr_addr
+    );
+}
+
+void mcts_search_tcn_torchscript_seq_to_shm_ptr(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    const float* root_obs_ptr,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    int lstm_hidden_dim,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed,
+    size_t action_ptr_addr,
+    size_t stats_ptr_addr
+) {
+    float* action_ptr = reinterpret_cast<float*>(action_ptr_addr);
+    float* stats_ptr = reinterpret_cast<float*>(stats_ptr_addr);
+
+    // Use a version of mcts_search_tcn_torchscript_seq that takes a pointer
+    auto res = mcts_search_tcn_torchscript_seq_ptr(
+        env, root_state, root_obs_ptr, seq_len, obs_dim, model_path,
+        agent_index, num_simulations, num_action_samples, rollout_depth,
+        c_puct, temperature, gamma, dirichlet_alpha, dirichlet_eps, seed
+    );
+
+    if (action_ptr) {
+        action_ptr[0] = res.first.size() > 0 ? res.first[0] : 0.0f;
+        action_ptr[1] = res.first.size() > 1 ? res.first[1] : 0.0f;
+    }
+
+    if (stats_ptr) {
+        const py::dict& stats = res.second;
+        stats_ptr[0] = stats.contains("root_v") ? py::cast<float>(stats["root_v"]) : 0.0f;
+        stats_ptr[1] = stats.contains("root_n") ? (float)py::cast<int>(stats["root_n"]) : 0.0f;
+
+        const int H = lstm_hidden_dim;
+        std::memset(stats_ptr + 2, 0, sizeof(float) * 2 * (size_t)H); 
+
+        const int actions_offset = 2 + 2 * H;
+        const int visits_offset = actions_offset + num_action_samples * 2;
+
+        std::memset(stats_ptr + actions_offset, 0,
+                    sizeof(float) * (size_t)(num_action_samples * 2 + num_action_samples));
+
+        if (stats.contains("edges")) {
+            py::list edges = py::cast<py::list>(stats["edges"]);
+            const int n = std::min((int)edges.size(), num_action_samples);
+
+            for (int i = 0; i < n; ++i) {
+                py::dict e = py::cast<py::dict>(edges[i]);
+                py::tuple act = py::cast<py::tuple>(e["action"]);
+                stats_ptr[actions_offset + i * 2] = py::cast<float>(act[0]);
+                stats_ptr[actions_offset + i * 2 + 1] = py::cast<float>(act[1]);
+                stats_ptr[visits_offset + i] = (float)py::cast<int>(e["n"]);
+            }
+        }
+    }
+}
+
+void mcts_search_to_shm_np(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    py::array_t<float, py::array::c_style | py::array::forcecast> root_obs_seq,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    const std::vector<float>& root_h,
+    const std::vector<float>& root_c,
+    int lstm_hidden_dim,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed,
+    size_t action_ptr_addr,
+    size_t stats_ptr_addr
+) {
+    auto buf = root_obs_seq.request();
+    if (buf.size != (size_t)seq_len * obs_dim) {
+        throw std::runtime_error("mcts_search_to_shm_np: obs size mismatch");
+    }
+    const float* ptr = static_cast<const float*>(buf.ptr);
+    std::vector<float> obs_seq_vec(ptr, ptr + buf.size);
+
+    mcts_search_to_shm(
+        env, root_state, obs_seq_vec, seq_len, obs_dim, model_path,
+        root_h, root_c, lstm_hidden_dim, agent_index, num_simulations,
+        num_action_samples, rollout_depth, c_puct, temperature, gamma,
+        dirichlet_alpha, dirichlet_eps, seed, action_ptr_addr, stats_ptr_addr
+    );
+}
+
 // ============================================================================
 // 基础MCTS搜索（非LSTM版本）
 // ============================================================================
@@ -1398,18 +1714,31 @@ std::pair<std::vector<float>, py::dict> mcts_search(
 ) {
     std::mt19937 rng(seed ? seed : std::random_device{}());
 
+    const int obs_dim = (int)root_obs.size();
+    const int seq_len = 1; // 基础版本 seq_len=1
+
+    // 初始化 Arena
+    g_obs_arena.init(obs_dim, num_simulations + seq_len);
+
     std::vector<Node> nodes;
     nodes.reserve((size_t)num_simulations + 1);
 
     Node root;
     root.state = root_state;
+    // 将初始观测存入 Arena
+    root.obs_offsets.push_back(g_obs_arena.push(root_obs));
     nodes.push_back(std::move(root));
 
-    auto expand_node = [&](Node& node, const std::vector<float>& node_obs, bool add_dirichlet) {
+    // 预分配临时 flatten 序列缓冲区
+    std::vector<float> temp_obs_flat;
+
+    auto expand_node = [&](Node& node, bool add_dirichlet) {
+        node.fill_obs_seq_flat(temp_obs_flat, obs_dim);
+
         py::list obs_one;
         {
             py::list row;
-            for (float v : node_obs) row.append(v);
+            for (float v : temp_obs_flat) row.append(v);
             obs_one.append(row);
         }
 
@@ -1466,7 +1795,7 @@ std::pair<std::vector<float>, py::dict> mcts_search(
         }
     };
 
-    expand_node(nodes[0], root_obs, true);
+    expand_node(nodes[0], true);
 
     for (int sim = 0; sim < num_simulations; ++sim) {
         std::vector<std::pair<int,int>> path;
@@ -1492,40 +1821,41 @@ std::pair<std::vector<float>, py::dict> mcts_search(
             }
 
             // Expand
-            bool done = false;
-            EnvState next_state;
-            float rollout_return = 0.0f;
-
-            EnvState saved = env.get_state();
             env.set_state(n.state);
             auto res = env.step({e.action[0]}, {e.action[1]});
             
             float immediate_r = 0.0f;
             if (!res.rewards.empty()) immediate_r = res.rewards[0];
 
-            next_state = env.get_state();
-            done = res.terminated || res.truncated;
+            EnvState next_state;
+            env.get_state_into(next_state);
+            bool done = res.terminated || res.truncated;
 
             std::vector<float> next_obs;
             if (!res.obs.empty()) next_obs = res.obs[0];
 
-            env.set_state(saved);
-
-            rollout_return = immediate_r;
-
             Node child;
             child.state = std::move(next_state);
+            
+            // 策略 A: 序列更新（基础版本 seq_len=1，只需替换 offset）
+            if (!next_obs.empty()) {
+                const float* prev_raw_ptr = g_obs_arena.get(n.obs_offsets.back());
+                std::vector<float> obs_to_push = prepare_obs_for_arena(prev_raw_ptr, next_obs, obs_dim);
+                child.obs_offsets.push_back(g_obs_arena.push(obs_to_push));
+            } else {
+                child.obs_offsets = n.obs_offsets;
+            }
 
             int child_idx = (int)nodes.size();
             nodes.push_back(std::move(child));
             e.child = child_idx;
 
             if (!done && !next_obs.empty()) {
-                expand_node(nodes[(size_t)child_idx], next_obs, false);
+                expand_node(nodes[(size_t)child_idx], false);
             }
 
             float leaf_value = nodes[(size_t)child_idx].V;
-            float leaf_backup = rollout_return + gamma * leaf_value;
+            float leaf_backup = immediate_r + gamma * leaf_value;
             backup_basic(path, nodes, leaf_backup);
             break;
         }
@@ -1562,10 +1892,10 @@ std::pair<std::vector<float>, py::dict> mcts_search(
 // TCN TorchScript MCTS Search (sequence version)
 // ============================================================================
 
-std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(
+std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq_ptr(
     ScenarioEnv& env,
     const EnvState& root_state,
-    const std::vector<float>& root_obs_seq,
+    const float* root_obs_ptr,
     int seq_len,
     int obs_dim,
     const std::string& model_path,
@@ -1591,12 +1921,18 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(
     torch::Device device(torch::kCPU);
     torch::jit::Module& module = get_cached_model(model_path, device);
 
+    // 初始化 Arena
+    g_obs_arena.init(obs_dim, num_simulations + seq_len);
+
     std::vector<Node> nodes;
     nodes.reserve((size_t)num_simulations + 1);
 
     Node root;
     root.state = root_state;
-    root.obs_seq_flat = root_obs_seq;
+    // 将初始序列存入 Arena
+    for (int t = 0; t < seq_len; ++t) {
+        root.obs_offsets.push_back(g_obs_arena.push(root_obs_ptr + (size_t)t * obs_dim));
+    }
     nodes.push_back(std::move(root));
 
     // For TCN, we use dummy hidden states for infer_policy_value
@@ -1605,8 +1941,17 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(
     torch::Tensor h_zero = torch::zeros({1, 1, H}, opts);
     torch::Tensor c_zero = torch::zeros({1, 1, H}, opts);
 
-    auto expand_node_ts = [&](Node& node, bool add_dirichlet) {
-        auto t_obs = make_obs_seq_tensor(node.obs_seq_flat, seq_len, obs_dim, device);
+    // 预分配临时 flatten 序列缓冲区
+    std::vector<float> temp_obs_flat;
+
+    auto expand_node_ts = [&](Node& node, const float* obs_ptr_override, bool add_dirichlet) {
+        torch::Tensor t_obs;
+        if (obs_ptr_override) {
+            t_obs = make_obs_seq_tensor_from_ptr(obs_ptr_override, seq_len, obs_dim, device);
+        } else {
+            node.fill_obs_seq_flat(temp_obs_flat, obs_dim);
+            t_obs = make_obs_seq_tensor(temp_obs_flat.data(), seq_len, obs_dim, device);
+        }
         
         double t0_pv = now_ms();
         auto out_iv = module.run_method("infer_policy_value", t_obs, h_zero, c_zero);
@@ -1668,7 +2013,8 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(
         }
     };
 
-    expand_node_ts(nodes[0], true);
+    // Use the pointer directly for the root expansion
+    expand_node_ts(nodes[0], root_obs_ptr, true);
 
     for (int sim = 0; sim < num_simulations; ++sim) {
         std::vector<std::pair<int,int>> path;
@@ -1693,23 +2039,28 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(
                 continue;
             }
 
-            EnvState saved = env.get_state();
             env.set_state(n.state);
             auto res = env.step({e.action[0]}, {e.action[1]});
             
             float immediate_r = res.rewards.empty() ? 0.0f : res.rewards[0];
-            EnvState next_state = env.get_state();
+            EnvState next_state;
+            env.get_state_into(next_state);
             bool done = res.terminated || res.truncated;
             std::vector<float> next_obs = res.obs.empty() ? std::vector<float>() : res.obs[0];
-
-            env.set_state(saved);
 
             Node child;
             child.state = std::move(next_state);
             if (!next_obs.empty()) {
-                child.obs_seq_flat = shift_append_obs_seq(n.obs_seq_flat, seq_len, obs_dim, next_obs);
+                child.obs_offsets.reserve((size_t)seq_len);
+                // Strategy A: inherit T-1 offsets and push latest
+                for (size_t i = 1; i < (size_t)seq_len; ++i) {
+                    child.obs_offsets.push_back(n.obs_offsets[i]);
+                }
+                const float* prev_raw_ptr = g_obs_arena.get(n.obs_offsets.back());
+                std::vector<float> obs_to_push = prepare_obs_for_arena(prev_raw_ptr, next_obs, obs_dim);
+                child.obs_offsets.push_back(g_obs_arena.push(obs_to_push));
             } else {
-                child.obs_seq_flat = n.obs_seq_flat;
+                child.obs_offsets = n.obs_offsets;
             }
 
             int child_idx = (int)nodes.size();
@@ -1717,7 +2068,7 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(
             e.child = child_idx;
 
             if (!done && !next_obs.empty()) {
-                expand_node_ts(nodes[(size_t)child_idx], false);
+                expand_node_ts(nodes[(size_t)child_idx], nullptr, false);
             }
 
             float leaf_value = nodes[(size_t)child_idx].V;
@@ -1781,6 +2132,33 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(
     return {action_out, stats};
 }
 
+// (removed stray duplicated block after mcts_search_tcn_torchscript_seq_ptr)
+
+std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq(
+    ScenarioEnv& env,
+    const EnvState& root_state,
+    const std::vector<float>& root_obs_seq,
+    int seq_len,
+    int obs_dim,
+    const std::string& model_path,
+    int agent_index,
+    int num_simulations,
+    int num_action_samples,
+    int rollout_depth,
+    float c_puct,
+    float temperature,
+    float gamma,
+    float dirichlet_alpha,
+    float dirichlet_eps,
+    unsigned int seed
+) {
+    return mcts_search_tcn_torchscript_seq_ptr(
+        env, root_state, root_obs_seq.data(), seq_len, obs_dim, model_path,
+        agent_index, num_simulations, num_action_samples, rollout_depth,
+        c_puct, temperature, gamma, dirichlet_alpha, dirichlet_eps, seed
+    );
+}
+
 void mcts_search_tcn_torchscript_seq_to_shm(
     ScenarioEnv& env,
     const EnvState& root_state,
@@ -1802,6 +2180,8 @@ void mcts_search_tcn_torchscript_seq_to_shm(
     size_t action_ptr_addr,
     size_t stats_ptr_addr
 ) {
+    // Legacy vector<float> API (kept for compatibility). Prefer *_np to avoid Python .tolist() overhead.
+
     float* action_ptr = reinterpret_cast<float*>(action_ptr_addr);
     float* stats_ptr = reinterpret_cast<float*>(stats_ptr_addr);
 
@@ -1883,6 +2263,9 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
     // 使用缓存的模型
     torch::jit::Module& module = get_cached_model(model_path, device);
 
+    // 初始化 Arena
+    g_obs_arena.init(obs_dim, num_simulations + seq_len);
+
     std::vector<LSTMNode> nodes;
     nodes.reserve((size_t)num_simulations + 1);
 
@@ -1890,7 +2273,10 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
     root.state = root_state;
     root.h = root_h;
     root.c = root_c;
-    root.obs_seq_flat = root_obs_seq;
+    // 将初始序列存入 Arena
+    for (int t = 0; t < seq_len; ++t) {
+        root.obs_offsets.push_back(g_obs_arena.push(root_obs_seq.data() + (size_t)t * obs_dim));
+    }
     nodes.push_back(std::move(root));
 
     // 检查是否支持 infer_expand（兼容旧模型）
@@ -1903,20 +2289,23 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
     }
 
     // init expand workspace for this thread (preallocated buffers)
-    // NOTE: if batch-expanding multiple nodes, we need a larger workspace than num_action_samples.
     const int batch_expand_nodes = int(std::max(1, std::atoi(std::getenv("MCTS_TS_BATCH_EXPAND_NODES") ? std::getenv("MCTS_TS_BATCH_EXPAND_NODES") : "1")));
     const int expand_workspace_max_b = std::max(num_action_samples, batch_expand_nodes * num_action_samples);
     t_expand_workspace.init(expand_workspace_max_b, seq_len, obs_dim, lstm_hidden_dim, device);
 
+    // 预分配临时 flatten 序列缓冲区
+    std::vector<float> temp_obs_flat;
+
     auto expand_node = [&](LSTMNode& node, bool add_dirichlet) {
         t_expand_workspace.ensure_tensors_allocated();
+        node.fill_obs_seq_flat(temp_obs_flat, obs_dim);
 
         if (has_infer_expand) {
             // ========== 优化路径：使用 infer_expand 融合方法 ==========
 
             // 1. 构建 obs batch（复制 num_action_samples 次）
             for (int k = 0; k < num_action_samples; ++k) {
-                t_expand_workspace.fill_obs_batch_row(k, node.obs_seq_flat);
+                t_expand_workspace.fill_obs_batch_row(k, temp_obs_flat);
             }
             auto obs_batch_t = t_expand_workspace.get_obs_batch_slice(num_action_samples);
 
@@ -2043,7 +2432,8 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
         } else {
             // ========== 回退路径 ==========
 
-            t_expand_workspace.fill_single_obs(node.obs_seq_flat);
+            node.fill_obs_seq_flat(temp_obs_flat, obs_dim);
+            t_expand_workspace.fill_single_obs(temp_obs_flat);
             t_expand_workspace.fill_single_hc(node.h, node.c);
 
             double t0_pv = now_ms();
@@ -2106,7 +2496,8 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
 
             // 批量获取 next_hidden（使用预分配 tensor）
             for (int k = 0; k < num_action_samples; ++k) {
-                t_expand_workspace.fill_obs_batch_row(k, node.obs_seq_flat);
+                node.fill_obs_seq_flat(temp_obs_flat, obs_dim);
+                t_expand_workspace.fill_obs_batch_row(k, temp_obs_flat);
                 t_expand_workspace.fill_hc_batch_col(k, node.h, node.c);
                 auto action_acc = t_expand_workspace.action_batch_tensor.accessor<float, 2>();
                 action_acc[k][0] = sampled[(size_t)k][0];
@@ -2195,6 +2586,9 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
             float rollout_return = 0.0f;
             std::vector<float> h_after_rollout, c_after_rollout;
 
+            // 预分配用于确定性rollout的展平观测序列
+            n.fill_obs_seq_flat(temp_obs_flat, obs_dim);
+
             std::vector<float> next_obs = step_env_with_joint_action_torchscript_deterministic(
                 env,
                 n.state,
@@ -2202,7 +2596,7 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
                 e.action,
                 module,
                 device,
-                n.obs_seq_flat,
+                temp_obs_flat,
                 e.h_next,
                 e.c_next,
                 seq_len,
@@ -2218,13 +2612,23 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
                 &prof
             );
 
-            std::vector<float> child_obs_seq = shift_append_obs_seq(n.obs_seq_flat, seq_len, obs_dim, next_obs);
-
             LSTMNode child;
             child.state = std::move(next_state);
             child.h = std::move(h_after_rollout);
             child.c = std::move(c_after_rollout);
-            child.obs_seq_flat = std::move(child_obs_seq);
+            
+            // 优化：从父节点继承前 T-1 个 offset，只在 Arena 存入最新的 obs
+            if (!next_obs.empty()) {
+                child.obs_offsets.reserve((size_t)seq_len);
+                for (size_t i = 1; i < (size_t)seq_len; ++i) {
+                    child.obs_offsets.push_back(n.obs_offsets[i]);
+                }
+                const float* prev_raw_ptr = g_obs_arena.get(n.obs_offsets.back());
+                std::vector<float> obs_to_push = prepare_obs_for_arena(prev_raw_ptr, next_obs, obs_dim);
+                child.obs_offsets.push_back(g_obs_arena.push(obs_to_push));
+            } else {
+                child.obs_offsets = n.obs_offsets;
+            }
 
             int child_idx = (int)nodes.size();
             nodes.push_back(std::move(child));
@@ -2358,6 +2762,13 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
 
     std::mt19937 rng(seed ? seed : std::random_device{}());
 
+    // 对于 LSTM 回调版本，通常 seq_len=1
+    const int seq_len = 1;
+    const int obs_dim = (int)root_obs.size();
+
+    // 初始化 Arena
+    g_obs_arena.init(obs_dim, num_simulations + seq_len);
+
     std::vector<LSTMNode> nodes;
     nodes.reserve((size_t)num_simulations + 1);
 
@@ -2365,13 +2776,20 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
     root.state = root_state;
     root.h = root_h;
     root.c = root_c;
+    // 将初始观测存入 Arena
+    root.obs_offsets.push_back(g_obs_arena.push(root_obs));
     nodes.push_back(std::move(root));
 
-    auto expand_node = [&](LSTMNode& node, const std::vector<float>& node_obs, bool add_dirichlet) {
+    // 预分配临时 flatten 序列缓冲区
+    std::vector<float> temp_obs_flat;
+
+    auto expand_node = [&](LSTMNode& node, bool add_dirichlet) {
+        node.fill_obs_seq_flat(temp_obs_flat, obs_dim);
+
         py::list obs_one;
         {
             py::list row;
-            for (float v : node_obs) row.append(v);
+            for (float v : temp_obs_flat) row.append(v);
             obs_one.append(row);
         }
 
@@ -2441,7 +2859,7 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
         py::list obs_batch;
         for (int k = 0; k < num_action_samples; ++k) {
             py::list row;
-            for (float v : node_obs) row.append(v);
+            for (float v : temp_obs_flat) row.append(v);
             obs_batch.append(row);
         }
 
@@ -2481,7 +2899,7 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
         }
     };
 
-    expand_node(nodes[0], root_obs, true);
+    expand_node(nodes[0], true);
 
     // MCTS主循环
     for (int sim = 0; sim < num_simulations; ++sim) {
@@ -2537,12 +2955,25 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm(
             child.h = std::move(h_after_rollout);
             child.c = std::move(c_after_rollout);
 
+            // 策略 A: 序列更新
+            if (!next_obs.empty()) {
+                child.obs_offsets.reserve((size_t)seq_len);
+                for (size_t i = 1; i < (size_t)seq_len; ++i) {
+                    child.obs_offsets.push_back(n.obs_offsets[i]);
+                }
+                const float* prev_raw_ptr = g_obs_arena.get(n.obs_offsets.back());
+                std::vector<float> obs_to_push = prepare_obs_for_arena(prev_raw_ptr, next_obs, obs_dim);
+                child.obs_offsets.push_back(g_obs_arena.push(obs_to_push));
+            } else {
+                child.obs_offsets = n.obs_offsets;
+            }
+
             int child_idx = (int)nodes.size();
             nodes.push_back(std::move(child));
             e.child = child_idx;
 
             if (!done && !next_obs.empty()) {
-                expand_node(nodes[(size_t)child_idx], next_obs, false);
+                expand_node(nodes[(size_t)child_idx], false);
             }
 
             float leaf_value = nodes[(size_t)child_idx].V;

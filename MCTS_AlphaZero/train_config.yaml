@@ -9,11 +9,30 @@ env:
   respawn_enabled: true
 
 mcts:
-  simulations: 100
-  rollout_depth: 25
-  num_action_samples: 16
+  # Speed/quality presets (rough guide; depends on CPU/core count and scenario):
+  #
+  # 1) Fast debug (~10-20s/episode @ 500 steps):
+  #    simulations: 20
+  #    rollout_depth: 10
+  #    num_action_samples: 8
+  #
+  # 2) Balanced (~20-30s/episode @ 500 steps):
+  #    simulations: 50
+  #    rollout_depth: 15
+  #    num_action_samples: 8
+  #
+  # 3) Quality (current; ~30-40s/episode @ 500 steps on your machine):
+  #    simulations: 100
+  #    rollout_depth: 25
+  #    num_action_samples: 16
+  #
+  # Note: runtime is roughly linear in simulations and num_action_samples, and also
+  # increases with rollout_depth and num_agents.
+  simulations: 50
+  rollout_depth: 15
+  num_action_samples: 8
   parallel: true
-  max_workers: 6
+  max_workers: 10
 
 net:
   device: cpu          # auto/cpu/cuda

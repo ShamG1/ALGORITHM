@@ -9,7 +9,6 @@
 import os
 import sys
 import time
-import struct
 import queue
 
 # Suppress pygame messages in worker processes (set before any pygame imports)
@@ -87,9 +86,8 @@ class SharedMemoryBuffer:
         self.obs_size = num_agents * obs_dim * 4  # float32
         self.action_size = num_agents * action_dim * 4
         self.stats_size = num_agents * self.stats_per_agent * 4
-        self.token_size = 8
         
-        self.total_size = self.obs_size + self.action_size + self.stats_size + self.token_size
+        self.total_size = self.obs_size + self.action_size + self.stats_size
         
         # Create shared memory
         self._shm = shared_memory.SharedMemory(create=True, size=self.total_size)
@@ -98,7 +96,6 @@ class SharedMemoryBuffer:
         self._obs_offset = 0
         self._action_offset = self.obs_size
         self._stats_offset = self.obs_size + self.action_size
-        self._token_offset = self.obs_size + self.action_size + self.stats_size
         
         # Event-based synchronization (replaces busy-wait polling)
         self._ready_events = [mp.Event() for _ in range(num_agents)]
@@ -127,12 +124,6 @@ class SharedMemoryBuffer:
         obs_bytes = np.ascontiguousarray(obs_array, dtype=np.float32).tobytes()
         buf[self._obs_offset:self._obs_offset + len(obs_bytes)] = obs_bytes
 
-    def write_token(self, token: int):
-        """Write current step token to shared memory."""
-        buf = self._shm.buf
-        token_bytes = struct.pack('q', token)
-        buf[self._token_offset:self._token_offset + 8] = token_bytes
-    
     def read_all_actions(self) -> np.ndarray:
         """Read all actions from shared memory."""
         buf = self._shm.buf
@@ -232,7 +223,6 @@ class SharedMemoryBufferClient:
         self._obs_offset = 0
         self._action_offset = self.obs_size
         self._stats_offset = self.obs_size + self.action_size
-        self._token_offset = self.obs_size + self.action_size + self.stats_size
         
         self._shm = shared_memory.SharedMemory(name=shm_name)
         
@@ -249,12 +239,6 @@ class SharedMemoryBufferClient:
         obs_bytes = bytes(buf[offset:offset + self.obs_dim * 4])
         return np.frombuffer(obs_bytes, dtype=np.float32).copy()
 
-    def read_token(self) -> int:
-        """Read current step token from shared memory."""
-        buf = self._shm.buf
-        token_bytes = bytes(buf[self._token_offset:self._token_offset + 8])
-        return struct.unpack('q', token_bytes)[0]
-    
     @property
     def action_ptr_addr(self) -> int:
         """Get raw address of action buffer for this agent in SHM."""
@@ -500,15 +484,13 @@ def _pinned_worker_loop_shm_optimized(
     )
     
     tensor_cache = None
-    current_token = -1
 
     while not stop_event.is_set():
         # Wait for ready signal (blocking with timeout)
         if not shm_client.wait_ready(timeout=0.5):
             continue
         
-        # CRITICAL: Check control commands AFTER ready signal to ensure token is picked up
-        # before starting MCTS search for this specific step.
+        # Check control commands after ready signal
         try:
             while True:
                 try:
@@ -524,11 +506,8 @@ def _pinned_worker_loop_shm_optimized(
                                 oh.clear()
                             except Exception:
                                 _WORKER_CACHE["obs_history"] = None
-                        current_token = -1 # Reset token on new episode
                     elif msg[0] == 'CONFIG':
                         config = msg[1]
-                    elif msg[0] == 'TOKEN':
-                        current_token = int(msg[1])
                     elif msg[0] == 'SYNC_WEIGHTS':
                         # Force weight sync
                         _WORKER_CACHE["_last_weight_version"] = -1
@@ -681,10 +660,10 @@ def _pinned_worker_loop_shm_optimized(
                     root_obs_seq_flat = obs_seq_np.astype(np.float32).flatten()
                     obs_dim_net = int(root_obs_seq_flat.size // seq_len)
 
-                    _cpp_backend.mcts_search_tcn_torchscript_seq_to_shm(
+                    _cpp_backend.mcts_search_tcn_torchscript_seq_to_shm_np(
                         env_cpp,
                         root_state_cpp,
-                        root_obs_seq_flat.tolist(),
+                        root_obs_seq_flat,
                         seq_len,
                         obs_dim_net,
                         config.get('ts_model_path'),
@@ -718,20 +697,25 @@ def _pinned_worker_loop_shm_optimized(
             if use_lstm_flag:
                 lstm_hidden_dim = int(config['lstm_hidden_dim'])
                 
+                h_np = None
+                c_np = None
+
                 if shm_ptrs is not None:
-                    # SHM Path: Read directly from stats buffer
+                    # SHM Path: Read directly from stats buffer using numpy view for safety
                     # Layout: [root_v(1), root_n(1), h_next(H), c_next(H), ...]
-                    import ctypes
-                    stats_ptr = ctypes.cast(shm_client.stats_ptr_addr, ctypes.POINTER(ctypes.c_float))
-                    # h_next starts at offset 2, c_next starts at offset 2 + H
-                    h_np = np.fromiter(stats_ptr[2 : 2 + lstm_hidden_dim], dtype=np.float32, count=lstm_hidden_dim)
-                    c_np = np.fromiter(stats_ptr[2 + lstm_hidden_dim : 2 + 2 * lstm_hidden_dim], dtype=np.float32, count=lstm_hidden_dim)
+                    # stats_offset for this agent = self._stats_offset + agent_id * self.stats_per_agent * 4
+                    stats_offset = shm_client._stats_offset + agent_id * shm_client.stats_per_agent * 4
+                    # Read the full stats array as float32
+                    stats_view = np.frombuffer(shm_client._shm.buf, dtype=np.float32, 
+                                             count=shm_client.stats_per_agent, offset=stats_offset)
+                    
+                    # Extract h_next and c_next using standard numpy slicing
+                    h_np = stats_view[2 : 2 + lstm_hidden_dim].copy()
+                    c_np = stats_view[2 + lstm_hidden_dim : 2 + 2 * lstm_hidden_dim].copy()
                 elif isinstance(search_stats, dict) and ("h_next" in search_stats):
                     # Legacy/Fallback Path: Read from dict
                     h_np = np.asarray(search_stats.get("h_next"), dtype=np.float32).reshape(-1)
                     c_np = np.asarray(search_stats.get("c_next"), dtype=np.float32).reshape(-1)
-                else:
-                    h_np = c_np = None
 
                 if h_np is not None and h_np.size == lstm_hidden_dim:
                     hn = torch.as_tensor(h_np).view(1, 1, lstm_hidden_dim)
@@ -752,7 +736,7 @@ def _pinned_worker_loop_shm_optimized(
                 try:
                     # Only send to queue if we're not using the direct SHM path (fallback)
                     if search_stats:
-                        out_stats_queue.put((current_token, agent_id, search_stats), block=False)
+                        out_stats_queue.put((agent_id, search_stats), block=False)
                 except queue.Full:
                     pass
         
@@ -764,7 +748,7 @@ def _pinned_worker_loop_shm_optimized(
             shm_client.write_action_and_stats(agent_id, np.zeros(2, dtype=np.float32), None)
             if out_stats_queue is not None:
                 try:
-                    out_stats_queue.put((current_token, agent_id, None), block=False)
+                    out_stats_queue.put((agent_id, None), block=False)
                 except Exception:
                     pass
         
@@ -1079,7 +1063,6 @@ class MCTSTrainer:
             'dones': [[] for _ in range(num_agents)],
             'mcts_pi': [[] for _ in range(self.num_agents)],
             'mcts_v': [[] for _ in range(self.num_agents)],
-            'tokens': [[] for _ in range(self.num_agents)],
         }
         
         self.log_file = os.path.join(save_dir, 'training_log.txt')
@@ -1116,6 +1099,8 @@ class MCTSTrainer:
             return
         
         # 1. Start SHM buffer with stats support
+        # SHM obs_dim should ALWAYS be the raw OBS_DIM from environment.
+        # The worker will handle history and delta features (TCN) internally.
         self._shm_buffer = SharedMemoryBuffer(
             self.num_agents, 
             OBS_DIM, 
@@ -1219,15 +1204,10 @@ class MCTSTrainer:
                 q.put(('RESET',))
                 q.put(('CONFIG', config))
         
-        # 2. Generate and broadcast step token (strict alignment)
-        # TOKEN must be sent AFTER RESET/CONFIG to ensure worker has latest context
-        token = (int(episode) << 20) | int(step)
-        for q in self._control_queues:
-            q.put(('TOKEN', token))
-        
-        # 3. Write observations
-        obs_array = np.asarray(obs, dtype=np.float32)
-        self._shm_buffer.write_all_observations(obs_array)
+        # 2. Write observations
+        obs_array_raw = np.asarray(obs, dtype=np.float32)
+        # Always write raw observations to SHM; workers handle history/delta
+        self._shm_buffer.write_all_observations(obs_array_raw)
         
         # 4. Signal workers and wait for completion (Event-based, no polling!)
         self._shm_buffer.signal_all_ready()
@@ -1243,8 +1223,6 @@ class MCTSTrainer:
         if self.stats['total_steps'] % 200 == 0:
             root_ns = [s['root_n'] if s else 0 for s in all_search_stats]
             active_agents = sum(1 for n in root_ns if n > 0)
-            #self.log(f"[DEBUG_SHM] Step {step} | Actions Mean: {np.mean(actions):.4f} Std: {np.std(actions):.4f} | "
-            #         f"Root_N range: [{min(root_ns)}, {max(root_ns)}] | Active Agents: {active_agents}/{self.num_agents}")
             
             # If all root_n are 0, dump raw memory snippet for the first agent to see if anything is there
             if active_agents == 0:
@@ -1253,7 +1231,7 @@ class MCTSTrainer:
                 raw_vals = np.frombuffer(raw_buf, dtype=np.float32).tolist()
                 self.log(f"[DEBUG_RAW_SHM] First 8 floats of Agent 0 stats buffer: {raw_vals}")
 
-        return actions, all_search_stats, token
+        return actions, all_search_stats
 
     def _ensure_torchscript_model(self):
         """Generate and force-verify TorchScript model for optimized MCTS inference."""
@@ -1468,10 +1446,9 @@ class MCTSTrainer:
                         except Exception:
                             pass
                     
-                    step_token = -1
                     try:
                         if self.parallel_mcts and self.num_agents > 1:
-                            actions, all_search_stats, step_token = self._parallel_mcts_search_shm(
+                            actions, all_search_stats = self._parallel_mcts_search_shm(
                                 obs, env_state, episode=episode, step=episode_length
                             )
                         else:
@@ -1505,7 +1482,7 @@ class MCTSTrainer:
                     done = terminated or truncated
                     
                     # Update with AlphaZero search_stats
-                    self._update_networks(obs, actions, rewards, next_obs, done, search_stats=all_search_stats, token=step_token)
+                    self._update_networks(obs, actions, rewards, next_obs, done, search_stats=all_search_stats)
                     
                     episode_reward += rewards
                     episode_length += 1
@@ -1638,7 +1615,7 @@ class MCTSTrainer:
         
         return np.array(actions), all_search_stats
 
-    def _update_networks(self, obs, actions, rewards, next_obs, done, search_stats=None, token: Optional[int] = None):
+    def _update_networks(self, obs, actions, rewards, next_obs, done, search_stats=None):
         """Update networks using experience buffer, storing AlphaZero search statistics."""
         if not hasattr(self, 'buffer') or 'mcts_pi' not in self.buffer:
             self.buffer = {
@@ -1649,10 +1626,7 @@ class MCTSTrainer:
                 'dones': [[] for _ in range(self.num_agents)],
                 'mcts_pi': [[] for _ in range(self.num_agents)], # AlphaZero: visit count distribution
                 'mcts_v': [[] for _ in range(self.num_agents)],  # AlphaZero: search value
-                'tokens': [[] for _ in range(self.num_agents)],  # Step tokens for late stats injection
             }
-
-        step_token_val = int(token) if token is not None else -1
 
         for i in range(self.num_agents):
             self.buffer['obs'][i].append(np.asarray(obs[i], dtype=np.float32))
@@ -1660,7 +1634,6 @@ class MCTSTrainer:
             self.buffer['actions'][i].append(np.asarray(actions[i], dtype=np.float32))
             self.buffer['rewards'][i].append(float(rewards[i]))
             self.buffer['dones'][i].append(float(done))
-            self.buffer['tokens'][i].append(step_token_val)
             
             # AlphaZero stats
             if search_stats is not None and i < len(search_stats):
@@ -1826,7 +1799,7 @@ class MCTSTrainer:
             'dones': [[] for _ in range(self.num_agents)],
             'mcts_pi': [[] for _ in range(self.num_agents)],
             'mcts_v': [[] for _ in range(self.num_agents)],
-            'tokens': [[] for _ in range(self.num_agents)],
+
         }
 
     

@@ -615,6 +615,11 @@ StepResult ScenarioEnv::step(const std::vector<float>& throttles,
 
 EnvState ScenarioEnv::get_state() const {
     EnvState s;
+    get_state_into(s);
+    return s;
+}
+
+void ScenarioEnv::get_state_into(EnvState& s) const {
     s.cars.clear();
     s.cars.reserve(cars.size());
     for (const auto& c : cars) s.cars.push_back(c.get_dynamic_state());
@@ -626,7 +631,6 @@ EnvState ScenarioEnv::get_state() const {
     s.agent_ids = agent_ids;
     s.next_agent_id = next_agent_id;
     s.step_count = step_count;
-    return s;
 }
 
 void ScenarioEnv::set_state(const EnvState& s) {
@@ -645,11 +649,15 @@ void ScenarioEnv::set_state(const EnvState& s) {
     next_agent_id = s.next_agent_id;
     step_count = s.step_count;
 
-    // Rebuild lidars to match car counts (counts are assumed unchanged within an episode)
-    lidars.clear();
-    lidars.resize(cars.size());
-    traffic_lidars.clear();
-    traffic_lidars.resize(traffic_cars.size());
+    // Optimized: Only rebuild lidars if car counts changed
+    if (lidars.size() != cars.size()) {
+        lidars.clear();
+        lidars.resize(cars.size());
+    }
+    if (traffic_lidars.size() != traffic_cars.size()) {
+        traffic_lidars.clear();
+        traffic_lidars.resize(traffic_cars.size());
+    }
 }
 
 std::vector<float> ScenarioEnv::get_global_state(int agent_index, int k_nearest) const {

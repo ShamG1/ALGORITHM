@@ -82,3 +82,15 @@ def mcts_search_lstm_torchscript(*args, **kwargs):
 
 def mcts_search_tcn_torchscript_seq_to_shm(*args, **kwargs):
     return _require().mcts_search_tcn_torchscript_seq_to_shm(*args, **kwargs)
+
+
+def mcts_search_tcn_torchscript_seq_to_shm_np(*args, **kwargs):
+    return _require().mcts_search_tcn_torchscript_seq_to_shm_np(*args, **kwargs)
+
+
+def mcts_search_to_shm(*args, **kwargs):
+    return _require().mcts_search_to_shm(*args, **kwargs)
+
+
+def mcts_search_to_shm_np(*args, **kwargs):
+    return _require().mcts_search_to_shm_np(*args, **kwargs)

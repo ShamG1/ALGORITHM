@@ -1,183 +1,231 @@
 # profile_mcts.py
 # Run this to identify remaining bottlenecks
-# Usage: python MCTS_DUAL/profile_mcts.py
+# Usage: python MCTS_AlphaZero/profile_mcts.py
 
 import os
 import sys
 import time
 import numpy as np
+from typing import List, Optional
 
 # Add parent directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-def profile_single_episode():
-    """Profile a single episode to identify bottlenecks."""
-    
-    from MCTS_DUAL.train import MCTSTrainer
+
+def _fmt_stats(name: str, values: List[float]) -> str:
+    if not values:
+        return f"{name:18s}: (no data)"
+    arr = np.asarray(values, dtype=np.float64) * 1000.0
+    return (
+        f"{name:18s}: mean={arr.mean():8.2f}ms  std={arr.std():7.2f}ms  "
+        f"min={arr.min():7.2f}ms  max={arr.max():7.2f}ms"
+    )
+
+
+def profile_single_episode(
+    num_steps: int = 30,
+    num_agents: int = 6,
+    scenario_name: str = "roundabout_3lane",
+    simulations: int = 100,
+    rollout_depth: int = 25,
+    num_action_samples: int = 16,
+    use_tcn: bool = True,
+    use_lstm: bool = False,
+):
+    """Profile a short run with production-like MCTS settings.
+
+    This profiler is designed for your current SHM+Event architecture.
+    It breaks down each step into:
+      - SHM write obs
+      - signal+wait (dominant: worker MCTS work)
+      - SHM read actions/stats
+      - env.step
+      - update/buffer bookkeeping
+      - overhead (rest)
+    """
+
     import torch
-    
-    print("=" * 60)
-    print("MCTS Performance Profiler")
-    print("=" * 60)
-    
-    # Create trainer with minimal settings for profiling
+    from MCTS_AlphaZero.train import MCTSTrainer
+
+    print("=" * 70)
+    print("MCTS AlphaZero Profiler (SHM/Event)")
+    print("=" * 70)
+
     trainer = MCTSTrainer(
-        num_agents=6,
-        num_lanes=2,
+        num_agents=num_agents,
+        scenario_name=scenario_name,
         max_episodes=1,
-        max_steps_per_episode=50,  # Short episode for profiling
-        mcts_simulations=5,
-        rollout_depth=5,
-        num_action_samples=3,
-        device='cpu',
-        use_lstm=True,
+        max_steps_per_episode=num_steps,
+        mcts_simulations=simulations,
+        rollout_depth=rollout_depth,
+        num_action_samples=num_action_samples,
+        device="cpu",
+        use_tcn=use_tcn,
+        use_lstm=use_lstm,
         render=False,
-        save_dir='MCTS_DUAL/checkpoints',
+        save_dir="MCTS_AlphaZero/checkpoints",
         parallel_mcts=True,
         use_shm=True,
-        use_tqdm=False
+        use_tqdm=False,
     )
-    
-    # Reset environment
+
+    # Ensure TS exists (so profiling reflects the intended fast path)
+    trainer._ensure_torchscript_model()
+
     obs, info = trainer.env.reset()
-    
-    # Initialize obs history
-    if trainer.use_lstm:
+    if trainer.use_lstm or trainer.use_tcn:
         for i in range(trainer.num_agents):
             trainer.obs_history[i].clear()
             trainer.obs_history[i].append(obs[i])
-    
-    # Timing breakdown
+
     timings = {
-        'mcts_search': [],
-        'env_step': [],
-        'total_step': [],
+        "total_step": [],
+        "shm_write_obs": [],
+        "shm_signal_wait": [],
+        "shm_read_results": [],
+        "env_step": [],
+        "update_buf": [],
+        "overhead": [],
     }
-    
-    print(f"\nRunning {trainer.max_steps_per_episode} steps with {trainer.num_agents} agents...")
-    print(f"MCTS simulations: {trainer.mcts_simulations}")
-    print(f"Rollout depth: {trainer.rollout_depth}")
-    print(f"Action samples: {trainer.num_action_samples}")
-    print()
-    
+
+    print(
+        f"Config: agents={num_agents} scenario={scenario_name} steps={num_steps} | "
+        f"sims={simulations} depth={rollout_depth} K={num_action_samples} | "
+        f"mode={'TCN' if use_tcn else 'LSTM' if use_lstm else 'MLP'}"
+    )
+    print("-" * 70)
+
     done = False
     step = 0
-    
-    while not done and step < trainer.max_steps_per_episode:
-        step_start = time.perf_counter()
-        
-        # Update obs history
-        if trainer.use_lstm and step > 0:
+
+    while (not done) and step < num_steps:
+        t0 = time.perf_counter()
+
+        # keep history consistent with train loop
+        if (trainer.use_lstm or trainer.use_tcn) and step > 0:
             for i in range(trainer.num_agents):
                 trainer.obs_history[i].append(obs[i])
-        
-        # MCTS search
-        mcts_start = time.perf_counter()
-        if trainer.use_shm:
-            actions = trainer._parallel_mcts_search_shm(obs, None, episode=1, step=step)
-        else:
-            actions = trainer._parallel_mcts_search(obs, None, episode=1, step=step)
-        mcts_end = time.perf_counter()
-        timings['mcts_search'].append(mcts_end - mcts_start)
-        
-        # Environment step
-        env_start = time.perf_counter()
+
+        # --- inline _parallel_mcts_search_shm for finer timing ---
+        if trainer._pinned_procs is None:
+            trainer._start_pinned_workers_shm()
+
+        if step == 0:
+            trainer._broadcast_weights_if_dirty()
+            cfg = {
+                "hidden_dim": 256,
+                "lstm_hidden_dim": trainer.lstm_hidden_dim,
+                "use_lstm": trainer.use_lstm,
+                "use_tcn": trainer.use_tcn,
+                "sequence_length": 5,
+                "device": str(trainer.device),
+                "num_simulations": trainer.mcts_simulations,
+                "c_puct": 1.0,
+                "temperature": 1.0,
+                "rollout_depth": trainer.rollout_depth,
+                "num_action_samples": trainer.num_action_samples,
+                "base_seed": int(trainer.seed) if trainer.seed is not None else 0,
+                "episode": 1,
+                "step": int(step),
+                "ts_model_path": os.path.join(trainer.save_dir, "mcts_infer.pt"),
+            }
+            for q in trainer._control_queues:
+                q.put(("RESET",))
+                q.put(("CONFIG", cfg))
+
+        # write obs
+        t_w0 = time.perf_counter()
+        obs_array_raw = np.asarray(obs, dtype=np.float32)
+        trainer._shm_buffer.write_all_observations(obs_array_raw)
+        t_w1 = time.perf_counter()
+
+        # signal + wait (dominant)
+        t_sw0 = time.perf_counter()
+        trainer._shm_buffer.signal_all_ready()
+        ok = trainer._shm_buffer.wait_all_done(timeout=60.0)
+        t_sw1 = time.perf_counter()
+        if not ok:
+            print(f"[WARN] wait_all_done timeout at step={step}")
+
+        # read results
+        t_r0 = time.perf_counter()
+        actions = trainer._shm_buffer.read_all_actions()
+        all_search_stats = trainer._shm_buffer.read_all_stats()
+        t_r1 = time.perf_counter()
+
+        # env step
+        t_e0 = time.perf_counter()
         next_obs, rewards, terminated, truncated, info = trainer.env.step(actions)
-        env_end = time.perf_counter()
-        timings['env_step'].append(env_end - env_start)
-        
-        step_end = time.perf_counter()
-        timings['total_step'].append(step_end - step_start)
-        
-        done = terminated or truncated
+        t_e1 = time.perf_counter()
+
+        # update/buffer
+        t_u0 = time.perf_counter()
+        trainer._update_networks(
+            obs,
+            actions,
+            rewards,
+            next_obs,
+            terminated or truncated,
+            search_stats=all_search_stats,
+        )
+        t_u1 = time.perf_counter()
+
+        t1 = time.perf_counter()
+
+        timings["shm_write_obs"].append(t_w1 - t_w0)
+        timings["shm_signal_wait"].append(t_sw1 - t_sw0)
+        timings["shm_read_results"].append(t_r1 - t_r0)
+        timings["env_step"].append(t_e1 - t_e0)
+        timings["update_buf"].append(t_u1 - t_u0)
+        timings["total_step"].append(t1 - t0)
+
+        known = (t_w1 - t_w0) + (t_sw1 - t_sw0) + (t_r1 - t_r0) + (t_e1 - t_e0) + (t_u1 - t_u0)
+        timings["overhead"].append((t1 - t0) - known)
+
         obs = next_obs
+        done = terminated or truncated
         step += 1
-        
+
         if step <= 5 or step % 10 == 0:
-            print(f"Step {step:3d}: MCTS={timings['mcts_search'][-1]*1000:6.1f}ms, "
-                  f"Env={timings['env_step'][-1]*1000:5.1f}ms, "
-                  f"Total={timings['total_step'][-1]*1000:6.1f}ms")
-    
-    # Print summary
-    print("\n" + "=" * 60)
+            print(
+                f"Step {step:3d}: total={timings['total_step'][-1]*1000:7.1f}ms | "
+                f"wait(MCTS)={timings['shm_signal_wait'][-1]*1000:7.1f}ms | "
+                f"env={timings['env_step'][-1]*1000:6.1f}ms"
+            )
+
+    print("\n" + "=" * 70)
     print("TIMING SUMMARY")
-    print("=" * 60)
-    
-    for name, values in timings.items():
-        if values:
-            arr = np.array(values) * 1000  # Convert to ms
-            print(f"{name:15s}: mean={arr.mean():7.2f}ms, "
-                  f"std={arr.std():6.2f}ms, "
-                  f"min={arr.min():6.2f}ms, "
-                  f"max={arr.max():6.2f}ms")
-    
-    # Estimate episode time
-    total_time = sum(timings['total_step'])
-    steps_per_episode = 500  # Typical episode length
-    estimated_episode_time = (total_time / step) * steps_per_episode
-    
-    print(f"\nActual steps completed: {step}")
-    print(f"Total time: {total_time:.2f}s")
-    print(f"Estimated time for {steps_per_episode} steps: {estimated_episode_time:.1f}s")
-    
-    # Breakdown analysis
-    mcts_total = sum(timings['mcts_search'])
-    env_total = sum(timings['env_step'])
-    other_total = total_time - mcts_total - env_total
-    
-    print(f"\nTime breakdown:")
-    print(f"  MCTS search: {mcts_total:.2f}s ({100*mcts_total/total_time:.1f}%)")
-    print(f"  Env step:    {env_total:.2f}s ({100*env_total/total_time:.1f}%)")
-    print(f"  Other:       {other_total:.2f}s ({100*other_total/total_time:.1f}%)")
-    
-    # Optimization suggestions
-    print("\n" + "=" * 60)
-    print("OPTIMIZATION SUGGESTIONS")
-    print("=" * 60)
-    
-    mcts_pct = 100 * mcts_total / total_time
-    env_pct = 100 * env_total / total_time
-    
-    if mcts_pct > 80:
-        print("→ MCTS is the main bottleneck. Consider:")
-        print("  - Reduce mcts_simulations (current: 5)")
-        print("  - Reduce rollout_depth (current: 5)")
-        print("  - Reduce num_action_samples (current: 3)")
-        print("  - Verify TorchScript model is being used (check for warnings)")
-    elif env_pct > 50:
-        print("→ Environment step is significant. Consider:")
-        print("  - Profile C++ environment code")
-        print("  - Check for unnecessary computations in step()")
-    else:
-        print("→ Time is distributed. Main areas to optimize:")
-        if mcts_pct > 50:
-            print("  - MCTS search (try reducing simulations)")
-        if env_pct > 20:
-            print("  - Environment step")
-        print("  - IPC/synchronization overhead")
-    
-    # Check TorchScript status
-    ts_path = os.path.join(trainer.save_dir, 'mcts_infer.pt')
-    if os.path.exists(ts_path):
-        print(f"\n✓ TorchScript model exists at {ts_path}")
-        # Try to load and verify
-        try:
-            model = torch.jit.load(ts_path)
-            methods = [m for m in dir(model) if not m.startswith('_')]
-            if 'infer_policy_value' in methods:
-                print("✓ TorchScript model has correct format (infer_policy_value found)")
-            else:
-                print("✗ TorchScript model missing infer_policy_value method!")
-                print(f"  Available methods: {methods}")
-        except Exception as e:
-            print(f"✗ Failed to load TorchScript model: {e}")
-    else:
-        print(f"\n✗ TorchScript model NOT found at {ts_path}")
-        print("  This means Python callbacks are being used (slower)")
-    
+    print("=" * 70)
+    for k in [
+        "shm_write_obs",
+        "shm_signal_wait",
+        "shm_read_results",
+        "env_step",
+        "update_buf",
+        "overhead",
+        "total_step",
+    ]:
+        print(_fmt_stats(k, timings[k]))
+
+    total_avg_s = float(np.mean(timings["total_step"])) if timings["total_step"] else 0.0
+    if total_avg_s > 0:
+        est_500 = total_avg_s * 500
+        print(f"\nEstimated 500-step episode time: {est_500:.2f}s")
+
+        mcts_avg = float(np.mean(timings["shm_signal_wait"]))
+        print("\nNotes:")
+        print(
+            "- 'shm_signal_wait' is the dominant worker-side time: "
+            "C++ MCTS + TorchScript inference + any Python-side serialization inside workers (e.g. .tolist())."
+        )
+        print(
+            "- If 'shm_signal_wait' dominates, the next engineering win is usually removing numpy->list conversions "
+            "in the C++ bindings and accepting raw arrays/buffers." 
+        )
+
     trainer.close()
     print("\nDone.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     profile_single_episode()
