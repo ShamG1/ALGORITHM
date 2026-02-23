@@ -4,226 +4,58 @@
 
 ### 1. 双网络架构 (Dual Network)
 
-双网络采用**共享骨干 + 分离头**的设计，支持多种时序编码骨干（LSTM / TCN / MLP），同时输出策略分布和状态价值估计。
-
-#### 时序编码方案
-
-对于观测序列 $o_{1:t} = \{o_1, o_2, \ldots, o_t\}$，本项目支持以下两种主流编码方式：
-
-##### A. LSTM 编码 (Recurrent)
-利用循环神经网络的隐藏状态 $h_t$ 传递记忆：
-
-$h_t = \text{LSTM}(f_{\text{input}}(o_t), h_{t-1})$
-
-$x_t = f_{\text{shared}}(h_t)$
-
-##### B. TCN 编码 (Temporal Convolutional)
-利用一维因果卷积 (Causal Conv1d) 并行处理固定窗口历史。对于输入的特征序列 $X \in \mathbb{R}^{C \times T}$：
-
-**因果卷积：**
-
-$y_t = \sum_{i=0}^{k-1} w_i \cdot x_{t-d i}$
-其中 $d$ 为膨胀因子 (dilation)，确保 $t$ 时刻的输出仅依赖于 $t$ 及其之前的输入。
-
-**非均匀采样与差分增强：**
-为了在不增加计算开销的情况下扩大时序感受野并增强动态感知，本项目在 TCN 模式下引入了以下机制：
-- **非均匀采样 (Non-uniform Sampling)**：在 $T=5$ 的窗口内，不再采用连续取帧，而是按照 $[t, t-1, t-3, t-7, t-15]$ 的指数级回溯索引提取历史观测。这使得模型能以极小的输入代价捕捉到长达 16 帧的历史上下文。
-- **差分特征拼接 (Delta Features)**：将原始观测 $o_t$ 与其时序差分 $\Delta o_t = o_t - o_{t-k}$ 拼接，输入维度从 $D$ 翻倍至 $2D$。这显式地为模型提供了“加速度”和“变化率”信息，显著提升了在交叉路口避碰等高动态场景下的反应灵敏度。
-**残差块结构：**
-$\text{Block}(X) = \text{Activation}(\text{CausalConv}(X) + \text{Residual}(X))$
-
-**优势：** TCN 在 MCTS 分支扩展时**不需要拷贝隐藏状态**，仅需维护固定长度的历史缓冲区，推理速度比串行的 LSTM 更快且更容易并行化。最终网络取时序维度最后一刻的特征输出，映射为特征向量 $\mathbf{x}_t$，输入后续的策略与价值头。
-
-#### 策略与价值输出
-无论采用哪种编码器，最终的特征向量 $x_t$ 都会通过独立的头部：
-- **策略输出：** $\mu_t = \tanh(f_{\mu}(x_t))$, $\sigma_t = \exp(\text{clamp}(f_{\sigma}(x_t), -5, 1))$
-- **价值输出：** $V_t = f_v(x_t)$
-
-## 概述
-
-本项目实现了一种结合"双网络（Dual Network）"和"蒙特卡洛树搜索（MCTS）"的强化学习算法，用于多智能体交叉路口导航任务。该算法通过共享 LSTM 骨干网络同时学习策略和价值函数，并利用 MCTS 进行在线规划以提升决策质量。
-
-## 核心算法
-
-### 1. 双网络架构（Dual Network）
-
-双网络采用**共享骨干 + 分离头**的设计，同时输出策略分布和状态价值估计。
-
-#### 网络结构
-
-![双网络架构图](images/dual_network_architecture.png)
-
-#### 数学表示
-
-
-对于观测序列 $o_{1:t} = \{o_1, o_2, \ldots, o_t\}$，网络支持两种主要的共享特征提取模式：
-
-**A. LSTM 模式（Recurrent）：**
-
-```tex
-h_t = LSTM(f_input(o_t), h_{t-1})
-x_t = f_shared(h_t)
-```
-
-**B. TCN 模式（Temporal Convolutional）：**
-
-针对窗口长度为 $K$ 的历史观测，采用**非均匀采样**和**差分增强**处理：
-
-1. **输入构造：** 拼接当前观测与时序差分
-```tex
-o_t_tilde = [o_t, o_t - o_{t-k}]
-```
-2. **非均匀采样序列：** 提取指数级回溯的历史特征序列
-```tex
-S_t = { o_t_tilde, o_{t-1}_tilde, o_{t-3}_tilde, o_{t-7}_tilde, o_{t-15}_tilde }
-```
-3. **特征提取：** 通过多层膨胀因果卷积提取特征
-```tex
-x_t = f_shared(TCN(S_t))
-```
-
-**策略输出：**
-
-```tex
-mu_t = tanh(f_mu(x_t)) \in [-1, 1]
-log_sigma_t = clamp(f_sigma(x_t), -5, 1)
-sigma_t = exp(log_sigma_t)
-```
-
-**价值输出：**
-
-```tex
-V_t = f_v(x_t)
-```
-
-其中：
-- $f_{\text{input}}$: 输入投影层
-- $f_{\text{shared}}$: 共享全连接层
-- $f_{\mu}, f_{\sigma}$: 策略头（均值和标准差）
-- $f_v$: 价值头
-
-#### 动作采样
-
-策略分布为多元高斯分布：
-
-```tex
-a_t \sim N(mu_t, sigma_t^2)
-```
-
-动作被裁剪到 $[-1, 1]$ 范围内：
-
-```tex
-a_t = clip(a_t, -1, 1)
-```
-
-### 2. 蒙特卡洛树搜索（MCTS）
-
-MCTS 利用双网络进行在线规划，通过模拟搜索找到最优动作。
-
-#### MCTS 搜索流程
-
-MCTS 搜索包含四个阶段，重复执行 $N$ 次模拟：
-
-![MCTS 搜索流程图](images/mcts_search_flow.png)
-
-**搜索树结构：**
-
-![MCTS 搜索树结构](images/mcts_tree_structure.png)
-
-每个节点存储：
-- $N(s)$: 节点访问次数
-- $N(s, a)$: 动作访问次数
-- $Q(s, a)$: 动作价值估计
-- $P(s, a)$: 策略先验概率
-
-#### UCB 公式
-
-对于节点 $s$，选择动作 $a$ 的 UCB 分数为：
-
-```tex
-U(s, a) = Q(s, a) + c_puct * P(s, a) * (sqrt(N(s)) / (1 + N(s, a)))
-```
-
-其中：
-- $Q(s, a)$: 动作价值估计
-- $P(s, a)$: 策略网络给出的先验概率
-- $N(s)$: 节点访问次数
-- $N(s, a)$: 动作访问次数
-- $c_{\text{puct}}$: 探索常数（默认 1.0）
-
-#### 动作采样策略
-
-在 MCTS 搜索完成后，根据访问次数分布采样动作：
-
-$$
-P(a|s) = \frac{N(s, a)^{1/\tau}}{\sum_{a'} N(s, a')^{1/\tau}}
-$$
-
-其中 $\tau$ 是温度参数：
-- $\tau = 1$: 按访问次数分布采样
-- $\tau \to 0$: 贪婪选择访问次数最多的动作
-
-### 3. 训练方法
-
-#### 经验回放与 TBPTT
-
-使用截断反向传播（Truncated Backpropagation Through Time, TBPTT）训练 LSTM 网络：
-
-1. **经验收集**：在环境中执行 MCTS 选择的动作，收集轨迹
-2. **批量更新**：当缓冲区达到阈值（64 步）时进行批量更新
-3. **序列分块**：将长序列分成固定长度（16 步）的块进行 TBPTT
-
-#### 损失函数
-
-**策略损失（Policy Loss）：**
-
-$$
-\mathcal{L}_{\text{policy}} = -\mathbb{E}_t[\log \pi(a_t|o_t) \cdot \hat{A}_t]
-$$
-
-其中 $\hat{A}_t$ 是归一化后的优势函数：
-
-$$
-A_t = R_t - V(o_t)
-$$
-
-$$
-\hat{A}_t = \frac{A_t - \bar{A}}{\sigma_A + \epsilon}
-$$
-
-其中：
-- $R_t$: 回报（Returns）
-- $V(o_t)$: 价值网络估计
-- $\bar{A}$: 优势函数的均值
-- $\sigma_A$: 优势函数的标准差
-- $\epsilon = 10^{-8}$: 防止除零的小常数
-
-归一化优势函数有助于稳定训练，减少方差。
-
-**价值损失（Value Loss）：**
-
-$$
-\mathcal{L}_{\text{value}} = \mathbb{E}_t[(V(o_t) - R_t)^2]
-$$
-
-**总损失：**
-
-$$
-\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{value}} + \lambda_p \cdot \mathcal{L}_{\text{policy}}
-$$
-
-其中 $\lambda_p = 0.5$ 是策略损失权重。
-
-**回报计算（Returns）：**
-
-$$
-R_t = r_t + \gamma R_{t+1} \cdot (1 - d_t)
-$$
-
-其中：
-- $r_t$: 即时奖励
-- $\gamma = 0.99$: 折扣因子
-- $d_t$: 终止标志
+本项目采用 **AlphaZero** 风格的策略-价值联合网络（Policy-Value Network），同时输出动作的概率分布和状态的价值估计。
+
+#### 网络骨干 (Backbone)
+支持多种时序编码方案以处理多帧观测 $o_{1:t}$：
+- **LSTM (Recurrent)**：利用隐藏状态 $h_t$ 传递长程记忆。
+- **TCN (Temporal Convolutional)**：利用膨胀因果卷积并行处理历史窗口。本项目采用**非均匀采样**（索引 $[t, t-1, t-3, t-7, t-15]$）与**差分特征增强**（拼接 $o_t - o_{t-k}$），在 $T=5$ 的输入下实现 $16$ 帧的感受野。
+
+#### 连续动作头 (Continuous Action Heads)
+与原版 AlphaGo 处理离散动作不同，本项目面向连续控制空间：
+- **策略头**：输出高斯分布的均值 $\mu_t = \tanh(f_{\mu}(x_t))$ 与标准差 $\sigma_t = \exp(\text{clamp}(f_{\sigma}(x_t), -5, 1))$。
+- **价值头**：输出状态价值估计 $V_t = f_v(x_t)$。
+
+### 2. 蒙特卡洛树搜索 (MCTS)
+
+利用神经网络作为启发式函数进行在线规划。搜索包含 Selection, Expansion, Simulation (Rollout), Backup 四个阶段。
+
+#### UCB 公式与节点属性
+每个节点存储访问次数 $N(s, a)$、动作价值 $Q(s, a)$ 和策略先验 $P(s, a)$。选择动作的 UCB 分数为：
+\[
+U(s, a) = Q(s, a) + c_{puct} \cdot P(s, a) \cdot \frac{\sqrt{\sum_b N(s, b)}}{1 + N(s, a)}
+\]
+
+#### 核心优化与对齐
+- **强制 Backup 机制**：确保每次模拟（Simulation）无论是否提前终止（如碰撞），都执行一次完整的回传，保证根节点访问次数 $N(s)$ 严格等于模拟次数。
+- **确定性 Rollout**：在搜索过程中（$t>0$），受控智能体采用策略网络的均值动作，以降低搜索方差。
+- **性能架构**：C++ 后端实现 + TorchScript 推理 + 共享内存 (SHM) 通信，支持大规模多智能体并行搜索。
+
+### 3. 训练与损失函数 (AlphaZero 风格)
+
+#### 训练流程
+1. **数据生成**：智能体通过 MCTS 进行自博弈，记录每步的访问分布 $\pi_{mcts}$ 和搜索价值 $v_{mcts}$。
+2. **TBPTT 训练**：利用截断反向传播处理时序序列，将长轨迹分块进行梯度更新。
+
+#### 损失函数公式
+通过最小化网络输出与 MCTS 搜索结果之间的差异来更新参数 $\theta$：
+
+**策略损失 (Weighted Gaussian NLL)**：
+\[
+\mathcal{L}_{policy} = -\sum_{k=1}^{K} \pi_{mcts}(a_k|s) \cdot \log p_{\theta}(a_k|s)
+\]
+其中 $\pi_{mcts}(a_k|s) = \frac{N(s, a_k)}{\sum N(s, a)}$ 为 MCTS 搜索得到的概率分布，$p_{\theta}$ 为网络输出的高斯密度。
+
+**价值损失 (MSE)**：
+\[
+\mathcal{L}_{value} = (V_{\theta}(s) - z)^2
+\]
+其中 $z$ 为目标回报（混合 Monte-Carlo 回报与搜索价值估计）。
+
+**总损失**：
+\[
+\mathcal{L}_{total} = c_v \cdot \mathcal{L}_{value} + c_p \cdot \mathcal{L}_{policy} + c_{reg} \cdot \|\theta\|^2
+\]
 
 #### 训练流程
 
