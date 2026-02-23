@@ -4,19 +4,19 @@
 # roundabout_2lane, roundabout_3lane, onrampmerge_3lane, bottleneck
 env:
   num_agents: 6
-  scenario_name: "roundabout_3lane" 
+  scenario_name: "cross_3lane" 
   max_steps: 500
   respawn_enabled: true
 
 mcts:
   # Speed/quality presets (rough guide; depends on CPU/core count and scenario):
   #
-  # 1) Fast debug (~10-20s/episode @ 500 steps):
+  # 1) Fast debug (~2-5s/episode @ 500 steps):
   #    simulations: 20
   #    rollout_depth: 10
   #    num_action_samples: 8
   #
-  # 2) Balanced (~20-30s/episode @ 500 steps):
+  # 2) Balanced (~2-5s/episode @ 500 steps):
   #    simulations: 50
   #    rollout_depth: 15
   #    num_action_samples: 8
@@ -48,6 +48,9 @@ train:
   seed: 42
   deterministic: false
   use_shm: true
+  mcts_debug:
+    enabled: false      
+    interval: 500      
 
 render:
   enabled: false

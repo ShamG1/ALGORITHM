@@ -1013,7 +1013,25 @@ static std::vector<float> step_env_with_joint_action_torchscript_deterministic(
 // 回溯函数
 // ============================================================================
 
-static void backup_lstm(std::vector<std::pair<int,int>>& path, std::vector<LSTMNode>& nodes, float value) {
+// 统计当前搜索中 backup_lstm 调用次数（用于 debug）
+// 每个线程各自维护一份
+static thread_local int g_backup_calls = 0;
+
+static void backup_lstm(std::vector<std::pair<int,int>>& path,
+                        std::vector<LSTMNode>& nodes,
+                        float value) {
+    // 如果 path 为空（比如在选边前就到达终止节点），
+    // 也要至少给 root 计一次数，避免空跑 simulation。
+    if (path.empty()) {
+        if (!nodes.empty()) {
+            nodes[0].total_N += 1;
+        }
+        g_backup_calls += 1;
+        return;
+    }
+
+    g_backup_calls += 1;
+
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
         int nidx = it->first;
         int eidx = it->second;
@@ -1025,7 +1043,21 @@ static void backup_lstm(std::vector<std::pair<int,int>>& path, std::vector<LSTMN
     }
 }
 
+static thread_local int g_backup_calls_basic = 0;
+
 static void backup_basic(std::vector<std::pair<int,int>>& path, std::vector<Node>& nodes, float value) {
+    // If path is empty (can happen if we hit a terminal/root node before selecting any edge),
+    // still count this simulation at the root to keep statistics consistent.
+    if (path.empty()) {
+        if (!nodes.empty()) {
+            nodes[0].total_N += 1;
+        }
+        g_backup_calls_basic += 1;
+        return;
+    }
+
+    g_backup_calls_basic += 1;
+
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
         int nidx = it->first;
         int eidx = it->second;
@@ -1149,7 +1181,21 @@ std::pair<std::vector<float>, py::dict> mcts_search_seq(
 
         while (true) {
             Node& n = nodes[(size_t)cur];
-            if (n.edges.empty()) break;
+
+            // If the current node is not expanded, expand it now.
+            // This prevents simulations from being dropped when traversing to an unexpanded child.
+            if (n.edges.empty()) {
+                // Root gets Dirichlet noise, others do not.
+                // For non-root nodes, we reconstruct obs_seq from Arena.
+                expand_node_seq(n, (cur == 0));
+
+                // If still empty after expand (terminal / invalid), backup at least the leaf value.
+                if (n.edges.empty()) {
+                    float leaf_backup = n.V;
+                    backup_basic(path, nodes, leaf_backup);
+                    break;
+                }
+            }
 
             float best = -1e9f;
             int best_idx = 0;
@@ -1397,6 +1443,8 @@ void mcts_search_to_shm(
         const py::dict& stats = res.second;
         stats_ptr[0] = stats.contains("root_v") ? py::cast<float>(stats["root_v"]) : 0.0f;
         stats_ptr[1] = stats.contains("root_n") ? (float)py::cast<int>(stats["root_n"]) : 0.0f;
+        // Debug counter: how many times backup_lstm() was called during this search.
+        stats["backup_calls"] = g_backup_calls; // LSTM path counter
 
         // Use the lstm_hidden_dim passed from Python instead of hardcoded 128
         const int H = lstm_hidden_dim;
@@ -1552,6 +1600,7 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq_ptr(
     float dirichlet_eps,
     unsigned int seed
 );
+
 
 void mcts_search_tcn_torchscript_seq_to_shm_np(
     ScenarioEnv& env,
@@ -1912,6 +1961,10 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq_ptr(
 ) {
     TSProfile prof;
     double t_total0 = now_ms();
+
+    // reset backup counter for this search
+    g_backup_calls_basic = 0;
+
     std::mt19937 rng(seed ? seed : std::random_device{}());
 
     if (!std::filesystem::exists(model_path)) {
@@ -2022,7 +2075,21 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq_ptr(
 
         while (true) {
             Node& n = nodes[(size_t)cur];
-            if (n.edges.empty()) break;
+            
+            // If the current node is not expanded, expand it now.
+            // This prevents simulations from being dropped when traversing to an unexpanded child.
+            if (n.edges.empty()) {
+                // Root gets Dirichlet noise, others do not.
+                // For non-root nodes, we reconstruct obs_seq from Arena.
+                expand_node_ts(n, nullptr, (cur == 0));
+
+                // If still empty after expand (terminal / invalid), backup at least the leaf value.
+                if (n.edges.empty()) {
+                    float leaf_backup = n.V;
+                    backup_basic(path, nodes, leaf_backup);
+                    break;
+                }
+            }
 
             float best = -1e9f;
             int best_idx = 0;
@@ -2121,7 +2188,7 @@ std::pair<std::vector<float>, py::dict> mcts_search_tcn_torchscript_seq_ptr(
         stats["root_n"] = root_n_total;
         stats["edges"] = edge_stats;
     }
-
+    stats["backup_calls"] = g_backup_calls_basic;
     prof.ms_total = now_ms() - t_total0;
     py::dict p;
     p["ms_total"] = prof.ms_total;
@@ -2563,7 +2630,18 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
 
         while (true) {
             LSTMNode& n = nodes[(size_t)cur];
-            if (n.edges.empty()) break;
+            
+            // CRITICAL: If the current node is not expanded (e.g. still in batch-expand queue),
+            // we MUST expand it now before selecting an edge.
+            if (n.edges.empty()) {
+                expand_node(n, (cur == 0));
+                // If it's still empty after expand (e.g. terminal state), we just backup from here.
+                if (n.edges.empty()) {
+                    float leaf_backup = n.V; // For terminal nodes, rollout_return is 0
+                    backup_lstm(path, nodes, leaf_backup);
+                    break;
+                }
+            }
 
             float best = -1e9f;
             int best_idx = 0;
@@ -2636,15 +2714,28 @@ std::pair<std::vector<float>, py::dict> mcts_search_lstm_torchscript(
 
             // Batch-expand newly created children to reduce TorchScript call overhead.
             // Controlled by env var MCTS_TS_BATCH_EXPAND_NODES (default 1 = disabled).
-            static thread_local std::vector<int> pending_expand;
-            pending_expand.push_back(child_idx);
+            struct PendingExpandQueue {
+                std::vector<int> indices;
+                void clear_for_new_search() { indices.clear(); }
+            };
+            static thread_local PendingExpandQueue pending_expand;
+
+            // NOTE: we assume each call to this search function corresponds
+            // to a fresh tree. To avoid cross-call contamination, clear the
+            // queue on the very first expansion in each simulation when we
+            // are at the root node.
+            if (cur == 0 && path.empty()) {
+                pending_expand.clear_for_new_search();
+            }
+
+            pending_expand.indices.push_back(child_idx);
 
             const int batch_n = batch_expand_nodes;
-            if ((int)pending_expand.size() >= batch_n) {
-                for (int idx : pending_expand) {
+            if ((int)pending_expand.indices.size() >= batch_n) {
+                for (int idx : pending_expand.indices) {
                     expand_node(nodes[(size_t)idx], false);
                 }
-                pending_expand.clear();
+                pending_expand.indices.clear();
             }
 
             float leaf_value = nodes[(size_t)child_idx].V;

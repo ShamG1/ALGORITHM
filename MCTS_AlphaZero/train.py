@@ -508,6 +508,13 @@ def _pinned_worker_loop_shm_optimized(
                                 _WORKER_CACHE["obs_history"] = None
                     elif msg[0] == 'CONFIG':
                         config = msg[1]
+                        # Only log important config change once per worker to avoid log bloat
+                        """ if agent_id == 0:
+                            with open(os.path.join(config.get('save_dir', 'MCTS_AlphaZero/checkpoints'), 'training_log.txt'), 'a') as f:
+                                f.write(f"[WORKER_CONFIG] Episode {config.get('episode', 0)} Step {config.get('step', 0)}: "
+                                        f"sims={config.get('num_simulations')}, depth={config.get('rollout_depth')}, "
+                                        f"K={config.get('num_action_samples')}, seq={config.get('sequence_length')}\n")
+                                f.flush() """
                     elif msg[0] == 'SYNC_WEIGHTS':
                         # Force weight sync
                         _WORKER_CACHE["_last_weight_version"] = -1
@@ -906,6 +913,7 @@ class MCTSTrainer:
         use_team_reward: bool = True,
         use_lstm: bool = True,
         use_tcn: bool = False,
+        sequence_length: int = 5,
         render: bool = False,
         show_lane_ids: bool = False,
         show_lidar: bool = False,
@@ -931,6 +939,7 @@ class MCTSTrainer:
         self.use_team_reward = use_team_reward
         self.use_lstm = use_lstm
         self.use_tcn = use_tcn
+        self.seq_len = int(sequence_length) if sequence_length is not None else 5
         self.render = render
         self.show_lane_ids = show_lane_ids
         self.show_lidar = show_lidar
@@ -986,6 +995,11 @@ class MCTSTrainer:
         if self.use_tcn:
             self.use_lstm = False
 
+        # Sequence length for LSTM/TCN models (single source of truth)
+        # NOTE: `self.seq_len` is injected from YAML via `MCTSTrainer(..., seq_len=...)`.
+        # Fall back to 5 for backward compatibility.
+        self.seq_len = int(getattr(self, "seq_len", 5))
+
         effective_obs_dim = OBS_DIM * 2 if self.use_tcn else OBS_DIM
 
         self.network = DualNetwork(
@@ -995,7 +1009,7 @@ class MCTSTrainer:
             lstm_hidden_dim=128,
             use_lstm=self.use_lstm,
             use_tcn=self.use_tcn,
-            sequence_length=5
+            sequence_length=self.seq_len
         ).to(self.device)
 
         # Single source of truth for SHM layout.
@@ -1043,7 +1057,7 @@ class MCTSTrainer:
         
         self.optimizer = optim.Adam(self.network.parameters(), lr=3e-4)
         
-        self.obs_history = [deque(maxlen=16) for _ in range(num_agents)] if (self.use_lstm or self.use_tcn) else None
+        self.obs_history = [deque(maxlen=self.seq_len) for _ in range(num_agents)] if (self.use_lstm or self.use_tcn) else None
         self.unroll_len = 16
         
         self.stats = {
@@ -1073,6 +1087,11 @@ class MCTSTrainer:
             f.write(f"Use team reward: {use_team_reward}\n")
             f.write(f"Respawn enabled: {respawn_enabled}\n")
             f.write(f"MCTS simulations: {mcts_simulations}\n")
+            f.write(f"MCTS rollout_depth: {rollout_depth}\n")
+            f.write(f"MCTS num_action_samples: {num_action_samples}\n")
+            f.write(f"Net sequence_length: {self.seq_len}\n")
+            f.write(f"Net use_tcn: {self.use_tcn}\n")
+            f.write(f"Net use_lstm: {self.use_lstm}\n")
             f.write(f"Use shared memory: {use_shm}\n")
             f.write(f"Model: {'TCN' if self.use_tcn else 'LSTM' if self.use_lstm else 'MLP'}\n")
             f.write(f"Main device: {device} (workers use CPU)\n")
@@ -1185,7 +1204,7 @@ class MCTSTrainer:
             'lstm_hidden_dim': self.lstm_hidden_dim,
             'use_lstm': self.use_lstm,
             'use_tcn': self.use_tcn,
-            'sequence_length': 5,
+            'sequence_length': int(self.seq_len),
             'device': str(self.device),  # Main process device (workers ignore this, use CPU)
             'num_simulations': self.mcts_simulations,
             'c_puct': 1.0,
@@ -1220,16 +1239,40 @@ class MCTSTrainer:
         all_search_stats = self._shm_buffer.read_all_stats()
 
         # --- Debug Instrumentation ---
-        if self.stats['total_steps'] % 200 == 0:
-            root_ns = [s['root_n'] if s else 0 for s in all_search_stats]
+        # Controlled by YAML config: train.mcts_debug.enabled + train.mcts_debug.interval
+        mcts_debug_cfg = getattr(self, "mcts_debug", None) or {}
+        debug_enabled = bool(mcts_debug_cfg.get("enabled", False))
+        debug_interval = int(mcts_debug_cfg.get("interval", 500))
+
+        if debug_enabled and debug_interval > 0 and step % debug_interval == 0:
+            root_ns: List[int] = [int(s['root_n']) if s else 0 for s in all_search_stats]
+            edge_counts: List[int] = [len(s.get('edges', [])) if s else 0 for s in all_search_stats]
             active_agents = sum(1 for n in root_ns if n > 0)
-            
-            # If all root_n are 0, dump raw memory snippet for the first agent to see if anything is there
-            if active_agents == 0:
-                # Safer way to read raw buffer without ctypes pointer arithmetic issues
-                raw_buf = self._shm_buffer._shm.buf[self._shm_buffer._stats_offset : self._shm_buffer._stats_offset + 32]
+
+            # Summaries
+            if active_agents > 0:
+                # NOTE: root_n should be close-ish to num_simulations when MCTS runs normally.
+                self.log(
+                    f"[DEBUG_MCTS] ep={episode} step={step} "
+                    f"root_n(min/mean/max)={min(root_ns)}/{(sum(root_ns)/len(root_ns)):.1f}/{max(root_ns)} "
+                    f"edges(min/mean/max)={min(edge_counts)}/{(sum(edge_counts)/len(edge_counts)):.1f}/{max(edge_counts)} "
+                    f"root_n={root_ns} edges={edge_counts}"
+                )
+
+                # Also dump first few raw floats of Agent 0 stats buffer for layout debugging
+                raw_buf = self._shm_buffer._shm.buf[
+                    self._shm_buffer._stats_offset : self._shm_buffer._stats_offset + 64
+                ]
                 raw_vals = np.frombuffer(raw_buf, dtype=np.float32).tolist()
-                self.log(f"[DEBUG_RAW_SHM] First 8 floats of Agent 0 stats buffer: {raw_vals}")
+                self.log(f"[DEBUG_RAW_SHM] ep={episode} step={step} agent0 first16={raw_vals[:16]}")
+            else:
+                self.log(f"[DEBUG_MCTS] ep={episode} step={step} all agents root_n=0 (MCTS failed or stats not written)")
+
+                raw_buf = self._shm_buffer._shm.buf[
+                    self._shm_buffer._stats_offset : self._shm_buffer._stats_offset + 64
+                ]
+                raw_vals = np.frombuffer(raw_buf, dtype=np.float32).tolist()
+                self.log(f"[DEBUG_RAW_SHM] ep={episode} step={step} agent0 first16={raw_vals[:16]}")
 
         return actions, all_search_stats
 
@@ -1731,9 +1774,10 @@ class MCTSTrainer:
                 mean, std, value, h_out = self.network(obs_chunk, h, return_sequence=True)
                 
                 # Flatten batch and sequence for loss calculation
-                mean = mean.view(-1, 2)
-                std = std.view(-1, 2)
-                value = value.view(-1)
+                # (B=1, L, D) -> (L, D)
+                mean = mean.squeeze(0)
+                std = std.squeeze(0)
+                value = value.squeeze(0).squeeze(-1) # (L,)
                 z_chunk = returns_torch[start:end]
 
                 # --- AlphaZero Policy Loss (Weighted Gaussian NLL) ---
@@ -1750,7 +1794,7 @@ class MCTSTrainer:
                     actions_k = torch.stack([torch.from_numpy(a).to(self.device) for a, _p in mcts_pi])
                     probs_k = torch.tensor([p for _a, p in mcts_pi], device=self.device)
                     
-                    # Current network distribution for this step
+                    # Current network distribution for this step (t_idx is index within chunk)
                     dist = torch.distributions.Normal(mean[t_idx], std[t_idx])
                     
                     # Log-likelihood of all MCTS sampled actions
@@ -1953,6 +1997,13 @@ def main():
         use_shm=bool(config.get('train', {}).get('use_shm', True)),
         use_tqdm=bool(config.get('misc', {}).get('tqdm', True))
     )
+
+    # Optional MCTS debug config from YAML: train.mcts_debug.enabled / interval
+    mcts_debug_cfg = config.get('train', {}).get('mcts_debug', {}) or {}
+    trainer.mcts_debug = {
+        'enabled': bool(mcts_debug_cfg.get('enabled', False)),
+        'interval': int(mcts_debug_cfg.get('interval', 500)),
+    }
     
     load_path = config.get('train', {}).get('load_checkpoint')
     if load_path:
