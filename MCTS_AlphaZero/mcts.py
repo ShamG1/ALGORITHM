@@ -191,8 +191,8 @@ class MCTS:
                 self.c_puct,
                 self.temperature,
                 0.99, # gamma
-                0.3,  # dirichlet_alpha
-                0.25, # dirichlet_eps
+                float(getattr(self, 'dirichlet_alpha', 0.3)),  # dirichlet_alpha
+                float(getattr(self, 'dirichlet_eps', 0.25)), # dirichlet_eps
                 seed,
                 action_ptr,
                 stats_ptr

@@ -39,6 +39,33 @@ from datetime import datetime
 # from time import time
 from collections import deque
 import csv
+
+
+class RunningMeanStd:
+    def __init__(self, beta: float = 0.99, eps: float = 1e-8):
+        self.beta = float(beta)
+        self.eps = float(eps)
+        self.mean = 0.0
+        self.var = 1.0
+        self._initialized = False
+
+    def update(self, x: np.ndarray) -> None:
+        if x.size == 0:
+            return
+        m = float(np.mean(x))
+        v = float(np.var(x))
+        if not self._initialized:
+            self.mean = m
+            self.var = max(v, self.eps)
+            self._initialized = True
+            return
+        self.mean = self.beta * self.mean + (1.0 - self.beta) * m
+        self.var = self.beta * self.var + (1.0 - self.beta) * v
+        self.var = max(self.var, self.eps)
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.mean) / (float(np.sqrt(self.var)) + self.eps)
+
 import multiprocessing as mp
 from multiprocessing import shared_memory
 from typing import Optional, Dict, List, Any
@@ -637,6 +664,11 @@ def _pinned_worker_loop_shm_optimized(
             mcts = _WORKER_CACHE["mcts"]
             mcts.agent_id = agent_id
 
+            # Update dynamic MCTS hyperparameters from config (temperature/dirichlet decay)
+            mcts.temperature = float(config.get('temperature', 1.0))
+            mcts.dirichlet_alpha = float(config.get('dirichlet_alpha', 0.3))
+            mcts.dirichlet_eps = float(config.get('dirichlet_eps', 0.25))
+
             use_lstm_flag = bool(config.get('use_lstm', True))
             use_tcn_flag = bool(config.get('use_tcn', False))
 
@@ -682,8 +714,8 @@ def _pinned_worker_loop_shm_optimized(
                         float(config['c_puct']),
                         float(config['temperature']),
                         0.99,
-                        0.3,
-                        0.25,
+                        float(config.get('dirichlet_alpha', 0.3)),
+                        float(config.get('dirichlet_eps', 0.25)),
                         int(config.get('base_seed', 0)),
                         shm_client.action_ptr_addr,
                         shm_client.stats_ptr_addr,
@@ -964,6 +996,22 @@ class MCTSTrainer:
         self.seed = seed
         self.deterministic = deterministic
         self._weights_dirty = True
+
+        # Training hyperparameters (overridden by YAML in main())
+        self.c_pi = float(getattr(self, "c_pi", 1.0))
+        self.c_v = float(getattr(self, "c_v", 1.0))
+        self.returns_ema_beta = float(getattr(self, "returns_ema_beta", 0.99))
+        self._returns_rms = RunningMeanStd(beta=self.returns_ema_beta)
+
+        # Dirichlet noise params for root exploration (overridden by YAML in main())
+        self.dirichlet_alpha = float(getattr(self, "dirichlet_alpha", 0.3))
+        self.dirichlet_eps = float(getattr(self, "dirichlet_eps", 0.25))
+        self.dirichlet_decay_episodes = int(getattr(self, "dirichlet_decay_episodes", 2000))
+        self.min_dirichlet_eps = float(getattr(self, "min_dirichlet_eps", 0.03))
+
+        # Loss logging
+        self.loss_log_interval = int(getattr(self, "loss_log_interval", 1))
+        self._last_losses = None
         
         os.makedirs(save_dir, exist_ok=True)
         self.save_dir = save_dir
@@ -1199,6 +1247,12 @@ class MCTSTrainer:
         if step == 0:
             self._broadcast_weights_if_dirty()
         
+        # Temperature schedule: start high for exploration, decay to low for exploitation
+        start_temp = 1.0
+        min_temp = 0.1
+        decay_episodes = 2000
+        current_temp = max(min_temp, start_temp - (episode / decay_episodes) * (start_temp - min_temp))
+
         config = {
             'hidden_dim': 256,
             'lstm_hidden_dim': self.lstm_hidden_dim,
@@ -1208,7 +1262,7 @@ class MCTSTrainer:
             'device': str(self.device),  # Main process device (workers ignore this, use CPU)
             'num_simulations': self.mcts_simulations,
             'c_puct': 1.0,
-            'temperature': 1.0,
+            'temperature': current_temp,
             'rollout_depth': self.rollout_depth,
             'num_action_samples': self.num_action_samples,
             'base_seed': int(self.seed) if self.seed is not None else 0,
@@ -1711,8 +1765,8 @@ class MCTSTrainer:
 
         gamma = 0.99
         unroll = int(getattr(self, 'unroll_len', 16))
-        c_pi = 1.0  # Policy loss weight
-        c_v = 1.0   # Value loss weight
+        c_pi = float(getattr(self, "c_pi", 1.0))  # Policy loss weight
+        c_v = float(getattr(self, "c_v", 1.0))    # Value loss weight
         
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -1746,7 +1800,7 @@ class MCTSTrainer:
             done_arr = np.asarray(self.buffer['dones'][i], dtype=np.float32)
             pi_list = self.buffer['mcts_pi'][i] # List of [(action, prob), ...]
 
-            # 1. Calculate Monte-Carlo Returns (z)
+        # 1. Calculate Monte-Carlo Returns (z) with normalization
             returns = np.zeros(T, dtype=np.float32)
             running_return = 0.0
             # If the last transition is not 'done', bootstrap with last search value
@@ -1757,6 +1811,9 @@ class MCTSTrainer:
                 running_return = rew_arr[t] + gamma * running_return * (1.0 - done_arr[t])
                 returns[t] = running_return
             
+            # Moving (EMA) normalization to stabilize value learning
+            self._returns_rms.update(returns)
+            returns = self._returns_rms.normalize(returns)
             returns_torch = torch.from_numpy(returns).to(self.device)
 
             # 2. Training Loop with Sequence Unrolling (for LSTM/TCN)
@@ -1833,6 +1890,17 @@ class MCTSTrainer:
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
             self.optimizer.step()
             self._weights_dirty = True
+
+            avg_pi = total_policy_loss / max(1, total_steps)
+            avg_v = total_value_loss / max(1, total_steps)
+            self._last_losses = {
+                "policy": float(avg_pi),
+                "value": float(avg_v),
+                "c_pi": float(c_pi),
+                "c_v": float(c_v),
+            }
+            if int(getattr(self, "loss_log_interval", 1)) > 0 and (int(self.stats.get('episode', 0)) % int(getattr(self, "loss_log_interval", 1)) == 0):
+                self.log(f"[UPDATE] ep={int(self.stats.get('episode', 0))} policy_loss={avg_pi:.6f} value_loss={avg_v:.6f} c_pi={c_pi:.3f} c_v={c_v:.3f}")
         
         # Clear buffer after update
         self.buffer = {
@@ -2004,6 +2072,20 @@ def main():
         'enabled': bool(mcts_debug_cfg.get('enabled', False)),
         'interval': int(mcts_debug_cfg.get('interval', 500)),
     }
+
+    # Training hyperparameters (loss weights / normalization)
+    trainer.c_pi = float(config.get('train', {}).get('c_pi', 1.0))
+    trainer.c_v = float(config.get('train', {}).get('c_v', 1.0))
+    trainer.returns_ema_beta = float(config.get('train', {}).get('returns_ema_beta', 0.99))
+    trainer.loss_log_interval = int(config.get('train', {}).get('loss_log_interval', 1))
+    # refresh running stats with configured beta
+    trainer._returns_rms = RunningMeanStd(beta=trainer.returns_ema_beta)
+
+    # MCTS Dirichlet noise params
+    trainer.dirichlet_alpha = float(config.get('mcts', {}).get('dirichlet_alpha', 0.3))
+    trainer.dirichlet_eps = float(config.get('mcts', {}).get('dirichlet_eps', 0.25))
+    trainer.dirichlet_decay_episodes = int(config.get('mcts', {}).get('dirichlet_decay_episodes', 2000))
+    trainer.min_dirichlet_eps = float(config.get('mcts', {}).get('min_dirichlet_eps', 0.03))
     
     load_path = config.get('train', {}).get('load_checkpoint')
     if load_path:

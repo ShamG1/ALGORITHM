@@ -1,0 +1,92 @@
+Training started at 2026-02-24 23:46:21.573027
+Num agents: 3
+Scenario name: onrampmerge_3lane
+Use team reward: True
+Respawn enabled: True
+MCTS simulations: 100
+MCTS rollout_depth: 25
+MCTS num_action_samples: 16
+Net sequence_length: 5
+Net use_tcn: True
+Net use_lstm: False
+Use shared memory: True
+Model: TCN
+Main device: cpu (workers use CPU)
+Generated routes:
+  Agent 0: IN_1 -> OUT_1
+  Agent 1: IN_2 -> OUT_2
+  Agent 2: IN_RAMP_1 -> OUT_2
+================================================================================
+Generating TorchScript model at MCTS_AlphaZero/checkpoints/mcts_infer.pt...
+Successfully exported TorchScript model (4109856 bytes).
+================================================================================
+Starting Multi-Agent MCTS Training (Optimized)
+================================================================================
+[UPDATE] ep=1 policy_loss=0.214943 value_loss=0.099784 c_pi=1.000 c_v=1.000
+Episode     1 | Reward: -351.79 (Total: -1055.38) | Length:   500 | Time: 8.5s
+[UPDATE] ep=2 policy_loss=0.248827 value_loss=0.163293 c_pi=1.000 c_v=1.000
+Episode     2 | Reward: -468.11 (Total: -1404.33) | Length:   500 | Time: 6.6s
+[UPDATE] ep=3 policy_loss=0.188163 value_loss=0.170207 c_pi=1.000 c_v=1.000
+Episode     3 | Reward: -415.15 (Total: -1245.45) | Length:   500 | Time: 6.7s
+[UPDATE] ep=4 policy_loss=0.199964 value_loss=0.105941 c_pi=1.000 c_v=1.000
+Episode     4 | Reward: -555.40 (Total: -1666.21) | Length:   500 | Time: 6.9s
+[UPDATE] ep=5 policy_loss=0.194487 value_loss=0.120449 c_pi=1.000 c_v=1.000
+Episode     5 | Reward: -349.00 (Total: -1047.01) | Length:   500 | Time: 6.8s
+[UPDATE] ep=6 policy_loss=0.201138 value_loss=0.050974 c_pi=1.000 c_v=1.000
+Episode     6 | Reward: -281.09 (Total: -843.26) | Length:   500 | Time: 6.5s
+[UPDATE] ep=7 policy_loss=0.186370 value_loss=0.137710 c_pi=1.000 c_v=1.000
+Episode     7 | Reward: -385.70 (Total: -1157.10) | Length:   500 | Time: 6.8s
+[UPDATE] ep=8 policy_loss=0.191360 value_loss=0.326570 c_pi=1.000 c_v=1.000
+Episode     8 | Reward: -573.32 (Total: -1719.97) | Length:   500 | Time: 6.7s
+[UPDATE] ep=9 policy_loss=0.202889 value_loss=0.144129 c_pi=1.000 c_v=1.000
+Episode     9 | Reward: -455.67 (Total: -1367.00) | Length:   500 | Time: 6.9s
+[UPDATE] ep=10 policy_loss=0.212046 value_loss=0.118224 c_pi=1.000 c_v=1.000
+Episode    10 | Reward: -486.30 (Total: -1458.89) | Length:   500 | Time: 7.2s [CRASH]
+[UPDATE] ep=11 policy_loss=0.201150 value_loss=0.153630 c_pi=1.000 c_v=1.000
+Episode    11 | Reward: -298.29 (Total: -894.88) | Length:   500 | Time: 7.1s
+[UPDATE] ep=12 policy_loss=0.205974 value_loss=0.120368 c_pi=1.000 c_v=1.000
+Episode    12 | Reward: -364.58 (Total: -1093.73) | Length:   500 | Time: 6.6s
+[UPDATE] ep=13 policy_loss=0.194678 value_loss=0.097793 c_pi=1.000 c_v=1.000
+Episode    13 | Reward: -521.13 (Total: -1563.39) | Length:   500 | Time: 6.5s
+[UPDATE] ep=14 policy_loss=0.192442 value_loss=0.129373 c_pi=1.000 c_v=1.000
+Episode    14 | Reward: -388.05 (Total: -1164.14) | Length:   500 | Time: 6.6s
+[UPDATE] ep=15 policy_loss=0.188114 value_loss=0.104606 c_pi=1.000 c_v=1.000
+Episode    15 | Reward: -538.74 (Total: -1616.21) | Length:   500 | Time: 6.9s
+[UPDATE] ep=16 policy_loss=0.186956 value_loss=0.173783 c_pi=1.000 c_v=1.000
+Episode    16 | Reward: -487.68 (Total: -1463.04) | Length:   500 | Time: 7.0s
+[UPDATE] ep=17 policy_loss=0.192533 value_loss=2.439925 c_pi=1.000 c_v=1.000
+Episode    17 | Reward:  249.52 (Total:  748.57) | Length:   500 | Time: 6.7s
+[UPDATE] ep=18 policy_loss=0.197293 value_loss=0.053963 c_pi=1.000 c_v=1.000
+Episode    18 | Reward: -520.91 (Total: -1562.73) | Length:   500 | Time: 6.8s
+[UPDATE] ep=19 policy_loss=0.191773 value_loss=0.054187 c_pi=1.000 c_v=1.000
+Episode    19 | Reward: -318.62 (Total: -955.87) | Length:   500 | Time: 6.5s
+[UPDATE] ep=20 policy_loss=0.185084 value_loss=0.023519 c_pi=1.000 c_v=1.000
+Episode    20 | Reward: -228.67 (Total: -686.00) | Length:   500 | Time: 6.7s
+[UPDATE] ep=21 policy_loss=0.193685 value_loss=0.132021 c_pi=1.000 c_v=1.000
+Episode    21 | Reward: -504.93 (Total: -1514.78) | Length:   500 | Time: 6.6s
+[UPDATE] ep=22 policy_loss=0.196951 value_loss=0.033722 c_pi=1.000 c_v=1.000
+Episode    22 | Reward: -233.64 (Total: -700.93) | Length:   500 | Time: 6.5s
+[UPDATE] ep=23 policy_loss=0.199406 value_loss=0.183737 c_pi=1.000 c_v=1.000
+Episode    23 | Reward: -538.12 (Total: -1614.36) | Length:   500 | Time: 6.7s
+[UPDATE] ep=24 policy_loss=0.196014 value_loss=0.087416 c_pi=1.000 c_v=1.000
+Episode    24 | Reward: -439.34 (Total: -1318.01) | Length:   500 | Time: 6.9s
+[UPDATE] ep=25 policy_loss=0.193914 value_loss=0.052907 c_pi=1.000 c_v=1.000
+Episode    25 | Reward: -437.02 (Total: -1311.06) | Length:   500 | Time: 6.9s
+[UPDATE] ep=26 policy_loss=0.188125 value_loss=0.028738 c_pi=1.000 c_v=1.000
+Episode    26 | Reward: -353.89 (Total: -1061.68) | Length:   500 | Time: 6.8s
+[UPDATE] ep=27 policy_loss=0.187906 value_loss=0.048384 c_pi=1.000 c_v=1.000
+Episode    27 | Reward: -363.68 (Total: -1091.03) | Length:   500 | Time: 6.7s
+[UPDATE] ep=28 policy_loss=0.190591 value_loss=0.034505 c_pi=1.000 c_v=1.000
+Episode    28 | Reward: -439.54 (Total: -1318.61) | Length:   500 | Time: 6.8s
+[UPDATE] ep=29 policy_loss=0.193552 value_loss=0.035155 c_pi=1.000 c_v=1.000
+Episode    29 | Reward: -457.40 (Total: -1372.21) | Length:   500 | Time: 6.7s
+[UPDATE] ep=30 policy_loss=0.192432 value_loss=0.041403 c_pi=1.000 c_v=1.000
+Episode    30 | Reward: -556.33 (Total: -1668.99) | Length:   500 | Time: 6.2s
+[UPDATE] ep=31 policy_loss=0.189162 value_loss=0.031966 c_pi=1.000 c_v=1.000
+Episode    31 | Reward: -421.15 (Total: -1263.44) | Length:   500 | Time: 6.7s
+[UPDATE] ep=32 policy_loss=0.191311 value_loss=0.046468 c_pi=1.000 c_v=1.000
+Episode    32 | Reward: -400.20 (Total: -1200.60) | Length:   500 | Time: 6.9s
+[UPDATE] ep=33 policy_loss=0.191604 value_loss=0.048619 c_pi=1.000 c_v=1.000
+Episode    33 | Reward: -332.34 (Total: -997.03) | Length:   500 | Time: 6.7s
+[UPDATE] ep=34 policy_loss=0.194303 value_loss=0.034358 c_pi=1.000 c_v=1.000
+Episode    34 | Reward: -401.86 (Total: -1205.58) | Length:   500 | Time: 6.8s

@@ -3,8 +3,8 @@
 # cross_2lane, cross_3lane, highway_2lane, highway_4lane 
 # roundabout_2lane, roundabout_3lane, onrampmerge_3lane, bottleneck
 env:
-  num_agents: 6
-  scenario_name: "cross_3lane" 
+  num_agents: 3
+  scenario_name: "onrampmerge_3lane" 
   max_steps: 500
   respawn_enabled: true
 
@@ -28,11 +28,15 @@ mcts:
   #
   # Note: runtime is roughly linear in simulations and num_action_samples, and also
   # increases with rollout_depth and num_agents.
-  simulations: 50
-  rollout_depth: 15
-  num_action_samples: 8
+  simulations: 100
+  rollout_depth: 25
+  num_action_samples: 16
   parallel: true
-  max_workers: 10
+  max_workers: 4
+  dirichlet_alpha: 0.3    # Dirichlet noise parameter for exploration
+  dirichlet_eps: 0.25    # exploration noise
+  dirichlet_decay_episodes: 2000 # Decay episodes for exploration
+  min_dirichlet_eps: 0.03    # Minimum exploration noise
 
 net:
   device: cpu          # auto/cpu/cuda
@@ -43,11 +47,15 @@ net:
 train:
   max_episodes: 100000
   save_frequency: 100
+  loss_log_interval: 1
   save_dir: "MCTS_AlphaZero/checkpoints"
   load_checkpoint: ""  # empty means no load
   seed: 42
   deterministic: false
   use_shm: true
+  c_pi: 1.0  # Policy loss weight
+  c_v: 1.0  # Value loss weight
+  returns_ema_beta: 0.99
   mcts_debug:
     enabled: false      
     interval: 500      

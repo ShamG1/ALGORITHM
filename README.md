@@ -35,7 +35,13 @@ U(s, a) = Q(s, a) + c_{puct} \cdot P(s, a) \cdot \frac{\sqrt{\sum_b N(s, b)}}{1 
 
 #### 训练流程
 1. **数据生成**：智能体通过 MCTS 进行自博弈，记录每步的访问分布 $\pi_{mcts}$ 和搜索价值 $v_{mcts}$。
-2. **TBPTT 训练**：利用截断反向传播处理时序序列，将长轨迹分块进行梯度更新。
+2. **回报归一化 (EMA Normalization)**：采用滑动平均（EMA）维护 Returns 的均值与方差，对 Monte-Carlo 回报进行动态缩放，以稳定价值网络（Value Network）的训练。
+3. **TBPTT 训练**：利用截断反向传播处理时序序列，将长轨迹分块进行梯度更新。
+
+#### 探索与退火机制
+- **温度退火 (Temperature Schedule)**：在自博弈过程中，MCTS 动作选择的温度 $\tau$ 随 Episode 递减（从 $1.0$ 衰减至 $0.1$），初期鼓励全局探索，后期聚焦于最优决策。
+- **Dirichlet 噪声衰减**：根节点加入的 $\text{Dirichlet}(\alpha)$ 噪声比例 $\epsilon$ 同步衰减，确保模型在训练后期能够稳定收敛到高置信度策略。
+
 
 #### 损失函数公式
 通过最小化网络输出与 MCTS 搜索结果之间的差异来更新参数 $\theta$：
