@@ -956,7 +956,9 @@ class MCTSTrainer:
         use_tqdm: bool = False,
         seed: Optional[int] = None,
         deterministic: bool = False,
-        use_shm: bool = True
+        use_shm: bool = True,
+        learning_rate: float = 3e-4,
+        update_every: int = 512
     ):
         self.num_agents = num_agents
         self.scenario_name = scenario_name
@@ -980,6 +982,8 @@ class MCTSTrainer:
         self.max_workers = max_workers if max_workers is not None else num_agents
         self.use_tqdm = use_tqdm and tqdm is not None
         self.use_shm = use_shm
+        self.learning_rate = learning_rate
+        self.update_every = update_every
         if not self.use_shm:
             raise ValueError("use_shm must be True")
         # LSTM hidden dim will be taken from the network after it is constructed.
@@ -1103,7 +1107,7 @@ class MCTSTrainer:
         self._shared_weight_version = mp.Value('Q', 0)
         self._shared_weight_lock = mp.Lock()
         
-        self.optimizer = optim.Adam(self.network.parameters(), lr=3e-4)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
         
         self.obs_history = [deque(maxlen=self.seq_len) for _ in range(num_agents)] if (self.use_lstm or self.use_tcn) else None
         self.unroll_len = 16
@@ -1754,7 +1758,7 @@ class MCTSTrainer:
 
         buffer_size = len(self.buffer['obs'][0])
         # AlphaZero usually updates at the end of episodes, but we can do it periodically.
-        update_every = int(getattr(self, 'update_every', 512))
+        update_every = int(getattr(self, 'update_every', self.update_every))
         if buffer_size >= update_every:
             self._batch_update_networks()
     
@@ -2063,7 +2067,9 @@ def main():
         parallel_mcts=bool(config.get('mcts', {}).get('parallel', True)),
         max_workers=int(config.get('mcts', {}).get('max_workers', 6)),
         use_shm=bool(config.get('train', {}).get('use_shm', True)),
-        use_tqdm=bool(config.get('misc', {}).get('tqdm', True))
+        use_tqdm=bool(config.get('misc', {}).get('tqdm', True)),
+        learning_rate=float(config.get('train', {}).get('learning_rate', 3e-4)),
+        update_every=int(config.get('train', {}).get('update_every', 512))
     )
 
     # Optional MCTS debug config from YAML: train.mcts_debug.enabled / interval
