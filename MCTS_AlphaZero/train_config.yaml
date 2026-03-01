@@ -1,42 +1,53 @@
-# MCTS_DUAL training config (YAML-only)
-# Available scenarios:
-# cross_2lane, cross_3lane, highway_2lane, highway_4lane 
+# MCTS_DUAL 训练配置（仅 YAML）
+# 可用场景：
+# cross_2lane, cross_3lane, highway_2lane, highway_4lane
 # roundabout_2lane, roundabout_3lane, onrampmerge_3lane, bottleneck
 env:
-  num_agents: 3
-  scenario_name: "onrampmerge_3lane" 
+  num_agents: 2
+  scenario_name: "highway_2lane"
   max_steps: 500
   respawn_enabled: true
 
+  # 环境侧惩罚幅度参数走 DriveSimX/core/utils.py 的 DEFAULT_REWARD_CONFIG 默认值：
+  # max_steps_penalty_no_respawn / respawn_penalty / no_progress_penalty
+  # 这里只保留阈值类可调参数（按实验需要覆盖默认值）：
+  no_progress_window_steps: 30         # 无进度统计窗口步数
+  no_progress_threshold: 0.01          # 窗口内最小进度增量阈值
+
 mcts:
-  # Speed/quality presets (rough guide; depends on CPU/core count and scenario):
+  # 速度/质量建议（与 CPU 核数、场景复杂度相关）：
   #
-  # 1) Fast debug (~2-5s/episode @ 500 steps):
+  # 1) 快速调试：
   #    simulations: 20
   #    rollout_depth: 10
   #    num_action_samples: 8
   #
-  # 2) Balanced (~2-5s/episode @ 500 steps):
+  # 2) 平衡模式：
   #    simulations: 50
   #    rollout_depth: 15
   #    num_action_samples: 8
   #
-  # 3) Quality (current; ~30-40s/episode @ 500 steps on your machine):
+  # 3) 高质量模式（更慢，效果通常更好）：
   #    simulations: 100
   #    rollout_depth: 25
   #    num_action_samples: 16
   #
-  # Note: runtime is roughly linear in simulations and num_action_samples, and also
-  # increases with rollout_depth and num_agents.
-  simulations: 100
-  rollout_depth: 25
-  num_action_samples: 16
+  # 备注：运行时长大致与 simulations、num_action_samples 线性相关，
+  #       同时也会随 rollout_depth、num_agents 增加。
+  simulations: 50
+  rollout_depth: 15
+  num_action_samples: 8
   parallel: true
-  max_workers: 4
-  dirichlet_alpha: 0.3    # Dirichlet noise parameter for exploration
-  dirichlet_eps: 0.25    # exploration noise
-  dirichlet_decay_episodes: 2000 # Decay episodes for exploration
-  min_dirichlet_eps: 0.03    # Minimum exploration noise
+  max_workers: 2
+
+  temperature_start: 1.0            # episode=0 时的 MCTS 温度
+  temperature_min: 0.1              # 温度下限
+  temperature_decay_episodes: 20000 # 温度线性衰减到下限所需 episode 数
+
+  dirichlet_alpha: 0.3              # Dirichlet 噪声 alpha
+  dirichlet_eps: 0.25               # 初始探索噪声比例
+  dirichlet_decay_episodes: 20000   # 探索噪声线性衰减周期
+  min_dirichlet_eps: 0.03           # 探索噪声最小值
 
 net:
   device: cpu          # auto/cpu/cuda
@@ -49,24 +60,46 @@ train:
   save_frequency: 100
   loss_log_interval: 100
   save_dir: "MCTS_AlphaZero/checkpoints"
-  load_checkpoint: ""  # empty means no load
-  seed: 42
-  deterministic: false
+  load_checkpoint: ""   # 留空表示不加载
+
   use_shm: true
-  c_pi: 1.0  # Policy loss weight
-  c_v: 1.0  # Value loss weight
+  c_pi: 1.0             # 策略损失权重
+  c_v: 1.0              # 价值损失权重
   returns_ema_beta: 0.99
-  learning_rate: 1e-3
+  learning_rate: 3e-4
   update_every: 128
+
+  # best checkpoint 选择策略（基于最近窗口的平均 episode reward）
+  best_metric_window: 50
+  best_save_start_episode: 200
+  best_min_delta: 1e-3
+
   mcts_debug:
-    enabled: false      
-    interval: 500      
+    enabled: false
+    interval: 1
 
 render:
   enabled: false
 
-reward:
-  use_team_reward: true
+marl:
+  # cooperative_mode:
+  # - false：独立优化，各 agent 主要看自身回报
+  # - true ：协作模式（环境侧进行混合奖励与协作 shaping）
+  cooperative_mode: true
+  cooperative_alpha: 0.3
+
+  # 轻量 credit shaping 系数（环境侧）
+  cooperative_credit_coef: 0.3
+
+  # 轻量两两协调（环境侧动作调整）
+  pairwise_coordination_enabled: true
+  pairwise_distance_threshold: 80.0
+  pairwise_brake_scale: 0.35
+  pairwise_cooldown_steps: 6
+
+eval:
+  interval_episodes: 500   # 每隔多少个训练 episode 做一次评估
+  episodes: 20             # 每次评估运行的 episode 数
 
 misc:
   tqdm: false

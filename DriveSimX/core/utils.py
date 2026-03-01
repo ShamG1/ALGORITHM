@@ -14,16 +14,21 @@ OBS_DIM = 145
 DEFAULT_REWARD_CONFIG = {
     'use_team_reward': False,  # Use team reward mixing (for multi-agent)
     'traffic_flow': False,      # If True, forces individual reward (single-agent with traffic)
+    # Applied when respawn_enabled=False and episode is truncated by max_steps_per_episode.
+    'max_steps_penalty_no_respawn': -5.0,
+    # Applied when respawn_enabled=True and a car respawns after a crash.
+    'respawn_penalty': -0.5,
+    # Applied when progress gain in a window is below threshold.
+    'no_progress_penalty': -0.2,
     'reward_config': {
-        'progress_scale': 40.0, 
+        'progress_scale': 60.0,
         'stuck_speed_threshold': 1.0,  # m/s
-        'stuck_penalty': -0.001,
-        'crash_vehicle_penalty': -100.0,
-        'crash_wall_penalty': -30.0,   # Off-road / wall
-        'crash_line_penalty': -1.0,   # Yellow line crossing (lighter than wall)
-        'crash_object_penalty': -30.0,  # Legacy fallback: applies to both if specific keys missing
+        'stuck_penalty': -0.08,
+        'crash_vehicle_penalty': -30,
+        'crash_wall_penalty': -8.0,   # Off-road / wall
+        'crash_line_penalty': -0.5,   # Yellow line crossing (lighter than wall)
         'success_reward': 100.0,
-        'action_smoothness_scale': -0.02,
+        'action_smoothness_scale': -0.005,
         'team_alpha': 0.2,
     }
 }

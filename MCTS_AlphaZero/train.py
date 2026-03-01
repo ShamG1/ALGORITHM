@@ -39,6 +39,10 @@ from datetime import datetime
 # from time import time
 from collections import deque
 import csv
+import json
+
+CRASH_STATUSES = frozenset({'CRASH_CAR', 'CRASH_WALL'})
+SUCCESS_STATUS = 'SUCCESS'
 
 
 class RunningMeanStd:
@@ -406,23 +410,6 @@ class WorkerTensorCache:
 # Global Configuration and Utility Functions
 # ============================================================================
 
-def set_global_seeds(seed: int, deterministic: bool = False) -> None:
-    """Set Python/NumPy/PyTorch seeds for reproducibility."""
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        try:
-            torch.use_deterministic_algorithms(True)
-        except Exception:
-            pass
-
-
 # Worker process global cache
 _WORKER_CACHE: Dict[str, Any] = {
     "network": None,
@@ -586,13 +573,22 @@ def _pinned_worker_loop_shm_optimized(
                 # Use 2 * OBS_DIM if using TCN with delta features (seq_len 5 mode)
                 effective_obs_dim = _OBS_DIM * 2 if (use_tcn and seq_len == 5) else _OBS_DIM
                 
+                # Keep worker network architecture strictly identical to trainer network,
+                # otherwise shared-weight copy will fail on shape mismatch.
+                env_cfg = _WORKER_CACHE.get('env_config') or {}
+                num_agents_cfg = int(env_cfg.get('num_agents', 1))
+                global_state_dim = int(config.get('global_state_dim', int(num_agents_cfg * _OBS_DIM)))
+                use_centralized_critic = bool(config.get('use_centralized_critic', True))
+
                 net = DualNetwork(
                     obs_dim=effective_obs_dim, action_dim=2,
                     hidden_dim=config['hidden_dim'],
                     lstm_hidden_dim=config['lstm_hidden_dim'],
                     use_lstm=config.get('use_lstm', True),
                     use_tcn=use_tcn,
-                    sequence_length=seq_len
+                    sequence_length=seq_len,
+                    global_state_dim=global_state_dim,
+                    use_centralized_critic=use_centralized_critic,
                 ).to(worker_device)
                 net.eval()
                 
@@ -629,14 +625,13 @@ def _pinned_worker_loop_shm_optimized(
                     'ego_routes': list(env_cfg.get('ego_routes', [])),
                 })
             
-            if _WORKER_CACHE.get("mcts") is None:
+            mcts_obj = _WORKER_CACHE.get("mcts")
+            if mcts_obj is None:
                 try:
                     from .mcts import MCTS
                 except ImportError:
                     from mcts import MCTS
-                env_cfg = _WORKER_CACHE.get('env_config') or {}
-                _num_agents = int(env_cfg.get('num_agents', 1))
-                mcts = MCTS(
+                mcts_obj = MCTS(
                     network=_WORKER_CACHE["network"],
                     num_simulations=config['num_simulations'],
                     c_puct=config['c_puct'],
@@ -647,9 +642,9 @@ def _pinned_worker_loop_shm_optimized(
                     num_action_samples=config['num_action_samples'],
                     ts_model_path=config.get('ts_model_path'),
                 )
-                mcts._env_cache = _WORKER_CACHE["env"]
-                _WORKER_CACHE["mcts"] = mcts
-            
+                mcts_obj._env_cache = _WORKER_CACHE["env"]
+                _WORKER_CACHE["mcts"] = mcts_obj
+
             # Sync weights only when version changes
             if _SHARED_STATE.get("version") is not None:
                 last_ver = _WORKER_CACHE.get("_last_weight_version", -1)
@@ -660,14 +655,14 @@ def _pinned_worker_loop_shm_optimized(
                         for p, src in zip(state.values(), _SHARED_STATE["tensors"]):
                             p.copy_(src)
                     _WORKER_CACHE["_last_weight_version"] = cur_ver
-            
-            mcts = _WORKER_CACHE["mcts"]
-            mcts.agent_id = agent_id
+
+            mcts_ref = _WORKER_CACHE["mcts"]
+            mcts_ref.agent_id = agent_id
 
             # Update dynamic MCTS hyperparameters from config (temperature/dirichlet decay)
-            mcts.temperature = float(config.get('temperature', 1.0))
-            mcts.dirichlet_alpha = float(config.get('dirichlet_alpha', 0.3))
-            mcts.dirichlet_eps = float(config.get('dirichlet_eps', 0.25))
+            mcts_ref.temperature = float(config.get('temperature', 1.0))
+            mcts_ref.dirichlet_alpha = float(config.get('dirichlet_alpha', 0.3))
+            mcts_ref.dirichlet_eps = float(config.get('dirichlet_eps', 0.25))
 
             use_lstm_flag = bool(config.get('use_lstm', True))
             use_tcn_flag = bool(config.get('use_tcn', False))
@@ -681,7 +676,7 @@ def _pinned_worker_loop_shm_optimized(
 
                 if use_lstm_flag:
                     # LSTM path: use unified Python wrapper, which calls C++ mcts_search_to_shm
-                    action, search_stats = mcts.search(
+                    action, search_stats = mcts_ref.search(
                         obs_data,
                         _WORKER_CACHE["env"],
                         list(_WORKER_CACHE["obs_history"]) if (use_lstm_flag or use_tcn_flag) else None,
@@ -698,6 +693,11 @@ def _pinned_worker_loop_shm_optimized(
                     # Use the already prepared obs_seq_np (handles TCN delta features/dim doubling)
                     root_obs_seq_flat = obs_seq_np.astype(np.float32).flatten()
                     obs_dim_net = int(root_obs_seq_flat.size // seq_len)
+
+                    # Use non-deterministic entropy per search call.
+                    step_seed = int.from_bytes(os.urandom(4), byteorder='little') & 0x7FFFFFFF
+                    if step_seed == 0:
+                        step_seed = 1
 
                     _cpp_backend.mcts_search_tcn_torchscript_seq_to_shm_np(
                         env_cpp,
@@ -716,7 +716,7 @@ def _pinned_worker_loop_shm_optimized(
                         0.99,
                         float(config.get('dirichlet_alpha', 0.3)),
                         float(config.get('dirichlet_eps', 0.25)),
-                        int(config.get('base_seed', 0)),
+                        int(step_seed),
                         shm_client.action_ptr_addr,
                         shm_client.stats_ptr_addr,
                     )
@@ -742,11 +742,13 @@ def _pinned_worker_loop_shm_optimized(
                 if shm_ptrs is not None:
                     # SHM Path: Read directly from stats buffer using numpy view for safety
                     # Layout: [root_v(1), root_n(1), h_next(H), c_next(H), ...]
-                    # stats_offset for this agent = self._stats_offset + agent_id * self.stats_per_agent * 4
-                    stats_offset = shm_client._stats_offset + agent_id * shm_client.stats_per_agent * 4
                     # Read the full stats array as float32
-                    stats_view = np.frombuffer(shm_client._shm.buf, dtype=np.float32, 
-                                             count=shm_client.stats_per_agent, offset=stats_offset)
+                    stats_view = np.frombuffer(
+                        shm_client._shm.buf,
+                        dtype=np.float32,
+                        count=shm_client.stats_per_agent,
+                        offset=(shm_client._stats_offset + agent_id * shm_client.stats_per_agent * 4),
+                    )
                     
                     # Extract h_next and c_next using standard numpy slicing
                     h_np = stats_view[2 : 2 + lstm_hidden_dim].copy()
@@ -942,7 +944,9 @@ class MCTSTrainer:
         save_frequency: int = 100,
         log_frequency: int = 10,
         device: str = 'cpu',
-        use_team_reward: bool = True,
+        use_team_reward: bool = False,
+        cooperative_mode: bool = False,
+        centralized_value: bool = True,
         use_lstm: bool = True,
         use_tcn: bool = False,
         sequence_length: int = 5,
@@ -954,11 +958,21 @@ class MCTSTrainer:
         parallel_mcts: bool = True,
         max_workers: int = None,
         use_tqdm: bool = False,
-        seed: Optional[int] = None,
-        deterministic: bool = False,
         use_shm: bool = True,
         learning_rate: float = 3e-4,
-        update_every: int = 512
+        update_every: int = 512,
+        max_steps_penalty_no_respawn: float = -5.0,
+        respawn_penalty: float = -0.5,
+        no_progress_penalty: float = -0.2,
+        no_progress_window_steps: int = 30,
+        no_progress_threshold: float = 0.01,
+        cooperative_credit_coef: float = 0.3,
+        pairwise_coordination_enabled: bool = True,
+        pairwise_distance_threshold: float = 80.0,
+        pairwise_brake_scale: float = 0.35,
+        pairwise_cooldown_steps: int = 6,
+        eval_interval_episodes: int = 500,
+        eval_episodes: int = 20,
     ):
         self.num_agents = num_agents
         self.scenario_name = scenario_name
@@ -971,6 +985,8 @@ class MCTSTrainer:
         self.log_frequency = log_frequency
         self.device = torch.device(device)
         self.use_team_reward = use_team_reward
+        self.cooperative_mode = cooperative_mode
+        self.centralized_value = centralized_value
         self.use_lstm = use_lstm
         self.use_tcn = use_tcn
         self.seq_len = int(sequence_length) if sequence_length is not None else 5
@@ -984,6 +1000,18 @@ class MCTSTrainer:
         self.use_shm = use_shm
         self.learning_rate = learning_rate
         self.update_every = update_every
+        self.max_steps_penalty_no_respawn = float(max_steps_penalty_no_respawn)
+        self.respawn_penalty = float(respawn_penalty)
+        self.no_progress_penalty = float(no_progress_penalty)
+        self.no_progress_window_steps = int(no_progress_window_steps)
+        self.no_progress_threshold = float(no_progress_threshold)
+        self.cooperative_credit_coef = float(np.clip(cooperative_credit_coef, 0.0, 1.0))
+        self.pairwise_coordination_enabled = bool(pairwise_coordination_enabled)
+        self.pairwise_distance_threshold = float(max(1.0, pairwise_distance_threshold))
+        self.pairwise_brake_scale = float(np.clip(pairwise_brake_scale, 0.0, 1.0))
+        self.pairwise_cooldown_steps = int(max(1, pairwise_cooldown_steps))
+        self.eval_interval_episodes = int(max(0, eval_interval_episodes))
+        self.eval_episodes = int(max(1, eval_episodes))
         if not self.use_shm:
             raise ValueError("use_shm must be True")
         # LSTM hidden dim will be taken from the network after it is constructed.
@@ -997,8 +1025,6 @@ class MCTSTrainer:
         self._stop_event = None
 
         
-        self.seed = seed
-        self.deterministic = deterministic
         self._weights_dirty = True
 
         # Training hyperparameters (overridden by YAML in main())
@@ -1006,6 +1032,11 @@ class MCTSTrainer:
         self.c_v = float(getattr(self, "c_v", 1.0))
         self.returns_ema_beta = float(getattr(self, "returns_ema_beta", 0.99))
         self._returns_rms = RunningMeanStd(beta=self.returns_ema_beta)
+
+        # Temperature schedule params for MCTS action sampling (overridden by YAML in main())
+        self.temperature_start = float(getattr(self, "temperature_start", 1.0))
+        self.temperature_min = float(getattr(self, "temperature_min", 0.1))
+        self.temperature_decay_episodes = int(getattr(self, "temperature_decay_episodes", 2000))
 
         # Dirichlet noise params for root exploration (overridden by YAML in main())
         self.dirichlet_alpha = float(getattr(self, "dirichlet_alpha", 0.3))
@@ -1016,6 +1047,9 @@ class MCTSTrainer:
         # Loss logging
         self.loss_log_interval = int(getattr(self, "loss_log_interval", 1))
         self._last_losses = None
+
+        # Reward shaping is handled in environment config; trainer only records/normalizes rewards.
+        self.cooperative_alpha = float(getattr(self, "cooperative_alpha", 0.3))
         
         os.makedirs(save_dir, exist_ok=True)
         self.save_dir = save_dir
@@ -1031,7 +1065,7 @@ class MCTSTrainer:
         #     print(f"WARNING: Found duplicate routes: {duplicates}")
         #     print(f"All routes: {ego_routes}")
         
-        self.env = ScenarioEnv({
+        self.env_cfg = {
             'scenario_name': scenario_name,
             'traffic_flow': False,
             'num_agents': num_agents,
@@ -1039,9 +1073,22 @@ class MCTSTrainer:
             'render_mode': 'human' if render else None,
             'max_steps': max_steps_per_episode,
             'respawn_enabled': respawn_enabled,
+            'max_steps_penalty_no_respawn': float(self.max_steps_penalty_no_respawn),
+            'respawn_penalty': float(self.respawn_penalty),
+            'no_progress_penalty': float(self.no_progress_penalty),
+            'no_progress_window_steps': int(self.no_progress_window_steps),
+            'no_progress_threshold': float(self.no_progress_threshold),
+            'cooperative_mode': bool(self.cooperative_mode),
+            'cooperative_alpha': float(self.cooperative_alpha),
+            'cooperative_credit_coef': float(self.cooperative_credit_coef),
+            'pairwise_coordination_enabled': bool(self.pairwise_coordination_enabled),
+            'pairwise_distance_threshold': float(self.pairwise_distance_threshold),
+            'pairwise_brake_scale': float(self.pairwise_brake_scale),
+            'pairwise_cooldown_steps': int(self.pairwise_cooldown_steps),
             'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
-            'ego_routes': ego_routes
-        })
+            'ego_routes': ego_routes,
+        }
+        self.env = ScenarioEnv(dict(self.env_cfg))
         
         # Enforce mutual exclusion: TCN replaces LSTM
         if self.use_tcn:
@@ -1052,16 +1099,19 @@ class MCTSTrainer:
         # Fall back to 5 for backward compatibility.
         self.seq_len = int(getattr(self, "seq_len", 5))
 
-        effective_obs_dim = OBS_DIM * 2 if self.use_tcn else OBS_DIM
+        actor_obs_dim = OBS_DIM * 2 if self.use_tcn else OBS_DIM
+        value_global_state_dim = int(self.num_agents * OBS_DIM)
 
         self.network = DualNetwork(
-            obs_dim=effective_obs_dim,
+            obs_dim=actor_obs_dim,
             action_dim=2,
             hidden_dim=256,
             lstm_hidden_dim=128,
             use_lstm=self.use_lstm,
             use_tcn=self.use_tcn,
-            sequence_length=self.seq_len
+            sequence_length=self.seq_len,
+            global_state_dim=value_global_state_dim,
+            use_centralized_critic=self.centralized_value,
         ).to(self.device)
 
         # Single source of truth for SHM layout.
@@ -1121,8 +1171,16 @@ class MCTSTrainer:
             'crash_count': 0,
         }
 
+        # Best-checkpoint tracking (based on moving average reward)
+        self.best_metric_window = int(getattr(self, 'best_metric_window', 50))
+        self.best_save_start_episode = int(getattr(self, 'best_save_start_episode', 200))
+        self.best_min_delta = float(getattr(self, 'best_min_delta', 1e-3))
+        self.best_score = float('-inf')
+        self.best_episode = 0
+
         self.buffer = {
             'obs': [[] for _ in range(num_agents)],
+            'global_state': [[] for _ in range(num_agents)],
             'next_obs': [[] for _ in range(num_agents)],
             'actions': [[] for _ in range(num_agents)],
             'rewards': [[] for _ in range(num_agents)],
@@ -1138,6 +1196,12 @@ class MCTSTrainer:
             f.write(f"Scenario name: {scenario_name}\n")
             f.write(f"Use team reward: {use_team_reward}\n")
             f.write(f"Respawn enabled: {respawn_enabled}\n")
+            f.write(f"Cooperative alpha: {self.cooperative_alpha}\n")
+            f.write(f"Cooperative credit coef: {self.cooperative_credit_coef}\n")
+            f.write(f"Pairwise coordination enabled: {self.pairwise_coordination_enabled}\n")
+            f.write(f"Pairwise distance threshold: {self.pairwise_distance_threshold}\n")
+            f.write(f"Pairwise brake scale: {self.pairwise_brake_scale}\n")
+            f.write(f"Pairwise cooldown steps: {self.pairwise_cooldown_steps}\n")
             f.write(f"MCTS simulations: {mcts_simulations}\n")
             f.write(f"MCTS rollout_depth: {rollout_depth}\n")
             f.write(f"MCTS num_action_samples: {num_action_samples}\n")
@@ -1155,7 +1219,32 @@ class MCTSTrainer:
         self.csv_file = os.path.join(save_dir, 'episode_rewards.csv')
         with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Episode', 'Total_Reward', 'Mean_Reward', 'Episode_Length', 'Episode_Duration_Sec'])
+            writer.writerow([
+                'Episode',
+                'Total_Reward',
+                'Mean_Reward',
+                'Episode_Length',
+                'Episode_Duration_Sec',
+                'Reward_Min',
+                'Reward_Max',
+                'Reward_Std',
+                'Reward_P25',
+                'Reward_P50',
+                'Reward_P75',
+            ])
+
+        self.components_csv_file = os.path.join(save_dir, 'episode_reward_components.csv')
+        with open(self.components_csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Episode', 'Component', 'Value'])
+
+        self.eval_csv_file = os.path.join(save_dir, 'eval_metrics.csv')
+        with open(self.eval_csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'Episode', 'Eval_Episodes', 'Reward_Mean', 'Reward_Std',
+                'Length_Mean', 'Success_Rate', 'Crash_Rate', 'Truncated_Rate'
+            ])
         
         # Generate TorchScript model immediately for optimized MCTS inference
         self._ensure_torchscript_model()
@@ -1163,7 +1252,13 @@ class MCTSTrainer:
     def log(self, message: str):
         with open(self.log_file, 'a') as f:
             f.write(message + "\n")
-    
+
+    def _to_agent_reward_array(self, rewards) -> np.ndarray:
+        """Normalize env reward output into float32 array of shape (num_agents,)."""
+        if isinstance(rewards, (list, np.ndarray)):
+            return np.asarray(rewards, dtype=np.float32)
+        return np.full(self.num_agents, float(rewards), dtype=np.float32)
+
     def _start_pinned_workers_shm(self):
         """Start worker processes with optimized Event-based synchronization."""
         if self._pinned_procs is not None:
@@ -1180,15 +1275,8 @@ class MCTSTrainer:
         )
         self._stop_event = mp.Event()
         
-        init_env_config = {
-            'num_agents': self.num_agents,
-            'scenario_name': self.scenario_name,
-            'use_team_reward': self.use_team_reward,
-            'max_steps': self.max_steps_per_episode,
-            'respawn_enabled': self.respawn_enabled,
-            'reward_config': DEFAULT_REWARD_CONFIG['reward_config'],
-            'ego_routes': self.ego_routes,
-        }
+        init_env_config = dict(getattr(self, 'env_cfg', {}))
+        init_env_config['render_mode'] = None
         _init_worker_shared_state(
             self._shared_weight_tensors,
             self._shared_weight_version,
@@ -1252,10 +1340,24 @@ class MCTSTrainer:
             self._broadcast_weights_if_dirty()
         
         # Temperature schedule: start high for exploration, decay to low for exploitation
-        start_temp = 1.0
-        min_temp = 0.1
-        decay_episodes = 2000
-        current_temp = max(min_temp, start_temp - (episode / decay_episodes) * (start_temp - min_temp))
+        temp_start = float(getattr(self, 'temperature_start', 1.0))
+        temp_min = float(getattr(self, 'temperature_min', 0.1))
+        temp_decay_eps = max(1, int(getattr(self, 'temperature_decay_episodes', 2000)))
+        temp_progress = min(1.0, float(episode) / float(temp_decay_eps))
+        current_temp = temp_start + (temp_min - temp_start) * temp_progress
+        lo_t, hi_t = (temp_min, temp_start) if temp_min <= temp_start else (temp_start, temp_min)
+        current_temp = float(np.clip(current_temp, lo_t, hi_t))
+
+        # Dirichlet epsilon schedule: decay from configured initial eps to min eps.
+        # Uses train config values injected into trainer in main().
+        dir_decay_eps = max(1, int(getattr(self, 'dirichlet_decay_episodes', 2000)))
+        dir_eps_start = float(getattr(self, 'dirichlet_eps', 0.25))
+        dir_eps_min = float(getattr(self, 'min_dirichlet_eps', 0.03))
+        progress = min(1.0, float(episode) / float(dir_decay_eps))
+        current_dirichlet_eps = dir_eps_start + (dir_eps_min - dir_eps_start) * progress
+        # Numerical guard and robust ordering (in case config accidentally sets min > start).
+        lo, hi = (dir_eps_min, dir_eps_start) if dir_eps_min <= dir_eps_start else (dir_eps_start, dir_eps_min)
+        current_dirichlet_eps = float(np.clip(current_dirichlet_eps, lo, hi))
 
         config = {
             'hidden_dim': 256,
@@ -1263,13 +1365,16 @@ class MCTSTrainer:
             'use_lstm': self.use_lstm,
             'use_tcn': self.use_tcn,
             'sequence_length': int(self.seq_len),
+            'global_state_dim': int(self.num_agents * OBS_DIM),
+            'use_centralized_critic': bool(self.centralized_value),
             'device': str(self.device),  # Main process device (workers ignore this, use CPU)
             'num_simulations': self.mcts_simulations,
             'c_puct': 1.0,
             'temperature': current_temp,
             'rollout_depth': self.rollout_depth,
             'num_action_samples': self.num_action_samples,
-            'base_seed': int(self.seed) if self.seed is not None else 0,
+            'dirichlet_alpha': float(getattr(self, 'dirichlet_alpha', 0.3)),
+            'dirichlet_eps': current_dirichlet_eps,
             'episode': int(episode),
             'step': int(step),
             'ts_model_path': os.path.join(self.save_dir, 'mcts_infer.pt'),
@@ -1453,6 +1558,79 @@ class MCTSTrainer:
             self.network.to(original_device)
             self.network.train(original_training)
     
+    def _run_periodic_eval(self, episode: int):
+        """Run deterministic periodic evaluation (no training update)."""
+        if self.eval_interval_episodes <= 0:
+            return
+        if episode % self.eval_interval_episodes != 0:
+            return
+
+        eval_success = 0
+        eval_crash = 0
+        eval_trunc = 0
+        eval_rewards = []
+        eval_lengths = []
+
+        for _ in range(self.eval_episodes):
+            obs, _ = self.env.reset()
+            if self.use_lstm or self.use_tcn:
+                for i in range(self.num_agents):
+                    self.obs_history[i].clear()
+                    self.obs_history[i].append(obs[i])
+
+            done = False
+            ep_len = 0
+            ep_reward = np.zeros(self.num_agents, dtype=np.float32)
+
+            while (not done) and ep_len < self.max_steps_per_episode:
+                actions, _ = self._sequential_mcts_search(obs, None, deterministic_eval=True)
+                next_obs, rewards, terminated, truncated, info = self.env.step(actions)
+                rewards = self._to_agent_reward_array(rewards)
+                ep_reward += rewards
+                ep_len += 1
+                done = bool(terminated or truncated)
+                obs = next_obs
+
+                if done:
+                    statuses = list(info.get('status', [])) if isinstance(info, dict) else []
+                    if any(s == SUCCESS_STATUS for s in statuses):
+                        eval_success += 1
+                    if any(s in CRASH_STATUSES for s in statuses):
+                        eval_crash += 1
+                    if bool(truncated):
+                        eval_trunc += 1
+
+            eval_rewards.append(float(np.mean(ep_reward)))
+            eval_lengths.append(int(ep_len))
+
+        n = max(1, self.eval_episodes)
+        eval_reward_mean = float(np.mean(eval_rewards))
+        eval_reward_std = float(np.std(eval_rewards))
+        eval_len_mean = float(np.mean(eval_lengths))
+        eval_success_rate = float(eval_success / n)
+        eval_crash_rate = float(eval_crash / n)
+        eval_trunc_rate = float(eval_trunc / n)
+
+        self.log(
+            f"[EVAL] ep={episode} episodes={self.eval_episodes} "
+            f"reward_mean={eval_reward_mean:.2f} reward_std={eval_reward_std:.2f} "
+            f"len_mean={eval_len_mean:.1f} "
+            f"success_rate={eval_success_rate:.3f} crash_rate={eval_crash_rate:.3f} trunc_rate={eval_trunc_rate:.3f}"
+        )
+
+        with open(self.eval_csv_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                episode,
+                self.eval_episodes,
+                eval_reward_mean,
+                eval_reward_std,
+                eval_len_mean,
+                eval_success_rate,
+                eval_crash_rate,
+                eval_trunc_rate,
+            ])
+
     def train(self):
         """Main training loop."""
         self.log("=" * 80)
@@ -1460,9 +1638,6 @@ class MCTSTrainer:
         self.log("=" * 80)
 
         try:
-            if self.seed is not None:
-                self.log(f"[Seed] seed={self.seed} deterministic={self.deterministic}")
-            
             episode = 0
             step_count = 0
             
@@ -1500,6 +1675,7 @@ class MCTSTrainer:
                         self.obs_history[i].append(obs[i])
                 
                 episode_reward = np.zeros(self.num_agents)
+                episode_component_sums: Dict[str, float] = {}
                 episode_length = 0
                 done = False
                 
@@ -1548,12 +1724,14 @@ class MCTSTrainer:
                             pass
                     
                     try:
-                        if self.parallel_mcts and self.num_agents > 1:
+                        if self.parallel_mcts and self.num_agents >= 1:
                             actions, all_search_stats = self._parallel_mcts_search_shm(
                                 obs, env_state, episode=episode, step=episode_length
                             )
                         else:
                             actions, all_search_stats = self._sequential_mcts_search(obs, env_state)
+
+                        # Lightweight explicit interaction handling on top of independent MCTS.
                     except Exception as e:
                         self.log(f"Error in MCTS search at episode {episode}, step {episode_length}: {e}")
                         import traceback
@@ -1575,11 +1753,48 @@ class MCTSTrainer:
                         traceback.print_exc()
                         break
 
-                    if isinstance(rewards, (list, np.ndarray)):
-                        rewards = np.array(rewards)
-                    else:
-                        rewards = np.array([rewards] * self.num_agents)
-                    
+                    rewards = self._to_agent_reward_array(rewards)
+
+                    # Accumulate per-component rewards for this episode.
+                    rc_cpp = info.get('reward_components_cpp', {}) if isinstance(info, dict) else {}
+                    rc_py = info.get('reward_components_py', {}) if isinstance(info, dict) else {}
+                    if isinstance(rc_cpp, dict):
+                        for k, v in rc_cpp.items():
+                            try:
+                                episode_component_sums[f"cpp_{k}"] = episode_component_sums.get(f"cpp_{k}", 0.0) + float(np.sum(np.asarray(v, dtype=np.float32)))
+                            except Exception:
+                                pass
+                    if isinstance(rc_py, dict):
+                        for k, v in rc_py.items():
+                            # pairwise_action_adjust_applied is a flag, not reward magnitude.
+                            if k == 'pairwise_action_adjust_applied':
+                                continue
+                            try:
+                                episode_component_sums[f"py_{k}"] = episode_component_sums.get(f"py_{k}", 0.0) + float(np.sum(np.asarray(v, dtype=np.float32)))
+                            except Exception:
+                                pass
+
+                    # Optional per-step action diagnostics (controlled by train.mcts_debug)
+                    mcts_debug_cfg = getattr(self, "mcts_debug", None) or {}
+                    debug_enabled = bool(mcts_debug_cfg.get("enabled", False))
+                    action_debug_interval = int(mcts_debug_cfg.get("action_interval", 1))
+                    if debug_enabled and action_debug_interval > 0 and (episode_length % action_debug_interval == 0):
+                        try:
+                            a0 = np.asarray(actions[0], dtype=np.float32).reshape(-1) if len(actions) > 0 else np.zeros(2, dtype=np.float32)
+                            r0 = float(rewards[0]) if rewards.size > 0 else 0.0
+                            status0 = None
+                            if isinstance(info, dict):
+                                st_list = info.get('status', None)
+                                if isinstance(st_list, (list, tuple)) and len(st_list) > 0:
+                                    status0 = st_list[0]
+                            self.log(
+                                f"[DEBUG_ACT] ep={episode} step={episode_length} "
+                                f"a0=({a0[0]:+.4f},{a0[1]:+.4f}) r0={r0:+.4f} "
+                                f"status0={status0} terminated={bool(terminated)} truncated={bool(truncated)}"
+                            )
+                        except Exception as _e:
+                            self.log(f"[DEBUG_ACT] logging_error={_e}")
+
                     done = terminated or truncated
                     
                     # Update with AlphaZero search_stats
@@ -1619,12 +1834,21 @@ class MCTSTrainer:
                 self.stats['total_steps'] = step_count
                 self.stats['episode_rewards'].append(episode_reward.mean())
                 self.stats['episode_lengths'].append(episode_length)
+
+                # Save best model by moving-average reward (with warmup and min delta)
+                self._maybe_save_best_checkpoint(episode)
                 
                 total_reward = episode_reward.sum()
                 mean_reward = episode_reward.mean()
+                ep_min_reward = float(np.min(episode_reward)) if episode_reward.size > 0 else 0.0
+                ep_max_reward = float(np.max(episode_reward)) if episode_reward.size > 0 else 0.0
+                ep_std_reward = float(np.std(episode_reward)) if episode_reward.size > 0 else 0.0
+                ep_p25 = float(np.percentile(episode_reward, 25)) if episode_reward.size > 0 else 0.0
+                ep_p50 = float(np.percentile(episode_reward, 50)) if episode_reward.size > 0 else 0.0
+                ep_p75 = float(np.percentile(episode_reward, 75)) if episode_reward.size > 0 else 0.0
                 collisions = info.get('collisions', {})
-                has_success = any(status == 'SUCCESS' for status in collisions.values())
-                has_crash = any(status in ['CRASH_CAR', 'CRASH_WALL'] for status in collisions.values())
+                has_success = any(status == SUCCESS_STATUS for status in collisions.values())
+                has_crash = any(status in CRASH_STATUSES for status in collisions.values())
                 
                 rollout_info = ""
                 total_rollouts = sum(mcts.get_rollout_stats()['total_rollouts'] for mcts in self.mcts_instances)
@@ -1650,7 +1874,25 @@ class MCTSTrainer:
                 
                 with open(self.csv_file, 'a', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow([episode, total_reward, mean_reward, episode_length, episode_duration])
+                    writer.writerow([
+                        episode,
+                        total_reward,
+                        mean_reward,
+                        episode_length,
+                        episode_duration,
+                        ep_min_reward,
+                        ep_max_reward,
+                        ep_std_reward,
+                        ep_p25,
+                        ep_p50,
+                        ep_p75,
+                    ])
+
+                if episode_component_sums:
+                    with open(self.components_csv_file, 'a', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        for ck, cv in sorted(episode_component_sums.items()):
+                            writer.writerow([episode, ck, float(cv)])
                 
                 if has_success:
                     self.stats['success_count'] += 1
@@ -1677,16 +1919,24 @@ class MCTSTrainer:
                     )
                     self.save_checkpoint(checkpoint_path, episode)
                     self.log(f"Checkpoint saved: {checkpoint_path}")
+
+                self._run_periodic_eval(episode)
             
             self.log("Training completed!")
         finally:
             self.close()
     
-    def _sequential_mcts_search(self, obs, env_state):
+    def _sequential_mcts_search(self, obs, _env_state, deterministic_eval: bool = False):
         """Sequential MCTS search for each agent, collecting AlphaZero stats."""
         actions = []
         all_search_stats = []
-        
+
+        if deterministic_eval:
+            for i in range(self.num_agents):
+                m = self.mcts_instances[i]
+                m.temperature = 0.0
+                m.dirichlet_eps = 0.0
+
         for i in range(self.num_agents):
             if self.render:
                 try:
@@ -1703,8 +1953,7 @@ class MCTSTrainer:
                 root_obs=obs[i],
                 env=self.env,
                 obs_history=list(self.obs_history[i]) if (self.use_lstm or self.use_tcn) else None,
-                hidden_state=None,
-                env_state=env_state
+                hidden_state=None
             )
             
             if not isinstance(action, np.ndarray):
@@ -1721,6 +1970,7 @@ class MCTSTrainer:
         if not hasattr(self, 'buffer') or 'mcts_pi' not in self.buffer:
             self.buffer = {
                 'obs': [[] for _ in range(self.num_agents)],
+                'global_state': [[] for _ in range(self.num_agents)],
                 'next_obs': [[] for _ in range(self.num_agents)],
                 'actions': [[] for _ in range(self.num_agents)],
                 'rewards': [[] for _ in range(self.num_agents)],
@@ -1729,12 +1979,21 @@ class MCTSTrainer:
                 'mcts_v': [[] for _ in range(self.num_agents)],  # AlphaZero: search value
             }
 
+        global_state = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if self.cooperative_mode:
+            rewards_in = np.asarray(rewards, dtype=np.float32)
+            done_in = float(done)
+        else:
+            rewards_in = np.asarray(rewards, dtype=np.float32)
+            done_in = float(done)
+
         for i in range(self.num_agents):
             self.buffer['obs'][i].append(np.asarray(obs[i], dtype=np.float32))
+            self.buffer['global_state'][i].append(global_state)
             self.buffer['next_obs'][i].append(np.asarray(next_obs[i], dtype=np.float32))
             self.buffer['actions'][i].append(np.asarray(actions[i], dtype=np.float32))
-            self.buffer['rewards'][i].append(float(rewards[i]))
-            self.buffer['dones'][i].append(float(done))
+            self.buffer['rewards'][i].append(float(rewards_in[i]))
+            self.buffer['dones'][i].append(done_in)
             
             # AlphaZero stats
             if search_stats is not None and i < len(search_stats):
@@ -1800,6 +2059,7 @@ class MCTSTrainer:
                     prev = cur
             else:
                 obs_arr = obs_arr_raw
+            global_arr = np.asarray(self.buffer['global_state'][i], dtype=np.float32)
             rew_arr = np.asarray(self.buffer['rewards'][i], dtype=np.float32)
             done_arr = np.asarray(self.buffer['dones'][i], dtype=np.float32)
             pi_list = self.buffer['mcts_pi'][i] # List of [(action, prob), ...]
@@ -1829,10 +2089,14 @@ class MCTSTrainer:
                 # Prepare Observation Sequence
                 # (For TCN/LSTM, DualNetwork expects (B, T, D))
                 obs_chunk = torch.from_numpy(obs_arr[start:end]).unsqueeze(0).to(self.device)
-                
+                global_chunk = torch.from_numpy(global_arr[start:end]).to(self.device)
+
                 # Forward Pass
-                # returns: mean(B,L,2), std(B,L,2), value(B,L,1), h_out
-                mean, std, value, h_out = self.network(obs_chunk, h, return_sequence=True)
+                mean, std, _value_local, h_out = self.network(obs_chunk, h, return_sequence=True)
+                if self.centralized_value:
+                    value = self.network.forward_value_global(global_chunk).unsqueeze(0)
+                else:
+                    value = _value_local
                 
                 # Flatten batch and sequence for loss calculation
                 # (B=1, L, D) -> (L, D)
@@ -1909,6 +2173,7 @@ class MCTSTrainer:
         # Clear buffer after update
         self.buffer = {
             'obs': [[] for _ in range(self.num_agents)],
+            'global_state': [[] for _ in range(self.num_agents)],
             'next_obs': [[] for _ in range(self.num_agents)],
             'actions': [[] for _ in range(self.num_agents)],
             'rewards': [[] for _ in range(self.num_agents)],
@@ -1918,7 +2183,42 @@ class MCTSTrainer:
 
         }
 
-    
+    def _maybe_save_best_checkpoint(self, episode: int) -> None:
+        """Save best model using moving-average reward criterion."""
+        if episode < int(self.best_save_start_episode):
+            return
+
+        rewards = self.stats.get('episode_rewards', [])
+        window = max(1, int(self.best_metric_window))
+        if len(rewards) < window:
+            return
+
+        score = float(np.mean(rewards[-window:]))
+        if score <= (float(self.best_score) + float(self.best_min_delta)):
+            return
+
+        self.best_score = score
+        self.best_episode = int(episode)
+
+        best_ckpt_path = os.path.join(self.save_dir, 'best_model.pth')
+        self.save_checkpoint(best_ckpt_path, episode)
+
+        best_meta = {
+            'best_episode': int(self.best_episode),
+            'best_score_ma_reward': float(self.best_score),
+            'window': int(window),
+            'min_delta': float(self.best_min_delta),
+            'updated_at': str(datetime.now()),
+        }
+        best_meta_path = os.path.join(self.save_dir, 'best_metric.json')
+        with open(best_meta_path, 'w', encoding='utf-8') as f:
+            json.dump(best_meta, f, ensure_ascii=False, indent=2)
+
+        self.log(
+            f"[BEST] episode={episode}ma_reward(window={window})={score:.4f}"
+            f"saved={best_ckpt_path}"
+        )
+
     def save_checkpoint(self, path: str, episode: int):
         """Save training checkpoint and export optimized TorchScript model."""
         checkpoint = {
@@ -1927,8 +2227,6 @@ class MCTSTrainer:
             'network_state_dict': self.network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'stats': self.stats,
-            'seed': self.seed,
-            'deterministic': self.deterministic,
         }
         torch.save(checkpoint, path)
 
@@ -2039,15 +2337,17 @@ def main():
         device = device_name
     
     scenario_name = str(config.get('env', {}).get('scenario_name', "cross_3lane"))
+    cooperative_mode = bool(config.get('marl', {}).get('cooperative_mode', False))
+    use_team_reward = cooperative_mode
+    centralized_value = bool(config.get('marl', {}).get('centralized_value', True))
 
     print(f"[INFO] Training device: {device}")
     print(f"[INFO] Worker inference device: CPU (optimal for small networks)")
     print(f"[INFO] Scenario: {scenario_name}")
+    print(f"[INFO] MARL mode: {'cooperative' if cooperative_mode else 'independent'}")
+    print(f"[INFO] use_team_reward (auto): {use_team_reward}")
+    print(f"[INFO] Centralized value head: {centralized_value}")
 
-    seed = config.get('train', {}).get('seed')
-    if seed is not None:
-        set_global_seeds(int(seed), deterministic=config.get('train', {}).get('deterministic', False))
-    
     trainer = MCTSTrainer(
         num_agents=int(config.get('env', {}).get('num_agents', 6)),
         scenario_name=str(config.get('env', {}).get('scenario_name', "cross_3lane")),
@@ -2058,7 +2358,9 @@ def main():
         num_action_samples=int(config.get('mcts', {}).get('num_action_samples', 3)),
         save_frequency=int(config.get('train', {}).get('save_frequency', 100)),
         device=device,
-        use_team_reward=bool(config.get('reward', {}).get('use_team_reward', True)),
+        use_team_reward=use_team_reward,
+        cooperative_mode=cooperative_mode,
+        centralized_value=centralized_value,
         use_lstm=bool(config.get('net', {}).get('use_lstm', True)),
         use_tcn=bool(config.get('net', {}).get('use_tcn', False)),
         render=bool(config.get('render', {}).get('enabled', False)),
@@ -2069,7 +2371,19 @@ def main():
         use_shm=bool(config.get('train', {}).get('use_shm', True)),
         use_tqdm=bool(config.get('misc', {}).get('tqdm', True)),
         learning_rate=float(config.get('train', {}).get('learning_rate', 3e-4)),
-        update_every=int(config.get('train', {}).get('update_every', 512))
+        update_every=int(config.get('train', {}).get('update_every', 512)),
+        max_steps_penalty_no_respawn=float(config.get('env', {}).get('max_steps_penalty_no_respawn', DEFAULT_REWARD_CONFIG.get('max_steps_penalty_no_respawn', -5.0))),
+        respawn_penalty=float(config.get('env', {}).get('respawn_penalty', DEFAULT_REWARD_CONFIG.get('respawn_penalty', -0.5))),
+        no_progress_penalty=float(config.get('env', {}).get('no_progress_penalty', DEFAULT_REWARD_CONFIG.get('no_progress_penalty', -0.2))),
+        no_progress_window_steps=int(config.get('env', {}).get('no_progress_window_steps', DEFAULT_REWARD_CONFIG.get('no_progress_window_steps', 30))),
+        no_progress_threshold=float(config.get('env', {}).get('no_progress_threshold', DEFAULT_REWARD_CONFIG.get('no_progress_threshold', 0.01))),
+        cooperative_credit_coef=float(config.get('marl', {}).get('cooperative_credit_coef', 0.3)),
+        pairwise_coordination_enabled=bool(config.get('marl', {}).get('pairwise_coordination_enabled', True)),
+        pairwise_distance_threshold=float(config.get('marl', {}).get('pairwise_distance_threshold', 80.0)),
+        pairwise_brake_scale=float(config.get('marl', {}).get('pairwise_brake_scale', 0.35)),
+        pairwise_cooldown_steps=int(config.get('marl', {}).get('pairwise_cooldown_steps', 6)),
+        eval_interval_episodes=int(config.get('eval', {}).get('interval_episodes', 500)),
+        eval_episodes=int(config.get('eval', {}).get('episodes', 20)),
     )
 
     # Optional MCTS debug config from YAML: train.mcts_debug.enabled / interval
@@ -2087,7 +2401,19 @@ def main():
     # refresh running stats with configured beta
     trainer._returns_rms = RunningMeanStd(beta=trainer.returns_ema_beta)
 
+    # Best-checkpoint config
+    trainer.best_metric_window = int(config.get('train', {}).get('best_metric_window', 50))
+    trainer.best_save_start_episode = int(config.get('train', {}).get('best_save_start_episode', 200))
+    trainer.best_min_delta = float(config.get('train', {}).get('best_min_delta', 1e-3))
+
+    # Cooperative mixed-reward setting
+    trainer.cooperative_alpha = float(config.get('marl', {}).get('cooperative_alpha', 0.3))
+
     # MCTS Dirichlet noise params
+    trainer.temperature_start = float(config.get('mcts', {}).get('temperature_start', 1.0))
+    trainer.temperature_min = float(config.get('mcts', {}).get('temperature_min', 0.1))
+    trainer.temperature_decay_episodes = int(config.get('mcts', {}).get('temperature_decay_episodes', 2000))
+
     trainer.dirichlet_alpha = float(config.get('mcts', {}).get('dirichlet_alpha', 0.3))
     trainer.dirichlet_eps = float(config.get('mcts', {}).get('dirichlet_eps', 0.25))
     trainer.dirichlet_decay_episodes = int(config.get('mcts', {}).get('dirichlet_decay_episodes', 2000))

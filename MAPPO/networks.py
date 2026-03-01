@@ -7,19 +7,64 @@ import torch.nn.functional as F
 import numpy as np
 from DriveSimX.core.utils import OBS_DIM
 
+
+class TCNBlock(nn.Module):
+    """Causal temporal convolution block with residual connection."""
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            padding=self.padding,
+            dilation=dilation,
+        )
+        self.ln = nn.LayerNorm(out_channels)
+        self.res = nn.Linear(in_channels, out_channels) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x):
+        # x: (B, C, T)
+        residual = self.res(x.transpose(1, 2)).transpose(1, 2)
+        x = self.conv(x)
+        if self.padding > 0:
+            x = x[:, :, :-self.padding]
+        x = F.relu(self.ln(x.transpose(1, 2)).transpose(1, 2))
+        return x + residual
+
+
 class Actor(nn.Module):
-    """Actor network (policy network) for MAPPO with LSTM."""
-    
-    def __init__(self, obs_dim=OBS_DIM, action_dim=2, hidden_dim=256, lstm_hidden_dim=128, use_lstm=True, sequence_length=5):
+    """Actor network (policy network) for MAPPO with TCN/LSTM/MLP backbone."""
+
+    def __init__(
+        self,
+        obs_dim=OBS_DIM,
+        action_dim=2,
+        hidden_dim=256,
+        lstm_hidden_dim=128,
+        use_lstm=True,
+        use_tcn=False,
+        sequence_length=5,
+    ):
         super(Actor, self).__init__()
-        
+
         self.use_lstm = use_lstm
+        self.use_tcn = use_tcn
         self.sequence_length = sequence_length
-        
+
         # Input projection
         self.fc_input = nn.Linear(obs_dim, hidden_dim)
-        
-        if self.use_lstm:
+
+        if self.use_tcn:
+            self.tcn_blocks = nn.ModuleList([
+                TCNBlock(hidden_dim, lstm_hidden_dim, kernel_size=3, dilation=1),
+                TCNBlock(lstm_hidden_dim, lstm_hidden_dim, kernel_size=3, dilation=2),
+            ])
+            self.ln = nn.LayerNorm(lstm_hidden_dim)
+            self.fc2 = nn.Linear(lstm_hidden_dim, hidden_dim)
+            self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        elif self.use_lstm:
             # LSTM layer
             self.lstm = nn.LSTM(hidden_dim, lstm_hidden_dim, batch_first=True)
             # Layer normalization after LSTM for stability
@@ -31,19 +76,17 @@ class Actor(nn.Module):
             # Standard MLP layers
             self.fc2 = nn.Linear(hidden_dim, hidden_dim)
             self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-        
+
         # Output: mean and std for continuous actions
         self.mean_head = nn.Linear(hidden_dim, action_dim)
         self.std_head = nn.Linear(hidden_dim, action_dim)
-        
+
         # Initialize weights
         self._initialize_weights()
-        
+
         # Initialize std_head bias to ensure reasonable initial exploration
-        # softplus(0.5) ≈ 0.97, so initial std ≈ 0.97 + 1e-5 ≈ 0.97
-        # This ensures sufficient exploration at the start of training
         nn.init.constant_(self.std_head.bias, 0.5)
-    
+
     def _initialize_weights(self):
         """Initialize network weights."""
         for m in self.modules():
@@ -62,134 +105,151 @@ class Actor(nn.Module):
                         n = param.size(0)
                         start, end = n // 4, n // 2
                         param.data[start:end].fill_(1)
-    
+
     def forward(self, obs, hidden_state=None):
         """
         Forward pass through actor network.
-        
+
         Args:
             obs: Observation tensor
-                - If use_lstm=False: (batch_size, obs_dim)
-                - If use_lstm=True: (batch_size, sequence_length, obs_dim) or (batch_size, obs_dim) for single step
+                - If use_lstm/use_tcn=False: (batch_size, obs_dim)
+                - If use_lstm/use_tcn=True: (batch_size, sequence_length, obs_dim) or (batch_size, obs_dim)
             hidden_state: LSTM hidden state tuple (h, c) if use_lstm=True
-        
+
         Returns:
             mean: Action mean (batch_size, action_dim)
             std: Action std (batch_size, action_dim)
             hidden_state: Updated LSTM hidden state (if use_lstm=True)
         """
-        if self.use_lstm:
-            # Handle both sequence and single step inputs
+        if self.use_tcn:
             if len(obs.shape) == 2:
-                # Single step: (batch_size, obs_dim) -> (batch_size, 1, obs_dim)
                 obs = obs.unsqueeze(1)
-            
-            batch_size = obs.shape[0]
-            seq_len = obs.shape[1]
-            
-            # Project input
-            x = F.relu(self.fc_input(obs))  # (batch_size, seq_len, hidden_dim)
-            
-            # LSTM
+            x = self.fc_input(obs)  # (B, T, H)
+            x = x.transpose(1, 2)   # (B, H, T)
+            for block in self.tcn_blocks:
+                x = block(x)
+            x = x[:, :, -1]  # take last timestep
+            x = self.ln(x)
+            x = F.relu(self.fc2(x))
+            x = F.relu(self.fc3(x))
+            new_hidden = None
+        elif self.use_lstm:
+            if len(obs.shape) == 2:
+                obs = obs.unsqueeze(1)
+
+            x = F.relu(self.fc_input(obs))
+
             if hidden_state is None:
                 lstm_out, new_hidden = self.lstm(x)
             else:
                 lstm_out, new_hidden = self.lstm(x, hidden_state)
-            
-            # Use last timestep output
-            x = lstm_out[:, -1, :]  # (batch_size, lstm_hidden_dim)
-            x = self.ln(x)  # Layer normalization for stability
+
+            x = lstm_out[:, -1, :]
+            x = self.ln(x)
             x = F.relu(self.fc2(x))
             x = F.relu(self.fc3(x))
         else:
-            # Standard MLP
             x = F.relu(self.fc_input(obs))
             x = F.relu(self.fc2(x))
             x = F.relu(self.fc3(x))
             new_hidden = None
-        
-        mean = torch.tanh(self.mean_head(x))  # Mean in [-1, 1]
-        std = F.softplus(self.std_head(x)) + 1e-5  # Std > 0
-        
-        if self.use_lstm:
+
+        raw_mean = torch.tanh(self.mean_head(x))
+        # Action layout: [throttle, steering]
+        # Enforce non-negative throttle to disable reverse/brake-like negative acceleration.
+        throttle_mean = (raw_mean[..., :1] + 1.0) * 0.5   # [-1,1] -> [0,1]
+        steering_mean = raw_mean[..., 1:2]                # keep [-1,1]
+        mean = torch.cat([throttle_mean, steering_mean], dim=-1)
+        std = F.softplus(self.std_head(x)) + 1e-5
+
+        if self.use_lstm or self.use_tcn:
             return mean, std, new_hidden
-        else:
-            return mean, std
-    
+        return mean, std
+
     def get_action(self, obs, deterministic=False, hidden_state=None):
         """Sample action from policy distribution."""
-        if self.use_lstm:
+        if self.use_lstm or self.use_tcn:
             mean, std, new_hidden = self.forward(obs, hidden_state)
         else:
             mean, std = self.forward(obs)
             new_hidden = None
-        
+
         if deterministic:
-            if self.use_lstm:
+            if self.use_lstm or self.use_tcn:
                 return mean, new_hidden
-            else:
-                return mean
-        
+            return mean
+
         dist = torch.distributions.Normal(mean, std)
         action = dist.sample()
         log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
-        
-        # Clip action to [-1, 1]
+
         action = torch.clamp(action, -1.0, 1.0)
-        
-        if self.use_lstm:
+        # throttle in [0,1], steering in [-1,1]
+        action[..., :1] = torch.clamp(action[..., :1], 0.0, 1.0)
+
+        if self.use_lstm or self.use_tcn:
             return action, log_prob, new_hidden
-        else:
-            return action, log_prob
-    
+        return action, log_prob
+
     def evaluate_actions(self, obs, actions, hidden_state=None):
         """Evaluate actions and return log probs and entropy."""
-        if self.use_lstm:
+        if self.use_lstm or self.use_tcn:
             mean, std, new_hidden = self.forward(obs, hidden_state)
         else:
             mean, std = self.forward(obs)
             new_hidden = None
-        
+
         dist = torch.distributions.Normal(mean, std)
         log_probs = dist.log_prob(actions).sum(dim=-1, keepdim=True)
         entropy = dist.entropy().sum(dim=-1, keepdim=True)
-        
-        if self.use_lstm:
+
+        if self.use_lstm or self.use_tcn:
             return log_probs, entropy, new_hidden
-        else:
-            return log_probs, entropy
+        return log_probs, entropy
 
 
 class Critic(nn.Module):
-    """Critic network (value network) for MAPPO with LSTM."""
-    
-    def __init__(self, obs_dim=OBS_DIM, hidden_dim=256, lstm_hidden_dim=128, use_lstm=True, sequence_length=5):
+    """Critic network (value network) for MAPPO with TCN/LSTM/MLP backbone."""
+
+    def __init__(
+        self,
+        obs_dim=OBS_DIM,
+        hidden_dim=256,
+        lstm_hidden_dim=128,
+        use_lstm=True,
+        use_tcn=False,
+        sequence_length=5,
+    ):
         super(Critic, self).__init__()
-        
+
         self.use_lstm = use_lstm
+        self.use_tcn = use_tcn
         self.sequence_length = sequence_length
-        
+
         # Input projection
         self.fc_input = nn.Linear(obs_dim, hidden_dim)
-        
-        if self.use_lstm:
-            # LSTM layer
-            self.lstm = nn.LSTM(hidden_dim, lstm_hidden_dim, batch_first=True)
-            # Layer normalization after LSTM for stability
+
+        if self.use_tcn:
+            self.tcn_blocks = nn.ModuleList([
+                TCNBlock(hidden_dim, lstm_hidden_dim, kernel_size=3, dilation=1),
+                TCNBlock(lstm_hidden_dim, lstm_hidden_dim, kernel_size=3, dilation=2),
+            ])
             self.ln = nn.LayerNorm(lstm_hidden_dim)
-            # Post-LSTM layers
+            self.fc2 = nn.Linear(lstm_hidden_dim, hidden_dim)
+            self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        elif self.use_lstm:
+            self.lstm = nn.LSTM(hidden_dim, lstm_hidden_dim, batch_first=True)
+            self.ln = nn.LayerNorm(lstm_hidden_dim)
             self.fc2 = nn.Linear(lstm_hidden_dim, hidden_dim)
             self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         else:
-            # Standard MLP layers
             self.fc2 = nn.Linear(hidden_dim, hidden_dim)
             self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-        
+
         self.fc4 = nn.Linear(hidden_dim, 1)
-        
-        # Initialize weights
+
         self._initialize_weights()
-    
+
     def _initialize_weights(self):
         """Initialize network weights."""
         for m in self.modules():
@@ -204,58 +264,59 @@ class Critic(nn.Module):
                         nn.init.orthogonal_(param.data)
                     elif 'bias' in name:
                         param.data.fill_(0)
-                        # Set forget gate bias to 1
                         n = param.size(0)
                         start, end = n // 4, n // 2
                         param.data[start:end].fill_(1)
-    
+
     def forward(self, obs, hidden_state=None):
         """
         Forward pass through critic network.
-        
+
         Args:
             obs: Observation tensor
-                - If use_lstm=False: (batch_size, obs_dim)
-                - If use_lstm=True: (batch_size, sequence_length, obs_dim) or (batch_size, obs_dim) for single step
+                - If use_lstm/use_tcn=False: (batch_size, obs_dim)
+                - If use_lstm/use_tcn=True: (batch_size, sequence_length, obs_dim) or (batch_size, obs_dim)
             hidden_state: LSTM hidden state tuple (h, c) if use_lstm=True
-        
+
         Returns:
             value: State value (batch_size, 1)
             hidden_state: Updated LSTM hidden state (if use_lstm=True)
         """
-        if self.use_lstm:
-            # Handle both sequence and single step inputs
+        if self.use_tcn:
             if len(obs.shape) == 2:
-                # Single step: (batch_size, obs_dim) -> (batch_size, 1, obs_dim)
                 obs = obs.unsqueeze(1)
-            
-            batch_size = obs.shape[0]
-            seq_len = obs.shape[1]
-            
-            # Project input
-            x = F.relu(self.fc_input(obs))  # (batch_size, seq_len, hidden_dim)
-            
-            # LSTM
+            x = self.fc_input(obs)
+            x = x.transpose(1, 2)
+            for block in self.tcn_blocks:
+                x = block(x)
+            x = x[:, :, -1]
+            x = self.ln(x)
+            x = F.relu(self.fc2(x))
+            x = F.relu(self.fc3(x))
+            new_hidden = None
+        elif self.use_lstm:
+            if len(obs.shape) == 2:
+                obs = obs.unsqueeze(1)
+
+            x = F.relu(self.fc_input(obs))
+
             if hidden_state is None:
                 lstm_out, new_hidden = self.lstm(x)
             else:
                 lstm_out, new_hidden = self.lstm(x, hidden_state)
-            
-            # Use last timestep output
-            x = lstm_out[:, -1, :]  # (batch_size, lstm_hidden_dim)
-            x = self.ln(x)  # Layer normalization for stability
+
+            x = lstm_out[:, -1, :]
+            x = self.ln(x)
             x = F.relu(self.fc2(x))
             x = F.relu(self.fc3(x))
         else:
-            # Standard MLP
             x = F.relu(self.fc_input(obs))
             x = F.relu(self.fc2(x))
             x = F.relu(self.fc3(x))
             new_hidden = None
-        
+
         value = self.fc4(x)
-        
-        if self.use_lstm:
+
+        if self.use_lstm or self.use_tcn:
             return value, new_hidden
-        else:
-            return value
+        return value

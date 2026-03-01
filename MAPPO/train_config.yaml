@@ -1,32 +1,71 @@
-# MAPPO Training Configuration
-
+# MAPPO 训练配置（仅 YAML）
+# 可用场景：
+# cross_2lane, cross_3lane, highway_2lane, highway_4lane
+# roundabout_2lane, roundabout_3lane, onrampmerge_3lane, bottleneck
 env:
-  scenario_name: "cross_3lane"
+  scenario_name: "cross_2lane"
   num_agents: 6
   num_envs: 1
   max_steps: 500
   respawn_enabled: true
 
+  # 环境侧阈值参数
+  no_progress_window_steps: 30   # 无进度统计窗口步数
+  no_progress_threshold: 0.01    # 窗口内最小进度增量阈值
+
 train:
-  max_episodes: 10000
-  update_frequency: 2048
-  update_epochs: 5
+  max_episodes: 100000
+  update_frequency: 512
+  update_epochs: 3
   batch_size: 128
-  save_frequency: 100
-  log_frequency: 10
+  save_frequency: 1000
+  log_frequency: 1
   save_dir: "MAPPO/checkpoints"
 
+  # best checkpoint 选择策略（基于最近窗口的平均 episode reward）
+  best_metric_window: 50
+  best_save_start_episode: 200
+  best_min_delta: 0.001
+
 net:
-  device: "cpu"  # "cuda", "cpu", or "auto"
-  use_lstm: true
+  device: "cpu"      # 可选："cuda" / "cpu" / "auto"
+  use_tcn: true
+  use_lstm: false
   sequence_length: 5
 
+optim:
+  lr_actor: 1e-4
+  lr_critic: 2e-4
+  entropy_coef: 0.005
+  value_coef: 0.5
+  clip_epsilon: 0.2
+  max_grad_norm: 0.5
+
+rl:
+  gamma: 0.99
+  gae_lambda: 0.95
+
 reward:
+  # false=独立；true=协作（并驱动 cooperative_mode）
   use_team_reward: true
+
+marl:
+  # 环境侧协作/交互 shaping 参数
+  cooperative_alpha: 0.3
+  cooperative_credit_coef: 0.3
+
+  # 轻量 pairwise 协调（环境动作前处理）
+  pairwise_coordination_enabled: true
+  pairwise_distance_threshold: 80.0
+  pairwise_brake_scale: 0.35
+  pairwise_cooldown_steps: 6
 
 render:
   enabled: false
 
+eval:
+  interval_episodes: 500   # 每隔多少个训练 episode 做一次评估
+  episodes: 20             # 每次评估运行的 episode 数
+
 misc:
   tqdm: false
-  seed: 42
